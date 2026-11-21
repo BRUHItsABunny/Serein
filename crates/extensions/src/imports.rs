@@ -61,6 +61,15 @@ pub(crate) enum Kind {
 	/// `(ptr: i32, len: i32) -> i32`: performs one JSON-described HTTPS request to a declared
 	/// origin; the pending response's length, or a [`status`] code.
 	HttpsRequest,
+	/// `(ptr: i32, len: i32) -> i32`: broadcasts `{"topic", "payload"}`; how many approved
+	/// subscribers received it, or a [`status`] code.
+	Broadcast,
+	/// `(ptr: i32, len: i32) -> i32`: whether a topic name has an approved subscriber (`1`)
+	/// or not (`0`), or a [`status`] code.
+	HasSubscribers,
+	/// `(max: i32) -> i32`: reads up to `max` messages from approved providers; the pending
+	/// reply's length, or a [`status`] code.
+	TopicRead,
 }
 
 /// One importable host function.
@@ -105,6 +114,22 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		capability: Some(Capability::Network),
 		kind: Kind::HttpsRequest,
 	},
+	// Topic functions are checked against the manifest's topic lists at each call.
+	HostImport {
+		name: "broadcast",
+		capability: None,
+		kind: Kind::Broadcast,
+	},
+	HostImport {
+		name: "has_subscribers",
+		capability: None,
+		kind: Kind::HasSubscribers,
+	},
+	HostImport {
+		name: "topic_read",
+		capability: None,
+		kind: Kind::TopicRead,
+	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
@@ -144,6 +169,22 @@ pub trait HostImports: Send {
 	/// replies with the response as JSON. Blocks this invocation until it completes or the
 	/// host's time limit ends it.
 	fn https_request(&mut self, _request: &[u8]) -> Reply {
+		Reply::Unavailable
+	}
+	/// Broadcasts `{"topic": "...", "payload": ...}` JSON on a topic the manifest declares in
+	/// `broadcasts`; returns the number of approved subscribers that received it, or a
+	/// negative [`status`] code.
+	fn broadcast(&mut self, _request: &[u8]) -> i32 {
+		status::UNAVAILABLE
+	}
+	/// Whether `topic` has an approved subscriber: `1` or `0`, or a negative [`status`].
+	fn has_subscribers(&mut self, _topic: &str) -> i32 {
+		status::UNAVAILABLE
+	}
+	/// Reads up to `max` messages delivered to this plugin, as
+	/// `{"messages": [...], "more": bool}` JSON. They leave its queue only when the host
+	/// accepts the invocation.
+	fn topic_read(&mut self, _max: u32) -> Reply {
 		Reply::Unavailable
 	}
 }

@@ -15,11 +15,12 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		Surface::AppEvent => capabilities.push(Capability::AppEvents),
 		Surface::Tick => capabilities.push(Capability::Appearance),
 		Surface::Journal => capabilities.push(Capability::MessageJournal),
+		Surface::Topic => {}
 		Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
 			capabilities.push(Capability::ContextMenus)
 		}
 	}
-	let manifest = Manifest {
+	let mut manifest = Manifest {
 		api_version: extensions::API_VERSION,
 		id: "sdk-check".into(),
 		name: "SDK compatibility check".into(),
@@ -30,6 +31,8 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		kind: ExtensionKind::Plugin,
 		network: Vec::new(),
 		secrets: Vec::new(),
+		broadcasts: Vec::new(),
+		subscribes: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: action.into(),
@@ -37,6 +40,9 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 			surface,
 		}],
 	};
+	if surface == Surface::Topic {
+		manifest.subscribes = vec!["serein.test/1".into()];
+	}
 	manifest.validate().unwrap();
 	manifest
 }

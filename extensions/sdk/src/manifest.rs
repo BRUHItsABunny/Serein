@@ -26,6 +26,12 @@ pub struct Manifest {
 	/// plugin never reads it.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub secrets: Vec<SecretSpec>,
+	/// Topics [`crate::host::topics::broadcast`] may send, such as `serein.captions/1`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub broadcasts: Vec<String>,
+	/// Topics this plugin receives in its [`Surface::Topic`] action.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub subscribes: Vec<String>,
 }
 
 /// A secret the user enters for the plugin.
@@ -138,6 +144,8 @@ pub enum Surface {
 	Role,
 	/// Host-scheduled message journal delivery; read entries with [`crate::host::journal::read`].
 	Journal,
+	/// Host-scheduled delivery of approved broadcasts; read them with [`crate::host::topics::read`].
+	Topic,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.

@@ -15,6 +15,8 @@ fn manifest(capabilities: Vec<Capability>) -> Manifest {
 		kind: ExtensionKind::Plugin,
 		network: Vec::new(),
 		secrets: Vec::new(),
+		broadcasts: Vec::new(),
+		subscribes: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: "show".into(),

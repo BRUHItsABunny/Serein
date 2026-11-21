@@ -27,6 +27,9 @@ mod raw {
 		pub fn result_read(pointer: *mut u8, capacity: i32) -> i32;
 		pub fn journal_read(max: i32) -> i32;
 		pub fn https_request(pointer: *const u8, length: i32) -> i32;
+		pub fn broadcast(pointer: *const u8, length: i32) -> i32;
+		pub fn has_subscribers(pointer: *const u8, length: i32) -> i32;
+		pub fn topic_read(max: i32) -> i32;
 	}
 }
 
@@ -783,6 +786,165 @@ pub mod https {
 				send(&Request::get("https://api.example.org")),
 				Err(HttpsError::Host(HostError::Unavailable))
 			);
+		}
+	}
+}
+
+/// Broadcasts between plugins on versioned topics such as `serein.captions/1`.
+///
+/// A provider lists the topics it may [`broadcast`] in the manifest's `broadcasts`; a
+/// subscriber lists what it wants in `subscribes` and declares one `topic` action, where it
+/// calls [`read`]. Nothing flows until the user approves that provider, subscriber and
+/// topic. Broadcasts with no approved subscriber are dropped at once, and nothing is kept
+/// for subscribers that connect later. Messages leave a subscriber's queue only when its
+/// invocation succeeds; a full queue reports a [`Item::Gap`] with how many were lost.
+pub mod topics {
+	use super::HostError;
+	use serde::{Deserialize, Serialize};
+
+	/// Largest serialized payload of one broadcast.
+	pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+	/// Most messages one [`read`] returns.
+	pub const MAX_READ: u32 = 64;
+
+	/// One delivery batch, oldest first.
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Batch {
+		pub messages: Vec<Item>,
+		#[serde(default)]
+		pub more: bool,
+	}
+
+	#[derive(Clone, Debug, Deserialize, PartialEq)]
+	#[serde(tag = "kind", rename_all = "snake_case")]
+	pub enum Item {
+		Message {
+			seq: u64,
+			provider: String,
+			topic: String,
+			at_ms: i64,
+			payload: serde_json::Value,
+		},
+		/// `dropped` messages from `provider` on `topic` were lost here because this
+		/// subscriber's queue was full.
+		Gap {
+			seq: u64,
+			provider: String,
+			topic: String,
+			dropped: u64,
+		},
+		#[serde(other)]
+		Other,
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub enum TopicError {
+		Host(HostError),
+		/// The host's reply could not be decoded.
+		Reply,
+	}
+
+	/// Sends `payload` on `topic`; the number of approved subscribers that received it.
+	/// [`HostError::Invalid`] for an undeclared topic or an oversized payload,
+	/// [`HostError::Unavailable`] once this invocation sent 32.
+	pub fn broadcast(topic: &str, payload: &impl Serialize) -> Result<u32, TopicError> {
+		#[derive(Serialize)]
+		struct Request<'a, T: Serialize> {
+			topic: &'a str,
+			payload: &'a T,
+		}
+		let request =
+			serde_json::to_vec(&Request { topic, payload }).map_err(|_| TopicError::Reply)?;
+		if request.len() > MAX_PAYLOAD_BYTES + 1024 {
+			return Err(TopicError::Host(HostError::Invalid));
+		}
+		code(raw_broadcast(&request)).map(|reached| reached as u32)
+	}
+
+	/// Whether `topic`, which the manifest must declare in `broadcasts`, has an approved
+	/// subscriber; check before expensive work.
+	pub fn has_subscribers(topic: &str) -> bool {
+		raw_has_subscribers(topic.as_bytes()) == 1
+	}
+
+	/// Reads up to `max` (1 to [`MAX_READ`]) delivered messages in a `topic` action.
+	pub fn read(max: u32) -> Result<Batch, TopicError> {
+		if !(1..=MAX_READ).contains(&max) {
+			return Err(TopicError::Host(HostError::Invalid));
+		}
+		serde_json::from_slice(&raw_read(max)?).map_err(|_| TopicError::Reply)
+	}
+
+	fn code(code: i32) -> Result<i32, TopicError> {
+		match code {
+			0.. => Ok(code),
+			-1 => Err(TopicError::Host(HostError::Invalid)),
+			_ => Err(TopicError::Host(HostError::Unavailable)),
+		}
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn raw_broadcast(request: &[u8]) -> i32 {
+		// SAFETY: the host reads `request.len()` bytes from this live buffer.
+		unsafe { super::raw::broadcast(request.as_ptr(), request.len() as i32) }
+	}
+	#[cfg(target_arch = "wasm32")]
+	fn raw_has_subscribers(topic: &[u8]) -> i32 {
+		// SAFETY: the host reads `topic.len()` bytes from this live buffer.
+		unsafe { super::raw::has_subscribers(topic.as_ptr(), topic.len() as i32) }
+	}
+	#[cfg(target_arch = "wasm32")]
+	fn raw_read(max: u32) -> Result<Vec<u8>, TopicError> {
+		// SAFETY: a host call with no pointer arguments.
+		let length = code(unsafe { super::raw::topic_read(max as i32) })? as usize;
+		let mut reply = vec![0_u8; length];
+		// SAFETY: the host writes at most `length` bytes into this exclusive buffer.
+		let read = unsafe { super::raw::result_read(reply.as_mut_ptr(), length as i32) };
+		if read < 0 {
+			return Err(TopicError::Reply);
+		}
+		reply.truncate(read as usize);
+		Ok(reply)
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn raw_broadcast(_: &[u8]) -> i32 {
+		-2
+	}
+	#[cfg(not(target_arch = "wasm32"))]
+	fn raw_has_subscribers(_: &[u8]) -> i32 {
+		-2
+	}
+	#[cfg(not(target_arch = "wasm32"))]
+	fn raw_read(_: u32) -> Result<Vec<u8>, TopicError> {
+		Err(TopicError::Host(HostError::Unavailable))
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn deliveries_decode_messages_gaps_and_future_kinds() {
+			let batch: Batch = serde_json::from_str(
+				r#"{"messages":[
+				{"kind":"message","seq":3,"provider":"captioner","topic":"serein.captions/1","at_ms":9,"payload":{"text":"hi"}},
+				{"kind":"gap","seq":4,"provider":"captioner","topic":"serein.captions/1","dropped":5},
+				{"kind":"from_a_newer_host"}
+			],"more":false}"#,
+			)
+			.unwrap();
+			assert!(
+				matches!(&batch.messages[0], Item::Message { payload, .. } if payload["text"] == "hi")
+			);
+			assert!(matches!(batch.messages[1], Item::Gap { dropped: 5, .. }));
+			assert_eq!(batch.messages[2], Item::Other);
+			assert!(!has_subscribers("serein.captions/1"));
+			assert_eq!(
+				broadcast("serein.captions/1", &1),
+				Err(TopicError::Host(HostError::Unavailable))
+			);
+			assert_eq!(read(0), Err(TopicError::Host(HostError::Invalid)));
 		}
 	}
 }

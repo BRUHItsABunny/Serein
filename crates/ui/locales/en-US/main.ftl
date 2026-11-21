@@ -1005,6 +1005,12 @@ extensions-ui-details-modal-author = Author
 extensions-ui-details-modal-capabilities = Capabilities
 # Context: details_modal
 extensions-ui-details-modal-disable = Disable extension
+extensions-ui-connections-title = Connections between extensions
+extensions-ui-connections-hint = An extension receives what another one broadcasts only for the connections you turn on here. Nothing is kept for later.
+extensions-ui-connection = { $provider } → { $subscriber }: { $topic }
+extensions-ui-connection-network = { $subscriber } can send what it receives to { $hosts }.
+extensions-ui-consent-broadcasts = Can broadcast: { $topics }.
+extensions-ui-consent-subscribes = Wants to receive: { $topics }. You approve each source in Connections.
 extensions-ui-secrets-section = Secrets
 extensions-ui-secret-set = Set
 extensions-ui-secret-not-set = Not set

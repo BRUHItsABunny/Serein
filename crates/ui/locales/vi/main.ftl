@@ -1005,6 +1005,12 @@ extensions-ui-details-modal-author = tác giả
 extensions-ui-details-modal-capabilities = Khả năng
 # Context: details_modal
 extensions-ui-details-modal-disable = Tắt tiện ích mở rộng
+extensions-ui-connections-title = Kết nối giữa các tiện ích mở rộng
+extensions-ui-connections-hint = Một tiện ích chỉ nhận những gì tiện ích khác phát đi qua các kết nối bạn bật ở đây. Không có gì được giữ lại để dùng sau.
+extensions-ui-connection = { $provider } → { $subscriber }: { $topic }
+extensions-ui-connection-network = { $subscriber } có thể gửi những gì nó nhận được đến { $hosts }.
+extensions-ui-consent-broadcasts = Có thể phát: { $topics }.
+extensions-ui-consent-subscribes = Muốn nhận: { $topics }. Bạn duyệt từng nguồn trong mục Kết nối.
 extensions-ui-secrets-section = Bí mật
 extensions-ui-secret-set = Đã đặt
 extensions-ui-secret-not-set = Chưa đặt

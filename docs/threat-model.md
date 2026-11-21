@@ -10,7 +10,11 @@ cookies, proxies or Serein credentials; anything the same plugin can read, inclu
 the `message_journal`, can therefore leave the device to those origins, and the consent
 dialog says so. Plugin secrets never enter Wasm: the host fills `{{secret.<id>}}`
 placeholders only for each secret's declared origins and redacts echoed values from
-responses, though a declared origin that is hostile receives the value by design. Only explicitly granted, user-selected context crosses that boundary.
+responses, though a declared origin that is hostile receives the value by design.
+Plugins exchange data only through topics the user approved per provider, subscriber and
+topic; a subscriber sees only what a provider broadcasts, but data a reading plugin
+broadcasts can leave the device through a subscriber with `network`, which the
+Connections list warns about. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

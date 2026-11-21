@@ -114,6 +114,11 @@ pub enum ExtensionRequest {
 		id: String,
 		connection: bool,
 	},
+	/// Approve or revoke one subscription between two installed plugins.
+	SetSubscription {
+		subscription: extension_host::broker::Subscription,
+		approved: bool,
+	},
 	/// Save, or with `None` remove, a secret the plugin declares.
 	SetSecret {
 		id: String,
@@ -315,6 +320,8 @@ pub struct ExtensionUi {
 	confirm_delete_data: Option<(String, bool)>,
 	/// The secret being typed: plugin ID, secret ID and the masked value so far.
 	secret_edit: Option<(String, String, zeroize::Zeroizing<String>)>,
+	/// Subscriptions the user approved in this account.
+	pub subscriptions: Vec<extension_host::broker::Subscription>,
 }
 
 /// "1.5 MiB"-style size for data shown to the user.
@@ -1755,6 +1762,7 @@ impl ExtensionUi {
 				});
 		}
 		if !self.themes {
+			self.connections(ui, &colors);
 			self.kept_data(ui, &colors);
 		}
 		self.preview_modal(ui.ctx());
@@ -1889,6 +1897,75 @@ impl ExtensionUi {
 				}
 				Some(crate::dialog::Choice::Cancelled) => self.confirm_delete_data = None,
 				None => {}
+			}
+		}
+	}
+	/// Every provider, subscriber and topic the enabled plugins could connect, each with a
+	/// switch; nothing flows until the user turns one on.
+	fn connections(&mut self, ui: &mut egui::Ui, colors: &design::Palette) {
+		let enabled: Vec<&ExtensionEntry> = self
+			.entries
+			.iter()
+			.filter(|entry| entry.enabled && entry.manifest.kind == ExtensionKind::Plugin)
+			.collect();
+		let mut candidates = Vec::new();
+		for subscriber in &enabled {
+			for topic in &subscriber.manifest.subscribes {
+				for provider in &enabled {
+					if provider.manifest.id != subscriber.manifest.id
+						&& provider.manifest.broadcasts.contains(topic)
+					{
+						candidates.push((
+							extension_host::broker::Subscription {
+								subscriber: subscriber.manifest.id.clone(),
+								provider: provider.manifest.id.clone(),
+								topic: topic.clone(),
+							},
+							provider.manifest.name.clone(),
+							subscriber.manifest.name.clone(),
+							subscriber.manifest.network.join(", "),
+						));
+					}
+				}
+			}
+		}
+		if candidates.is_empty() {
+			return;
+		}
+		ui.add_space(16.0);
+		ui.label(design::eyebrow(
+			ui,
+			crate::i18n::translate("extensions-ui-connections-title"),
+			colors.muted,
+		));
+		crate::dialog::hint(ui, "extensions-ui-connections-hint");
+		for (subscription, provider, subscriber, hosts) in candidates {
+			let mut approved = self.subscriptions.contains(&subscription);
+			let label = crate::i18n::translate_args(
+				"extensions-ui-connection",
+				&[
+					("provider", &provider),
+					("subscriber", &subscriber),
+					("topic", &subscription.topic),
+				],
+			);
+			let warning = (!hosts.is_empty()).then(|| {
+				crate::i18n::translate_args(
+					"extensions-ui-connection-network",
+					&[("subscriber", &subscriber), ("hosts", &hosts)],
+				)
+			});
+			let response = ui.add_enabled_ui(!self.busy, |ui| {
+				design::switch(ui, &label, warning.as_deref(), &mut approved)
+			});
+			if response.inner.changed() {
+				self.queue(
+					ui.ctx(),
+					ExtensionRequest::SetSubscription {
+						subscription,
+						approved,
+					},
+				);
 			}
 		}
 	}
@@ -2947,6 +3024,27 @@ impl ExtensionUi {
 						}
 					}
 				}
+				for (key, topics) in [
+					(
+						"extensions-ui-consent-broadcasts",
+						&consent.entry.manifest.broadcasts,
+					),
+					(
+						"extensions-ui-consent-subscribes",
+						&consent.entry.manifest.subscribes,
+					),
+				] {
+					if !topics.is_empty() {
+						ui.label(
+							egui::RichText::new(crate::i18n::translate_args(
+								key,
+								&[("topics", &topics.join(", "))],
+							))
+							.size(13.0)
+							.color(colors.text),
+						);
+					}
+				}
 				if !consent.entry.manifest.secrets.is_empty() {
 					let labels: Vec<&str> = consent
 						.entry
@@ -3298,6 +3396,11 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			ExtensionRequest::SetSecret {
 				id, secret, value, ..
 			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),
+			ExtensionRequest::SetSubscription { subscription, .. } => {
+				subscription.subscriber.len()
+					+ subscription.provider.len()
+					+ subscription.topic.len()
+			}
 			ExtensionRequest::Invoke {
 				id,
 				invocation,
@@ -4091,6 +4194,8 @@ mod tests {
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
 				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: vec![Capability::Composer],
 				actions: vec![],
 			},
@@ -5074,6 +5179,46 @@ mod tests {
 		assert!(matches!(
 			shop.requests.as_slice(),
 			[ExtensionRequest::SetSecret { value: None, .. }]
+		));
+	}
+
+	#[test]
+	fn connections_list_each_shared_topic_and_warn_when_data_can_leave() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut provider = entry();
+		provider.enabled = true;
+		provider.manifest.id = "captioner".into();
+		provider.manifest.name = "Captioner".into();
+		provider.manifest.broadcasts = vec!["serein.captions/1".into()];
+		let mut subscriber = entry();
+		subscriber.enabled = true;
+		subscriber.manifest.id = "uploader".into();
+		subscriber.manifest.name = "Uploader".into();
+		subscriber.manifest.subscribes = vec!["serein.captions/1".into()];
+		subscriber.manifest.network = vec!["https://upload.example.org".into()];
+		shop.set_entries(vec![provider, subscriber]);
+		frame(&ctx, &mut shop, 900.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 900.0, vec![]);
+		let row = crate::i18n::translate_args(
+			"extensions-ui-connection",
+			&[
+				("provider", "Captioner"),
+				("subscriber", "Uploader"),
+				("topic", "serein.captions/1"),
+			],
+		);
+		assert!(labels.iter().any(|(text, _)| *text == row), "{labels:?}");
+		assert!(
+			labels
+				.iter()
+				.any(|(text, _)| text.contains("https://upload.example.org"))
+		);
+		click(&ctx, &mut shop, 900.0, &labels, &row);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSubscription { subscription, approved: true }]
+				if subscription.provider == "captioner" && subscription.subscriber == "uploader"
 		));
 	}
 

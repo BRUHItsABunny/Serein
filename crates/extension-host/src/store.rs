@@ -20,6 +20,7 @@ use extensions::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::broker::{Broker, Subscription, TopicSession};
 use crate::database::{self, PluginDatabase};
 use crate::journal::{self, JournalSession};
 use crate::network::PluginNetwork;
@@ -113,6 +114,12 @@ pub enum Job {
 		id: String,
 		account: Option<String>,
 		connection: bool,
+	},
+	/// Approves or revokes one subscription between two of the account's plugins.
+	SetSubscription {
+		account: String,
+		subscription: Subscription,
+		approved: bool,
 	},
 	/// Saves or, with `None`, removes a secret the plugin's manifest declares.
 	SetSecret {
@@ -391,6 +398,7 @@ pub enum Event {
 		installed: Vec<InstalledExtension>,
 		starters: Vec<Starter>,
 		data: Vec<PluginData>,
+		subscriptions: Vec<Subscription>,
 	},
 	Catalog(Catalog),
 	Preview {
@@ -410,6 +418,13 @@ pub enum Event {
 	},
 	/// Plugin data in the account's scopes, installed or kept from a removed plugin.
 	DataUsage(Vec<PluginData>),
+	/// A `topic` action finished; `more` when messages remain for another delivery.
+	TopicDelivered {
+		id: String,
+		more: bool,
+	},
+	/// The account's approved plugin subscriptions.
+	Subscriptions(Vec<Subscription>),
 	/// A `journal` action finished; `more` when entries remain for another delivery.
 	JournalDelivered {
 		id: String,
@@ -424,7 +439,10 @@ pub struct SystemImports {
 	database: Option<SharedDatabase>,
 	journal: Option<SharedJournal>,
 	network: Option<PluginNetwork>,
+	topics: Option<SharedTopics>,
 }
+
+type SharedTopics = Arc<std::sync::Mutex<TopicSession>>;
 
 type SharedDatabase = Arc<std::sync::Mutex<PluginDatabase>>;
 type SharedJournal = Arc<std::sync::Mutex<JournalSession>>;
@@ -436,6 +454,7 @@ type SharedJournal = Arc<std::sync::Mutex<JournalSession>>;
 struct Pending {
 	database: Option<SharedDatabase>,
 	journal: Option<SharedJournal>,
+	topics: Option<SharedTopics>,
 }
 
 impl Pending {
@@ -452,7 +471,19 @@ impl Pending {
 				.map_err(|_| "Message journal is unavailable".to_string())?
 				.commit()?;
 		}
+		if let Some(topics) = self.topics
+			&& let Ok(mut topics) = topics.lock()
+		{
+			topics.commit();
+		}
 		Ok(())
+	}
+
+	fn topics_more(&self) -> bool {
+		self.topics
+			.as_ref()
+			.and_then(|topics| topics.lock().ok().map(|topics| topics.more()))
+			.unwrap_or(false)
 	}
 
 	fn journal_more(&self) -> bool {
@@ -488,10 +519,23 @@ impl SystemImports {
 					stored.package.manifest.id.clone(),
 				)))
 			});
+		let manifest = &stored.package.manifest;
+		// Topics connect the account's own plugins; connection plugins have none.
+		let topics = (!is_proxy(manifest)
+			&& (!manifest.broadcasts.is_empty() || !manifest.subscribes.is_empty()))
+		.then(|| {
+			Arc::new(std::sync::Mutex::new(TopicSession::new(
+				gate.broker.clone(),
+				manifest.id.clone(),
+				manifest.broadcasts.clone(),
+				!manifest.subscribes.is_empty(),
+			)))
+		});
 		(
 			Box::new(Self {
 				database: database.clone(),
 				journal: journal.clone(),
+				topics: topics.clone(),
 				network: stored.grants.contains(&Capability::Network).then(|| {
 					let mut network =
 						PluginNetwork::new(&stored.package.manifest.network, gate.clone());
@@ -507,7 +551,11 @@ impl SystemImports {
 					network
 				}),
 			}),
-			Pending { database, journal },
+			Pending {
+				database,
+				journal,
+				topics,
+			},
 		)
 	}
 }
@@ -537,6 +585,24 @@ impl extensions::HostImports for SystemImports {
 			None => extensions::Reply::Unavailable,
 		}
 	}
+	fn broadcast(&mut self, request: &[u8]) -> i32 {
+		match self.topics.as_ref().and_then(|topics| topics.lock().ok()) {
+			Some(mut topics) => topics.broadcast(request),
+			None => extensions::imports::status::UNAVAILABLE,
+		}
+	}
+	fn has_subscribers(&mut self, topic: &str) -> i32 {
+		match self.topics.as_ref().and_then(|topics| topics.lock().ok()) {
+			Some(topics) => topics.has_subscribers(topic),
+			None => extensions::imports::status::UNAVAILABLE,
+		}
+	}
+	fn topic_read(&mut self, max: u32) -> extensions::Reply {
+		match self.topics.as_ref().and_then(|topics| topics.lock().ok()) {
+			Some(mut topics) => topics.read(max),
+			None => extensions::Reply::Unavailable,
+		}
+	}
 	fn journal_read(&mut self, max_entries: u32) -> extensions::Reply {
 		match &self.journal {
 			Some(journal) => match journal.lock() {
@@ -555,6 +621,7 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// A single worker exists only while a job runs. Queued jobs and results have fixed limits.
 pub struct ExtensionHost {
 	root: PathBuf,
+	broker: Arc<Broker>,
 	generation: Arc<AtomicU64>,
 	wake_cancel: Arc<tokio::sync::Notify>,
 	queue: VecDeque<(u64, Job)>,
@@ -567,6 +634,7 @@ impl ExtensionHost {
 	pub fn new(root: PathBuf) -> Self {
 		Self {
 			root,
+			broker: Arc::new(Broker::default()),
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::new(tokio::sync::Notify::new()),
 			queue: VecDeque::new(),
@@ -597,6 +665,11 @@ impl ExtensionHost {
 		self.queue.push_back((token, job));
 		self.start_next();
 		Ok(token)
+	}
+
+	/// The broker plugin broadcasts go through; the front end sets its subscriptions.
+	pub fn broker(&self) -> Arc<Broker> {
+		self.broker.clone()
 	}
 
 	/// The message journal shared by `account`'s plugins, kept with their data.
@@ -645,6 +718,7 @@ impl ExtensionHost {
 			epoch: generation.load(Ordering::Acquire),
 			generation,
 			wake_cancel: self.wake_cancel.clone(),
+			broker: self.broker.clone(),
 		};
 		let wake = self.wake.clone();
 		self.active = Some((token, receiver));
@@ -679,6 +753,8 @@ pub(crate) struct Gate {
 	epoch: u64,
 	generation: Arc<AtomicU64>,
 	pub(crate) wake_cancel: Arc<tokio::sync::Notify>,
+	/// The host's broker for plugin broadcasts.
+	pub(crate) broker: Arc<Broker>,
 }
 impl Gate {
 	/// A gate no job cancellation reaches, for device files written outside the job queue.
@@ -687,6 +763,7 @@ impl Gate {
 			epoch: 0,
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::new(tokio::sync::Notify::new()),
+			broker: Arc::new(Broker::default()),
 		}
 	}
 	pub(crate) fn check(&self) -> Result<(), String> {
@@ -917,6 +994,15 @@ fn validate_job(job: &Job) -> Result<(), String> {
 				return Err("Secrets are 1 to 4,096 characters without line breaks".into());
 			}
 		}
+		Job::SetSubscription { subscription, .. } => {
+			valid_id(&subscription.subscriber)?;
+			valid_id(&subscription.provider)?;
+			if subscription.subscriber == subscription.provider
+				|| !extensions::topics::valid_name(&subscription.topic)
+			{
+				return Err("Invalid subscription".into());
+			}
+		}
 		Job::SetDatabaseQuota { id, bytes, .. } => {
 			valid_id(id)?;
 			if !database::QUOTAS.contains(bytes) {
@@ -1045,6 +1131,10 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			starters: starters()?,
 			installed: load(root, account.as_deref(), gate)?,
 			data: data_usage(root, account.as_deref())?,
+			subscriptions: match account.as_deref() {
+				Some(account) => read_subscriptions(root, account),
+				None => Vec::new(),
+			},
 		}),
 		Job::RefreshCatalog => {
 			let bytes = download(CATALOG_URL, MAX_CATALOG, gate, Duration::from_secs(15))?;
@@ -1081,12 +1171,52 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 		} => {
 			let parent = scope(root, kind, account.as_deref())?;
 			disable(&parent, &id, gate)?;
+			// Disabling either side of a subscription ends it.
+			if let Some(account) = account.as_deref().filter(|_| kind == ExtensionKind::Plugin) {
+				let mut subscriptions = read_subscriptions(root, account);
+				let before = subscriptions.len();
+				subscriptions.retain(|subscription| {
+					subscription.subscriber != id && subscription.provider != id
+				});
+				if subscriptions.len() != before {
+					write_subscriptions(root, account, &subscriptions, gate)?;
+				}
+			}
 			if delete_data && kind == ExtensionKind::Plugin {
 				delete_data_dir(&data_dir(root, &id, account.as_deref())?)?;
 			}
 			Ok(Event::Disabled(id))
 		}
 		Job::DataUsage { account } => data_usage(root, account.as_deref()).map(Event::DataUsage),
+		Job::SetSubscription {
+			account,
+			subscription,
+			approved,
+		} => {
+			let mut subscriptions = read_subscriptions(root, &account);
+			subscriptions.retain(|existing| *existing != subscription);
+			if approved {
+				let parent = scope(root, ExtensionKind::Plugin, Some(&account))?;
+				let manifest = |id: &str| {
+					read_stored(&parent.join(id).join("package.json"))
+						.map(|stored| stored.package.manifest)
+				};
+				let topic = &subscription.topic;
+				if !manifest(&subscription.subscriber)?
+					.subscribes
+					.contains(topic)
+					|| !manifest(&subscription.provider)?.broadcasts.contains(topic)
+				{
+					return Err("Those plugins do not share that topic".into());
+				}
+				if subscriptions.len() >= MAX_SUBSCRIPTIONS {
+					return Err("Too many plugin subscriptions; revoke one first".into());
+				}
+				subscriptions.push(subscription);
+			}
+			write_subscriptions(root, &account, &subscriptions, gate)?;
+			Ok(Event::Subscriptions(subscriptions))
+		}
 		Job::DeleteData {
 			id,
 			account,
@@ -1199,6 +1329,10 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				stored.package.manifest.actions.iter().any(|action| {
 					action.id == invocation.action && action.surface == Surface::Journal
 				});
+			let topic_action =
+				stored.package.manifest.actions.iter().any(|action| {
+					action.id == invocation.action && action.surface == Surface::Topic
+				});
 			if journal_action && !stored.grants.contains(&Capability::MessageJournal) {
 				return Err("Plugin access was not granted".into());
 			}
@@ -1233,6 +1367,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			}
 			gate.check()?;
 			let more = pending.journal_more();
+			let topics_more = pending.topics_more();
 			pending.commit()?;
 			if let Some(saved) = saved {
 				fs::create_dir_all(&data).map_err(|_| "Cannot create plugin data directory")?;
@@ -1240,6 +1375,12 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			}
 			if journal_action {
 				return Ok(Event::JournalDelivered { id, more });
+			}
+			if topic_action {
+				return Ok(Event::TopicDelivered {
+					id,
+					more: topics_more,
+				});
 			}
 			Ok(Event::Invoked { id, output })
 		}
@@ -1414,6 +1555,33 @@ fn install_stored(
 		)?;
 	}
 	Ok(summary)
+}
+
+/// Approved subscriptions one account keeps.
+const MAX_SUBSCRIPTIONS: usize = 64;
+const SUBSCRIPTIONS_FILE: &str = "subscriptions.json";
+
+fn read_subscriptions(root: &Path, account: &str) -> Vec<Subscription> {
+	data_scope(root, Some(account))
+		.ok()
+		.and_then(|scope| read_bounded(&scope.join(SUBSCRIPTIONS_FILE), 64 * 1024).ok())
+		.and_then(|bytes| serde_json::from_slice::<Vec<Subscription>>(&bytes).ok())
+		.unwrap_or_default()
+		.into_iter()
+		.take(MAX_SUBSCRIPTIONS)
+		.collect()
+}
+
+fn write_subscriptions(
+	root: &Path,
+	account: &str,
+	subscriptions: &[Subscription],
+	gate: &Gate,
+) -> Result<(), String> {
+	let scope = data_scope(root, Some(account))?;
+	fs::create_dir_all(&scope).map_err(|_| "Cannot create plugin data directory")?;
+	let bytes = serde_json::to_vec(subscriptions).map_err(|_| "Cannot encode subscriptions")?;
+	atomic_write(&scope.join(SUBSCRIPTIONS_FILE), &bytes, gate)
 }
 
 /// Plugin data lives apart from packages, so disabling, updating, reinstalling or logging
@@ -1725,6 +1893,8 @@ fn load(
 							actions: Vec::new(),
 							network: Vec::new(),
 							secrets: Vec::new(),
+							broadcasts: Vec::new(),
+							subscribes: Vec::new(),
 						},
 						theme: None,
 						reviewed: false,
@@ -2281,6 +2451,8 @@ mod tests {
 				kind: ExtensionKind::Theme,
 				network: Vec::new(),
 				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: Vec::new(),
 				actions: Vec::new(),
 			},
@@ -2575,6 +2747,8 @@ mod tests {
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
 				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: vec![Capability::Database],
 				actions: vec![extensions::Action {
 					id: "run".into(),
@@ -2829,6 +3003,133 @@ mod tests {
 		}
 	}
 
+	/// A plugin `id` whose one action runs `body`; with `broadcasts` it is a panel action,
+	/// otherwise a `topic` action subscribed to `serein.test/1`.
+	fn topic_plugin(id: &str, broadcasts: bool, imports: &str, data: &str, body: &str) -> Package {
+		let mut package = database_plugin("{}");
+		package.manifest.id = id.into();
+		package.manifest.capabilities.clear();
+		if broadcasts {
+			package.manifest.broadcasts = vec!["serein.test/1".into()];
+			package.manifest.actions[0].surface = Surface::Panel;
+		} else {
+			package.manifest.subscribes = vec!["serein.test/1".into()];
+			package.manifest.actions[0].surface = Surface::Topic;
+		}
+		package.wasm = wat::parse_str(format!(
+			r#"(module {imports} (memory (export "memory") 1) {data}
+			(data (i32.const 4096) "{{}}")
+			(func (export "serein_alloc") (param i32) (result i32) (i32.const 8192))
+			(func (export "serein_invoke") (param i32 i32) (result i64) {body}
+				(i64.const {})))"#,
+			(4096_u64 << 32) | 2,
+		))
+		.unwrap();
+		package
+	}
+
+	#[test]
+	fn broadcasts_reach_only_approved_subscribers_and_disabling_ends_the_connection() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let gate = gate();
+		let request = r#"{"topic":"serein.test/1","payload":{"n":1}}"#;
+		let escaped: String = request.bytes().map(|b| format!("\\{b:02x}")).collect();
+		let provider = topic_plugin(
+			"provider",
+			true,
+			r#"(import "serein" "broadcast" (func $send (param i32 i32) (result i32)))"#,
+			&format!(r#"(data (i32.const 1024) "{escaped}")"#),
+			&format!(
+				"(drop (call $send (i32.const 1024) (i32.const {})))",
+				request.len()
+			),
+		);
+		let subscriber = topic_plugin(
+			"subscriber",
+			false,
+			r#"(import "serein" "topic_read" (func $read (param i32) (result i32)))"#,
+			"",
+			"(drop (call $read (i32.const 64)))",
+		);
+		let mut stranger = topic_plugin("stranger", false, "", "", "");
+		stranger.manifest.subscribes = vec!["serein.other/1".into()];
+		for package in [&provider, &subscriber, &stranger] {
+			enable(
+				&root,
+				source(&profile, package),
+				Vec::new(),
+				Some("account"),
+				&gate,
+			)
+			.unwrap();
+		}
+		let subscription = |subscriber: &str| Subscription {
+			subscriber: subscriber.into(),
+			provider: "provider".into(),
+			topic: "serein.test/1".into(),
+		};
+		let approve = |subscription: Subscription, approved: bool| {
+			run(
+				&root,
+				Job::SetSubscription {
+					account: "account".into(),
+					subscription,
+					approved,
+				},
+				&gate,
+			)
+		};
+		// Only plugins that share the topic can be connected.
+		assert!(approve(subscription("stranger"), true).is_err());
+		let Ok(Event::Subscriptions(saved)) = approve(subscription("subscriber"), true) else {
+			panic!("subscription not saved")
+		};
+		assert_eq!(saved, [subscription("subscriber")]);
+		let invoke = |id: &str| {
+			run(
+				&root,
+				Job::Invoke {
+					id: id.into(),
+					account: "account".into(),
+					invocation: Invocation {
+						action: "run".into(),
+						..Default::default()
+					},
+				},
+				&gate,
+			)
+		};
+		// The front end hands the broker the live subscriptions.
+		invoke("provider").unwrap();
+		assert!(
+			gate.broker.pending().is_empty(),
+			"nothing flows before the broker knows"
+		);
+		gate.broker
+			.set_subscriptions(saved.iter().cloned().collect());
+		invoke("provider").unwrap();
+		assert_eq!(gate.broker.pending(), ["subscriber"]);
+		assert!(matches!(
+			invoke("subscriber"),
+			Ok(Event::TopicDelivered { more: false, .. })
+		));
+		assert!(gate.broker.pending().is_empty());
+		// Disabling either side removes the saved subscription.
+		run(
+			&root,
+			Job::Disable {
+				id: "provider".into(),
+				kind: ExtensionKind::Plugin,
+				account: Some("account".into()),
+				delete_data: true,
+			},
+			&gate,
+		)
+		.unwrap();
+		assert!(read_subscriptions(&root, "account").is_empty());
+	}
+
 	#[test]
 	fn data_kept_inside_a_package_directory_moves_to_the_data_directory() {
 		let profile = Profile::new();
@@ -2884,6 +3185,8 @@ mod tests {
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
 				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: vec![Capability::MessageJournal],
 				actions: vec![extensions::Action {
 					id: "journal".into(),

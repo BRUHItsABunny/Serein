@@ -547,6 +547,9 @@ granted by the user:
 | `db_execute` | `(ptr: i32, len: i32) -> i32` | `database` | Runs one JSON request of at most 256 KiB; the pending reply's length, `-3` with a pending error message of at most 1 KiB, `-1` invalid length, `-2` unavailable |
 | `journal_read` | `(max: i32) -> i32` | `message_journal` | Reads 1-256 entries after the plugin's journal position; the pending reply's length, `-3` with a pending error, `-1` invalid count, `-2` unavailable |
 | `https_request` | `(ptr: i32, len: i32) -> i32` | `network` | Performs one JSON request to a declared origin; the pending response's length, `-3` with a pending error, `-1` invalid length, `-2` unavailable |
+| `broadcast` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | Sends `{"topic", "payload"}` (payload at most 16 KiB); the number of approved subscribers reached, or `-1` invalid / `-2` limit |
+| `has_subscribers` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | `1` when the topic has an approved subscriber, else `0` |
+| `topic_read` | `(max: i32) -> i32` | manifest `subscribes` | Reads 1-64 delivered messages in a `topic` action; the pending reply's length |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -708,6 +711,33 @@ only for the request; Serein zeroizes its own copies where practical.
 
 Secrets follow the plugin's data: keeping data on disable or logout keeps them; deleting
 the plugin's data also removes them from the credential store.
+
+## Broadcasts between plugins (preview)
+
+A provider lists versioned topics, such as `serein.captions/1`, in `broadcasts`; a
+subscriber lists them in `subscribes` and declares exactly one action with
+`surface: "topic"`, which may return only `storage`. Shared payload formats are defined in
+[extension topics](extension-topics.md).
+
+```json
+"broadcasts": ["serein.captions/1"]
+```
+
+- **Approval.** Nothing flows until the user turns on that provider, subscriber and topic
+  in Settings > Extensions > Connections, which lists every pairing the enabled plugins
+  allow and warns when the subscriber can send data to network origins. Approvals are
+  saved per account (at most 64) and end when either plugin is disabled.
+- **Delivery.** `serein.broadcast` copies the payload to each approved subscriber's
+  queue; with none it is dropped before copying (`has_subscribers` lets a provider skip
+  the work). The host then invokes the subscriber's `topic` action, which reads with
+  `serein.topic_read`. Messages leave the queue only when that invocation is accepted,
+  so a failed delivery is retried with the next one (after a 10-second pause).
+- **Bounds.** Payloads are at most 16 KiB; 32 broadcasts per invocation; each subscriber
+  queue holds 64 messages / 256 KiB. A full queue records a `gap` item with the provider,
+  topic and number dropped instead of losing messages silently.
+- **No history.** Queues live in memory only; nothing is replayed to subscribers that
+  connect later, and logout, an account switch or a revoked connection discards them.
+  A plugin that needs history stores what it receives in its own database.
 
 ## Plugin data (preview)
 

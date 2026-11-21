@@ -13,6 +13,8 @@ fn plugin(wasm: &str) -> Package {
 			kind: ExtensionKind::Plugin,
 			network: Vec::new(),
 			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![Capability::Composer],
 			actions: vec![Action {
 				id: "run".into(),
@@ -983,4 +985,39 @@ fn network_origins_and_capability_come_together() {
 		.map(|i| format!("https://h{i}.example.org"))
 		.collect();
 	assert!(matches!(package.validate(), Err(Error::Limit)));
+}
+
+#[test]
+fn topics_are_named_versioned_and_subscribers_declare_a_delivery_action() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.broadcasts = vec!["serein.captions/1".into()];
+	manifest.validate().unwrap();
+	for invalid in [
+		vec!["captions"],
+		vec!["serein.captions/1", "serein.captions/1"],
+	] {
+		manifest.broadcasts = invalid.iter().map(|t| t.to_string()).collect();
+		assert!(manifest.validate().is_err(), "{invalid:?}");
+	}
+	manifest.broadcasts.clear();
+	// Subscribing needs a topic action, and a topic action needs subscriptions.
+	manifest.subscribes = vec!["serein.captions/1".into()];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions.push(Action {
+		id: "receive".into(),
+		label: "Receive".into(),
+		surface: Surface::Topic,
+	});
+	manifest.validate().unwrap();
+	manifest.subscribes.clear();
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	// The imports themselves need no capability; the host checks topics per call.
+	let importing_topics = importing(
+		r#"(import "serein" "broadcast" (func (param i32 i32) (result i32)))
+		(import "serein" "has_subscribers" (func (param i32 i32) (result i32)))
+		(import "serein" "topic_read" (func (param i32) (result i32)))"#,
+		&[],
+		"(i32.const 1)",
+	);
+	importing_topics.validate().unwrap();
 }

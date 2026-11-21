@@ -2167,6 +2167,15 @@ logs or diagnostics, and are read on the extension worker only to fill a request
 store means no plugin secrets; there is no plaintext fallback. The demo keeps them in
 process memory.
 
+## Plugin broadcasts (preview, November 21, 2026)
+
+Approved provider/subscriber/topic connections are saved per account in
+`extensions/plugin-data/<account key>/subscriptions.json` (at most 64 entries, 64 KiB).
+Broadcast payloads exist only in RAM: one queue per subscriber of at most 64 messages /
+256 KiB plus at most 16 gap markers, each payload at most 16 KiB. Nothing is written to
+disk, journaled or replayed; scope changes, logout and revoked connections discard queued
+messages, and disabling either plugin removes its saved connections.
+
 ## Plugin data lifecycle (preview, November 21, 2026)
 
 Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`

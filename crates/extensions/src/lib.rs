@@ -7,6 +7,7 @@ mod runtime;
 pub use runtime::{invoke, invoke_with};
 pub mod imports;
 pub mod network;
+pub mod topics;
 pub use imports::{HostImports, NoHostImports, Reply};
 mod rich_presence;
 pub use rich_presence::*;
@@ -240,6 +241,9 @@ pub enum Surface {
 	/// Host-scheduled delivery of the message journal; the plugin pulls entries with
 	/// `serein.journal_read`. Requires `message_journal`.
 	Journal,
+	/// Host-scheduled delivery of broadcasts from approved providers; the plugin pulls them
+	/// with `serein.topic_read`. Requires a `subscribes` list.
+	Topic,
 }
 
 impl Surface {
@@ -279,6 +283,14 @@ pub struct Manifest {
 	/// requests to their origins; the plugin never reads them.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub secrets: Vec<network::SecretSpec>,
+	/// Versioned topics this plugin may broadcast to approved subscribers, such as
+	/// `serein.captions/1`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub broadcasts: Vec<String>,
+	/// Topics this plugin receives through its `topic` action once the user approves a
+	/// provider for each.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub subscribes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,6 +940,7 @@ impl Manifest {
 			return Err(Error::Capability);
 		}
 		network::validate_secrets(&self.secrets, &origins)?;
+		topics::validate(self)?;
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)
 		{
@@ -957,6 +970,7 @@ impl Manifest {
 			Surface::AppEvent,
 			Surface::Tick,
 			Surface::Journal,
+			Surface::Topic,
 		] {
 			if self
 				.actions
@@ -990,6 +1004,7 @@ impl Manifest {
 				Surface::AppEvent => Some(Capability::AppEvents),
 				Surface::Tick => Some(Capability::Appearance),
 				Surface::Journal => Some(Capability::MessageJournal),
+				Surface::Topic => None,
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1344,15 +1359,17 @@ impl Invocation {
 		{
 			return Err(Error::Capability);
 		}
-		if matches!(action.surface, Surface::Tick | Surface::Journal)
-			&& (!self.values.is_empty()
-				|| self.message_event.is_some()
-				|| self.app.is_some()
-				|| self.app_event.is_some()
-				|| self.action_result.is_some()
-				|| self.queries.is_some()
-				|| self.messaging_settings.is_some()
-				|| self.guild_folders.is_some())
+		if matches!(
+			action.surface,
+			Surface::Tick | Surface::Journal | Surface::Topic
+		) && (!self.values.is_empty()
+			|| self.message_event.is_some()
+			|| self.app.is_some()
+			|| self.app_event.is_some()
+			|| self.action_result.is_some()
+			|| self.queries.is_some()
+			|| self.messaging_settings.is_some()
+			|| self.guild_folders.is_some())
 		{
 			return Err(Error::Capability);
 		}
@@ -1414,8 +1431,8 @@ impl Output {
 				screen.validate().map_err(|_| Error::Invalid)?;
 			}
 		}
-		// A journal delivery may only save storage; its database writes go through imports.
-		if surface == Surface::Journal
+		// Journal and topic deliveries may only save storage; database writes go through imports.
+		if matches!(surface, Surface::Journal | Surface::Topic)
 			&& (self.rich_presence.is_some()
 				|| self.api_proxy.is_some()
 				|| self.image_sharing

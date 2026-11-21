@@ -283,6 +283,8 @@ mod tests {
 			kind: ExtensionKind::Plugin,
 			network: Vec::new(),
 			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![Capability::RichPresence],
 			actions: vec![Action {
 				id: "apply".into(),

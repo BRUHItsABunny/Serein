@@ -54,8 +54,8 @@ struct Pending {
 	preview: Option<(String, String)>,
 	invocation: Option<(String, Invocation, ExtensionContext)>,
 	tick: Option<String>,
-	/// The plugin a `journal` delivery runs for.
-	journal: Option<String>,
+	/// The plugin a background `journal` or `topic` delivery runs for.
+	delivery: Option<String>,
 }
 impl Pending {
 	fn reactive(&self) -> bool {
@@ -145,6 +145,8 @@ const MAX_MESSAGE_EVENT_BYTES: usize = 64 * 1024;
 const MESSAGE_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 /// Shortest pause between two message journal deliveries.
 const JOURNAL_INTERVAL: Duration = Duration::from_millis(100);
+/// Pause before a subscriber whose topic delivery failed receives messages again.
+const TOPIC_RETRY: Duration = Duration::from_secs(10);
 
 /// `interface` is the plugin's last restated interface; with the invocation it picks the
 /// channel directory's focus server.
@@ -250,6 +252,12 @@ pub struct Bridge {
 	/// Consumers with entries to deliver.
 	journal_due: BTreeSet<String>,
 	journal_at: Option<Instant>,
+	/// Subscriptions the user approved in this account, as saved.
+	subscriptions: Vec<extension_host::broker::Subscription>,
+	/// The subscriptions last handed to the broker: approved ones whose plugins both run.
+	live_subscriptions: BTreeSet<extension_host::broker::Subscription>,
+	/// Subscribers whose last topic delivery failed, and when they may try again.
+	topic_retry: BTreeMap<String, Instant>,
 }
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
@@ -722,7 +730,7 @@ impl Bridge {
 			|| self
 				.pending
 				.values()
-				.any(|pending| pending.journal.is_some())
+				.any(|pending| pending.delivery.is_some())
 		{
 			return;
 		}
@@ -766,7 +774,7 @@ impl Bridge {
 						preview: None,
 						invocation: None,
 						tick: None,
-						journal: Some(id),
+						delivery: Some(id),
 					},
 				);
 			}
@@ -797,6 +805,12 @@ impl Bridge {
 	}
 	/// Stops the journal writer after it wrote what was queued; the next scope reopens it.
 	fn close_journal(&mut self) {
+		self.subscriptions.clear();
+		self.topic_retry.clear();
+		self.live_subscriptions.clear();
+		if let Some(host) = &self.host {
+			host.broker().set_subscriptions(BTreeSet::new());
+		}
 		self.journal = None;
 		self.journal_consumers.clear();
 		self.journal_due.clear();
@@ -850,7 +864,7 @@ impl Bridge {
 						preview: None,
 						invocation: None,
 						tick: None,
-						journal: None,
+						delivery: None,
 					},
 				);
 			}
@@ -996,9 +1010,11 @@ impl Bridge {
 				continue;
 			}
 			match outcome {
-				Err(error) if pending.as_ref().is_some_and(|p| p.journal.is_some()) => {
+				Err(error) if pending.as_ref().is_some_and(|p| p.delivery.is_some()) => {
 					// The cursor did not move; the entries are delivered again with the next ones.
-					let id = pending.and_then(|p| p.journal).unwrap_or_default();
+					let id = pending.and_then(|p| p.delivery).unwrap_or_default();
+					self.topic_retry
+						.insert(id.clone(), Instant::now() + TOPIC_RETRY);
 					messaging.extensions.status =
 						format!("{id} could not process the message journal. {error}");
 				}
@@ -1058,13 +1074,29 @@ impl Bridge {
 					}
 				}
 				Ok(Event::DataUsage(data)) => messaging.extensions.plugin_data = data,
+				Ok(Event::Subscriptions(subscriptions)) => {
+					messaging
+						.extensions
+						.subscriptions
+						.clone_from(&subscriptions);
+					self.subscriptions = subscriptions;
+				}
+				Ok(Event::TopicDelivered { id, .. }) => {
+					self.topic_retry.remove(&id);
+				}
 				Ok(Event::Loaded {
 					catalog,
 					installed,
 					starters,
 					data,
+					subscriptions,
 				}) => {
 					messaging.extensions.plugin_data = data;
+					messaging
+						.extensions
+						.subscriptions
+						.clone_from(&subscriptions);
+					self.subscriptions = subscriptions;
 					if let Some(catalog) = catalog {
 						self.catalog = catalog
 							.entries
@@ -1503,6 +1535,24 @@ impl Bridge {
 						messaging,
 					);
 				}
+				ExtensionRequest::SetSubscription {
+					subscription,
+					approved,
+				} => {
+					if let Some(account) = &account {
+						self.submit(
+							Job::SetSubscription {
+								account: account.clone(),
+								subscription,
+								approved,
+							},
+							None,
+							state.generation,
+							ctx,
+							messaging,
+						);
+					}
+				}
 				ExtensionRequest::SetSecret {
 					id,
 					connection,
@@ -1807,6 +1857,102 @@ impl Bridge {
 		}
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
 		self.journal(&account, state, ctx, messaging);
+		self.topics(&account, state.generation, ctx, messaging);
+	}
+	fn topic_action(entry: &InstalledExtension) -> Option<&str> {
+		entry
+			.manifest
+			.actions
+			.iter()
+			.find(|action| action.surface == Surface::Topic)
+			.map(|action| action.id.as_str())
+	}
+	/// Hands the broker the approved subscriptions whose plugins both run, and starts one
+	/// topic delivery when a subscriber has messages waiting.
+	fn topics(
+		&mut self,
+		account: &Option<String>,
+		generation: u64,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let running = |id: &str| {
+			self.installed.iter().any(|entry| {
+				entry.manifest.id == id && entry.error.is_none() && !self.disabled.contains(id)
+			})
+		};
+		let live: BTreeSet<_> = if account.is_some() && self.start_screen_loaded {
+			self.subscriptions
+				.iter()
+				.filter(|subscription| {
+					running(&subscription.subscriber) && running(&subscription.provider)
+				})
+				.cloned()
+				.collect()
+		} else {
+			BTreeSet::new()
+		};
+		let broker = self.host.as_ref().unwrap().broker();
+		if live != self.live_subscriptions {
+			broker.set_subscriptions(live.clone());
+			self.live_subscriptions = live;
+		}
+		let Some(account) = account else {
+			return;
+		};
+		if self.host.as_ref().unwrap().busy()
+			|| !self.message_events.is_empty()
+			|| self
+				.pending
+				.values()
+				.any(|pending| pending.delivery.is_some())
+		{
+			return;
+		}
+		let now = Instant::now();
+		self.topic_retry.retain(|_, at| *at > now);
+		let Some((id, action)) = broker.pending().into_iter().find_map(|id| {
+			if self.topic_retry.contains_key(&id) {
+				return None;
+			}
+			let entry = self
+				.installed
+				.iter()
+				.find(|entry| entry.manifest.id == id)?;
+			Some((id.clone(), Self::topic_action(entry)?.to_owned()))
+		}) else {
+			if let Some(next) = self.topic_retry.values().min() {
+				ctx.request_repaint_after(next.saturating_duration_since(now));
+			}
+			return;
+		};
+		let job = Job::Invoke {
+			id: id.clone(),
+			account: account.clone(),
+			invocation: Invocation {
+				action,
+				..Default::default()
+			},
+		};
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
+			Ok(token) => {
+				self.pending.insert(
+					token,
+					Pending {
+						catalog: false,
+						theme_save: false,
+						generation,
+						cleanup: false,
+						reconcile: false,
+						preview: None,
+						invocation: None,
+						tick: None,
+						delivery: Some(id),
+					},
+				);
+			}
+			Err(error) => messaging.extensions.report_error(error),
+		}
 	}
 	fn schedule_ticks(
 		&mut self,
@@ -1892,7 +2038,7 @@ impl Bridge {
 								preview: None,
 								invocation: None,
 								tick: Some(id),
-								journal: None,
+								delivery: None,
 							},
 						);
 					}
@@ -1978,7 +2124,7 @@ impl Bridge {
 						generation,
 						invocation,
 						tick: None,
-						journal: None,
+						delivery: None,
 					},
 				);
 			}
@@ -2293,7 +2439,7 @@ mod tests {
 				preview: None,
 				invocation: None,
 				tick: Some("rainbow".into()),
-				journal: None,
+				delivery: None,
 			},
 		);
 		assert!(bridge.tick_pending(7, "rainbow"));
@@ -2554,6 +2700,8 @@ mod tests {
 			kind: extensions::ExtensionKind::Plugin,
 			network: Vec::new(),
 			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![
 				Capability::InterfaceUi,
 				Capability::AppEvents,
@@ -2667,6 +2815,8 @@ mod tests {
 			kind: extensions::ExtensionKind::Plugin,
 			network: Vec::new(),
 			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![Capability::InterfaceUi, Capability::StartScreen],
 			actions: vec![
 				extensions::Action {

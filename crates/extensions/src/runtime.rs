@@ -50,10 +50,13 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			.ok_or(Error::Module)?;
 		let expected = match host.kind {
 			Kind::ClockNowMs => FuncType::new([], [ValType::I64]),
-			Kind::RandomFill | Kind::DbExecute | Kind::ResultRead | Kind::HttpsRequest => {
-				FuncType::new([ValType::I32, ValType::I32], [ValType::I32])
-			}
-			Kind::JournalRead => FuncType::new([ValType::I32], [ValType::I32]),
+			Kind::RandomFill
+			| Kind::DbExecute
+			| Kind::ResultRead
+			| Kind::HttpsRequest
+			| Kind::Broadcast
+			| Kind::HasSubscribers => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+			Kind::JournalRead | Kind::TopicRead => FuncType::new([ValType::I32], [ValType::I32]),
 		};
 		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
 			return Err(Error::Module);
@@ -232,6 +235,64 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					.read(&caller, pointer, &mut request)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
 				let reply = caller.data_mut().services.https_request(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"broadcast",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				let Some((pointer, length)) =
+					span(pointer, length, crate::topics::MAX_REQUEST_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let mut request = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut request)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				Ok(caller.data_mut().services.broadcast(&request))
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"has_subscribers",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				charge(&mut caller, 0)?;
+				let Some((pointer, length)) = span(pointer, length, 64) else {
+					return Ok(status::INVALID);
+				};
+				let mut topic = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut topic)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let Ok(topic) = String::from_utf8(topic) else {
+					return Ok(status::INVALID);
+				};
+				Ok(caller.data_mut().services.has_subscribers(&topic))
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"topic_read",
+			|mut caller: Caller<'_, HostState>, max: i32| {
+				caller.data_mut().pending = None;
+				charge(&mut caller, 0)?;
+				let Some(max) = u32::try_from(max)
+					.ok()
+					.filter(|max| (1..=crate::topics::MAX_READ).contains(max))
+				else {
+					return Ok(status::INVALID);
+				};
+				let reply = caller.data_mut().services.topic_read(max);
 				hold(&mut caller, reply)
 			},
 		)

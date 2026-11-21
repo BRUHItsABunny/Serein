@@ -1048,6 +1048,8 @@ mod tests {
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
 				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: vec![capability],
 				actions: vec![],
 			},

@@ -145,6 +145,8 @@ impl ThemeEditor {
 					kind: ExtensionKind::Theme,
 					network: Vec::new(),
 					secrets: Vec::new(),
+					broadcasts: Vec::new(),
+					subscribes: Vec::new(),
 					capabilities: vec![],
 					actions: vec![],
 				},

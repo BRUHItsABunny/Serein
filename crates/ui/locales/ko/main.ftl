@@ -5110,6 +5110,12 @@ extensions-ui-details-modal-author = 제작자
 extensions-ui-details-modal-capabilities = 권한
 # Context: extensions_ui
 extensions-ui-details-modal-disable = 확장 비활성화
+extensions-ui-connections-title = 확장 기능 간 연결
+extensions-ui-connections-hint = 여기에서 켠 연결에 대해서만 한 확장 기능이 다른 확장 기능의 방송을 받습니다. 나중을 위해 보관되는 것은 없습니다.
+extensions-ui-connection = { $provider } → { $subscriber }: { $topic }
+extensions-ui-connection-network = { $subscriber }은(는) 받은 내용을 { $hosts }(으)로 보낼 수 있습니다.
+extensions-ui-consent-broadcasts = 방송할 수 있는 항목: { $topics }.
+extensions-ui-consent-subscribes = 받으려는 항목: { $topics }. 각 출처는 연결에서 승인합니다.
 extensions-ui-secrets-section = 비밀 값
 extensions-ui-secret-set = 설정됨
 extensions-ui-secret-not-set = 설정 안 됨
