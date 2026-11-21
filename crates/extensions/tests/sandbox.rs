@@ -686,6 +686,15 @@ impl HostImports for Fixed {
 		out.fill(0xab);
 		true
 	}
+	/// Echoes JSON requests; a one-byte request fails with a long message and a two-byte
+	/// request succeeds with an oversized reply.
+	fn db_execute(&mut self, request: &[u8]) -> Reply {
+		match request.len() {
+			1 => Reply::Failed("é".repeat(1000)),
+			2 => Reply::Ok(vec![b'x'; 300 * 1024]),
+			_ => Reply::Ok(request.to_vec()),
+		}
+	}
 }
 
 /// A composer plugin with `capabilities` whose handler runs `body` (leaving an i32 on the
@@ -715,6 +724,9 @@ fn importing(imports: &str, capabilities: &[Capability], body: &str) -> Package 
 
 const CLOCK: &str = r#"(import "serein" "clock_now_ms" (func $now (result i64)))"#;
 const RANDOM: &str = r#"(import "serein" "random_fill" (func $fill (param i32 i32) (result i32)))"#;
+
+const DATABASE: &str = r#"(import "serein" "db_execute" (func $db (param i32 i32) (result i32)))
+	(import "serein" "result_read" (func $read (param i32 i32) (result i32)))"#;
 
 fn run(package: &Package, grants: &[Capability]) -> Result<Option<String>, Error> {
 	invoke_with(package, &input(), grants, Box::new(Fixed)).map(|output| output.replacement)
@@ -816,4 +828,64 @@ fn host_calls_are_budgeted_per_invocation() {
 		"(i64.eq (call $now) (i64.const 1234))",
 	);
 	assert_eq!(run(&once, &grants).unwrap().as_deref(), Some("ok"));
+}
+
+#[test]
+fn variable_replies_stay_pending_until_read_into_a_large_enough_buffer() {
+	let grants = [Capability::Composer, Capability::Database];
+	let read_only = r#"(import "serein" "result_read" (func $read (param i32 i32) (result i32)))"#;
+	// Reading needs no capability and fails when nothing is pending.
+	let nothing = importing(
+		read_only,
+		&[],
+		"(i32.eq (call $read (i32.const 8192) (i32.const 64)) (i32.const -1))",
+	);
+	nothing.validate().unwrap();
+	assert_eq!(
+		run(&nothing, &[Capability::Composer]).unwrap().as_deref(),
+		Some("ok")
+	);
+	assert!(matches!(
+		importing(DATABASE, &[], "(i32.const 1)").validate(),
+		Err(Error::Capability)
+	));
+	for body in [
+		// The 20-byte request at 1024 is echoed; a short buffer keeps it pending, and a read
+		// clears it.
+		"(i32.and (i32.and (i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const 20))
+			(i32.eq (call $read (i32.const 8192) (i32.const 19)) (i32.const -1)))
+		 (i32.and (i32.and (i32.eq (call $read (i32.const 8192) (i32.const 20)) (i32.const 20))
+			(i32.eq (i32.load (i32.const 8192)) (i32.load (i32.const 1024))))
+			(i32.eq (call $read (i32.const 8192) (i32.const 20)) (i32.const -1))))",
+		// Failure messages are cut to 1 KiB on a character boundary.
+		"(i32.and (i32.eq (call $db (i32.const 1024) (i32.const 1)) (i32.const -3))
+			(i32.eq (call $read (i32.const 8192) (i32.const 4096)) (i32.const 1024)))",
+		// An oversized reply becomes an error, and a new call drops the unread reply.
+		"(i32.and (i32.and (i32.eq (call $db (i32.const 1024) (i32.const 2)) (i32.const -3))
+			(i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const 20)))
+			(i32.eq (call $read (i32.const 8192) (i32.const 4096)) (i32.const 20)))",
+		// Requests over 256 KiB are refused before memory is read.
+		"(i32.eq (call $db (i32.const 0) (i32.const 262145)) (i32.const -1))",
+	] {
+		let package = importing(DATABASE, &[Capability::Database], body);
+		assert_eq!(
+			run(&package, &grants).unwrap().as_deref(),
+			Some("ok"),
+			"{body}"
+		);
+	}
+	let unavailable = importing(
+		DATABASE,
+		&[Capability::Database],
+		"(i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const -2))",
+	);
+	let output = invoke_with(&unavailable, &input(), &grants, Box::new(NoHostImports)).unwrap();
+	assert_eq!(output.replacement.as_deref(), Some("ok"));
+	// A request that runs past linear memory traps.
+	let out_of_bounds = importing(
+		DATABASE,
+		&[Capability::Database],
+		"(i32.eqz (call $db (i32.const 65530) (i32.const 20)))",
+	);
+	assert!(matches!(run(&out_of_bounds, &grants), Err(Error::Trap)));
 }

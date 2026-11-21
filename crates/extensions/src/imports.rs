@@ -5,6 +5,9 @@
 //! invocation whose grants lack an imported function's capability fails before any Wasm runs.
 //! Each call costs fuel and counts against a per-invocation call budget. Host functions never
 //! hand Wasm a host pointer: data crosses only as bytes copied into the module's own memory.
+//!
+//! Functions whose reply has a variable size, such as `db_execute`, return its byte length
+//! and keep the reply pending; `result_read` then copies it into a buffer the module sized.
 use crate::Capability;
 
 /// Wasm import module name for every host function.
@@ -17,14 +20,23 @@ pub(crate) const CALL_FUEL: u64 = 1_000;
 pub(crate) const BYTE_FUEL: u64 = 4;
 /// Largest buffer one `random_fill` call may fill.
 pub const MAX_RANDOM_BYTES: u32 = 4096;
+/// Largest request one `db_execute` call may send.
+pub const MAX_DB_REQUEST_BYTES: u32 = 256 * 1024;
+/// Largest pending reply; a larger successful result is replaced by an error.
+pub const MAX_REPLY_BYTES: usize = 256 * 1024;
+/// Largest error message a failed call leaves pending.
+pub const MAX_ERROR_BYTES: usize = 1024;
 
-/// Status codes host functions return as `i32`. Zero is success.
+/// Status codes host functions return as `i32`. Zero or more is success.
 pub mod status {
 	pub const OK: i32 = 0;
-	/// Arguments are out of range, such as an oversized length.
+	/// Arguments are out of range, such as an oversized length or a missing reply.
 	pub const INVALID: i32 = -1;
 	/// The host cannot provide the service right now.
 	pub const UNAVAILABLE: i32 = -2;
+	/// The service rejected the request; a UTF-8 message of at most
+	/// [`MAX_ERROR_BYTES`](super::MAX_ERROR_BYTES) is pending for `result_read`.
+	pub const FAILED: i32 = -3;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,13 +45,21 @@ pub(crate) enum Kind {
 	ClockNowMs,
 	/// `(ptr: i32, len: i32) -> i32`: fills Wasm memory with random bytes; a [`status`] code.
 	RandomFill,
+	/// `(ptr: i32, len: i32) -> i32`: runs one JSON database request; the pending reply's
+	/// length, or a [`status`] code.
+	DbExecute,
+	/// `(ptr: i32, cap: i32) -> i32`: copies the pending reply when it fits in `cap` bytes and
+	/// clears it; the copied length, or [`status::INVALID`].
+	ResultRead,
 }
 
 /// One importable host function.
 #[derive(Clone, Copy, Debug)]
 pub struct HostImport {
 	pub name: &'static str,
-	pub capability: Capability,
+	/// Capability the manifest must declare and the user must grant; `None` for functions
+	/// that only return replies other gated calls produced.
+	pub capability: Option<Capability>,
 	pub(crate) kind: Kind,
 }
 
@@ -47,18 +67,39 @@ pub struct HostImport {
 pub const HOST_IMPORTS: &[HostImport] = &[
 	HostImport {
 		name: "clock_now_ms",
-		capability: Capability::Clock,
+		capability: Some(Capability::Clock),
 		kind: Kind::ClockNowMs,
 	},
 	HostImport {
 		name: "random_fill",
-		capability: Capability::Random,
+		capability: Some(Capability::Random),
 		kind: Kind::RandomFill,
+	},
+	HostImport {
+		name: "db_execute",
+		capability: Some(Capability::Database),
+		kind: Kind::DbExecute,
+	},
+	HostImport {
+		name: "result_read",
+		capability: None,
+		kind: Kind::ResultRead,
 	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
 	HOST_IMPORTS.iter().find(|import| import.name == name)
+}
+
+/// Answer to a request with a variable-size reply.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply {
+	/// The reply bytes.
+	Ok(Vec<u8>),
+	/// The request was rejected; a short UTF-8 message for the plugin.
+	Failed(String),
+	/// The service is not available to this invocation.
+	Unavailable,
 }
 
 /// Services behind the host functions. The front end supplies one per invocation; it runs
@@ -68,6 +109,11 @@ pub trait HostImports: Send {
 	fn now_ms(&mut self) -> Option<i64>;
 	/// Fills `out` with cryptographically secure random bytes.
 	fn fill_random(&mut self, out: &mut [u8]) -> bool;
+	/// Runs one database request, `{"sql": "...", "params": [...]}` as JSON, against the
+	/// plugin's own database.
+	fn db_execute(&mut self, _request: &[u8]) -> Reply {
+		Reply::Unavailable
+	}
 }
 
 /// Provides no services: every call reports [`status::UNAVAILABLE`].

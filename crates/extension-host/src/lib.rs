@@ -4,9 +4,10 @@
 //! front end needs around it without depending on a windowing toolkit: the bounded package
 //! store and worker ([`store`]), invocation snapshots built from [`client_core::State`]
 //! ([`snapshot`]), and admission of app/data/message events ([`data_events`],
-//! [`message_events`]). Device-local UI state reaches snapshots through [`HostLocal`].
+//! [`message_events`]), and each plugin's private SQLite file ([`database`]). Device-local UI state reaches snapshots through [`HostLocal`].
 
 pub mod data_events;
+pub mod database;
 pub mod forum_data;
 pub mod member_details;
 pub mod message_content;

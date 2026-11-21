@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod runtime;
 pub use runtime::{invoke, invoke_with};
 pub mod imports;
-pub use imports::{HostImports, NoHostImports};
+pub use imports::{HostImports, NoHostImports, Reply};
 mod rich_presence;
 pub use rich_presence::*;
 mod discovery;
@@ -163,6 +163,8 @@ pub enum Capability {
 	Clock,
 	/// Import `serein.random_fill` for secure random bytes.
 	Random,
+	/// Import `serein.db_execute` for a private SQLite database on this device.
+	Database,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from

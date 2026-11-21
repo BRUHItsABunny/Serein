@@ -84,6 +84,7 @@ impl HostInfo {
 				Capability::StartScreen,
 				Capability::Clock,
 				Capability::Random,
+				Capability::Database,
 			],
 			app_events: &[
 				AppEventKind::Ready,

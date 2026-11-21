@@ -93,6 +93,8 @@ pub enum Capability {
 	Clock,
 	/// Import [`crate::host::fill_random`].
 	Random,
+	/// Use [`crate::host::db`], a private SQLite database.
+	Database,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

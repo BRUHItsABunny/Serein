@@ -2123,3 +2123,18 @@ reused; a full active tracker returns a local capacity failure. Session teardown
 drops the tracker. The existing semaphore allows at most four admitted REST
 requests; caller queues retain their own bounds. There is no new disk storage
 or logging.
+
+## Plugin databases (preview, November 21, 2026)
+
+A plugin granted `database` gets one SQLite file, `data.sqlite`, in its existing
+per-account (or, for connection plugins, global) extension directory. SQLite caps
+the file at 64 MiB through its page count, and Serein uses the default rollback journal
+beside it during a write. Every invocation opens the file on first use with a 2 MiB
+page cache and closes it when the invocation ends. Its writes form one transaction
+that is committed only after the output is accepted. Temporary tables are refused,
+and sort spill files are SQLite's own short-lived temporary files. Requests and
+replies are each at most 256 KiB, so one pending reply is held in RAM at a time.
+Disabling the plugin or logging out removes the file together with the directory.
+Updating the plugin keeps it. The file is not encrypted and must not hold
+credentials. A failed open, a full file or an exhausted SQLite budget is reported to
+the plugin, and the invocation's changes are discarded.

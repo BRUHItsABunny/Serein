@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 60 capabilities, with at most 64 distinct declarations per manifest.
+supports 61 capabilities, with at most 64 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -178,6 +178,7 @@ supports 60 capabilities, with at most 64 distinct declarations per manifest.
 | `start_screen` | Replace the start screen's logo and copy with the plugin's own pre-rendered images and plain text | Preview; activation and panel results only; one bounded device-level file, shown on the connecting screen before any account loads and without running Wasm; the host draws nothing of its own design: up to four 2-bit palette cell images, each still or looping at up to 30 frames per second, stack top to bottom, then an optional title and subtitle in the normal font, scaled down only to fit (see the [image format](extension-sdk-actions.md#start-screen-preview)); an optional `window` size of 240-1,600 × 240-1,200 logical pixels is clamped to the monitor and centered while the screen shows, never saved as the window size, and the previous size, position and maximized state return afterwards; when several plugins set one, the lowest plugin id wins; disabling, removing or failing the plugin, revoking its grant, ending its account session or returning `start_screen: null` restores the default; the progress bar and **Use a different account** always stay |
 | `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
 | `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
+| `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB file |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -499,10 +500,11 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 60 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 64 distinct | Only the 61 supported capability names are currently accepted. |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
+| Plugin database | 64 MiB file; 256 KiB per request and reply; about 100 million SQLite instructions per invocation | See [plugin database](#plugin-database-preview). |
 | App snapshot | 64 KiB | Individual lists have smaller budgets; see the [data reference](extension-sdk-reference.md#app-data). |
 | Host proposals | 1 / 8 KiB serialized | A foreground action proposes one operation for Apply. |
 | Reactive queue / rate | 32 pending calls / 64 KiB / 10 starts per second | Shared message/app events are best effort; excess work is dropped. |
@@ -516,7 +518,7 @@ cleanup succeeds. Shared host code and bounded catalog metadata still cost some
 application space. Freed allocations may remain in the process allocator; an
 unchanged RSS reading alone does not mean an instance remains active.
 
-Plugin storage is ordinary local data, not encrypted by Serein. Do not use it
+Plugin storage and plugin databases are ordinary local data, not encrypted by Serein. Do not use it
 for credentials. No extension diagnostics or private invocation data are
 uploaded. Sandboxing and review reduce exposure but cannot prove absence of
 bugs in the runtime or host; keep Serein updated.
@@ -538,6 +540,8 @@ granted by the user:
 | --- | --- | --- | --- |
 | `clock_now_ms` | `() -> i64` | `clock` | Unix time in milliseconds, or `-1` when unavailable |
 | `random_fill` | `(ptr: i32, len: i32) -> i32` | `random` | Writes `len` (0-4,096) secure random bytes at `ptr`; `0` success, `-1` invalid length, `-2` unavailable |
+| `db_execute` | `(ptr: i32, len: i32) -> i32` | `database` | Runs one JSON request of at most 256 KiB; the pending reply's length, `-3` with a pending error message of at most 1 KiB, `-1` invalid length, `-2` unavailable |
+| `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
 signature or module name, or imports a function whose capability the manifest
@@ -548,6 +552,43 @@ linear memory traps. Calls count toward the invocation's fuel and its host-call
 budget (see [limits](#resource-and-privacy-limits)). Rust authors use
 `serein_extension_sdk::host`; only functions a plugin calls become imports.
 `HostInfo.host_imports` lists the names a host provides.
+
+Calls with a variable-size reply return its length and keep it pending; a later
+`result_read` copies it, and the next such call discards any unread reply. The
+reply is charged as copied bytes when it is produced.
+
+## Plugin database (preview)
+
+A plugin granted `database` has one SQLite file, `data.sqlite`, in its own
+extension directory. Like `storage`, it is per account and per plugin, survives
+updates and restarts, and is removed when the plugin is disabled or its account
+logs out. Rust authors call `serein_extension_sdk::host::db::execute(sql, params)`.
+
+Each `db_execute` request is JSON, `{"sql": "...", "params": [...]}`, with one
+statement and `?` parameters. Values are `null`, booleans (stored as integers),
+numbers, strings or `{"blob": "<base64>"}`. A reply is
+`{"columns": [...], "rows": [[...]], "changes": n, "last_insert_rowid": n}`,
+with the same value encoding; `changes` and `last_insert_rowid` are `0` for
+read-only statements.
+
+All requests in one invocation share a transaction. Serein commits it only after
+the invocation finishes and its output is accepted, so an error, trap, exhausted
+fuel, cancelled job or rejected output leaves the database unchanged. Plugins
+cannot run `BEGIN`, `COMMIT` or `ROLLBACK`, but `SAVEPOINT`, `RELEASE` and
+`ROLLBACK TO` work inside it.
+
+| Rule | Limit |
+| --- | --- |
+| File size | 64 MiB; a write past it fails and discards the invocation's database work |
+| Request / reply | 256 KiB each; a larger result fails instead of truncating |
+| SQLite work | About 100 million virtual-machine instructions per invocation. Exhausting it fails that statement and every later one, and the invocation's database work is discarded. |
+| Statement | 100,000 bytes of SQL, 256 parameters, 256 columns, expression depth 100, values up to 1 MiB |
+| Refused | `ATTACH`, `DETACH`, `VACUUM`, transaction statements, temporary tables, views and triggers, virtual tables, `load_extension`, writes to `sqlite_schema` |
+| Pragmas | Only `user_version`, `table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check`, `quick_check` and `integrity_check` |
+
+Foreign keys are enforced. Serein's bundled SQLite has no full-text search or
+R-tree modules. SQL errors are returned to the plugin as text; they never contain
+host paths.
 
 ## API proxy plugin (preview)
 

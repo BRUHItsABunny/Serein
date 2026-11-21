@@ -20,6 +20,8 @@ use extensions::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::database::{self, PluginDatabase};
+
 /// Generated from `extensions/` and pinned to a merged commit by the catalog workflow.
 const CATALOG_URL: &str =
 	"https://raw.githubusercontent.com/ViceVerse-cz/Serein/main/extensions/catalog.json";
@@ -231,7 +233,7 @@ pub fn demo_check_examples() -> Result<bool, String> {
 			sha256,
 			download_bytes: starter.download_bytes,
 		};
-		let summary = stored.summary(&gate, None, true);
+		let summary = stored.summary(&gate, None, None, true);
 		if let Some(error) = summary.error {
 			return Err(error);
 		}
@@ -245,7 +247,7 @@ pub fn demo_check_examples() -> Result<bool, String> {
 			}
 			activated = true;
 			stored.grants.clear();
-			let denied = stored.summary(&gate, None, true);
+			let denied = stored.summary(&gate, None, None, true);
 			if denied.preserve_deleted_messages || denied.image_sharing || denied.error.is_none() {
 				return Err("Plugin activation must require explicit permission".into());
 			}
@@ -366,8 +368,47 @@ pub enum Event {
 	LoggedOut,
 }
 
-/// Host services behind the `serein` Wasm imports, backed by the operating system.
-pub struct SystemImports;
+/// Host services behind the `serein` Wasm imports, backed by the operating system and, with
+/// the `database` grant, the plugin's own SQLite file.
+pub struct SystemImports {
+	database: Option<SharedDatabase>,
+}
+
+type SharedDatabase = Arc<std::sync::Mutex<PluginDatabase>>;
+
+impl SystemImports {
+	/// Services for one invocation of `stored`, installed in `directory`, plus the database
+	/// session the caller commits once the invocation's output has been accepted.
+	fn for_plugin(
+		stored: &Stored,
+		directory: Option<&Path>,
+	) -> (Box<Self>, Option<SharedDatabase>) {
+		let database = directory
+			.filter(|_| stored.grants.contains(&Capability::Database))
+			.map(|directory| {
+				Arc::new(std::sync::Mutex::new(PluginDatabase::new(
+					directory.join(database::FILE_NAME),
+				)))
+			});
+		(
+			Box::new(Self {
+				database: database.clone(),
+			}),
+			database,
+		)
+	}
+}
+
+fn commit(database: Option<SharedDatabase>) -> Result<(), String> {
+	match database {
+		Some(database) => database
+			.lock()
+			.map_err(|_| "Plugin database is unavailable".to_string())?
+			.commit(),
+		None => Ok(()),
+	}
+}
+
 impl extensions::HostImports for SystemImports {
 	fn now_ms(&mut self) -> Option<i64> {
 		let elapsed = std::time::SystemTime::now()
@@ -377,6 +418,15 @@ impl extensions::HostImports for SystemImports {
 	}
 	fn fill_random(&mut self, out: &mut [u8]) -> bool {
 		getrandom::fill(out).is_ok()
+	}
+	fn db_execute(&mut self, request: &[u8]) -> extensions::Reply {
+		match &self.database {
+			Some(database) => match database.lock() {
+				Ok(mut database) => database.execute(request),
+				Err(_) => extensions::Reply::Unavailable,
+			},
+			None => extensions::Reply::Unavailable,
+		}
 	}
 }
 
@@ -536,9 +586,16 @@ struct Stored {
 }
 
 impl Stored {
-	/// Builds the installed entry by running the activation action, if any, with saved storage,
-	/// and records what its granted output switched on.
-	fn summary(&self, gate: &Gate, storage: Option<String>, active: bool) -> InstalledExtension {
+	/// Builds the installed entry by running the activation action, if any, with saved storage
+	/// and the plugin's database in `directory` (none for bundled checks), and records what its
+	/// granted output switched on.
+	fn summary(
+		&self,
+		gate: &Gate,
+		storage: Option<String>,
+		directory: Option<&Path>,
+		active: bool,
+	) -> InstalledExtension {
 		let activation = self
 			.package
 			.manifest
@@ -548,6 +605,7 @@ impl Stored {
 		let mut result = activation.map_or(Ok(extensions::Output::default()), |action| {
 			validate_grants(&self.package.manifest, &self.grants)?;
 			gate.check()?;
+			let (services, database) = SystemImports::for_plugin(self, directory);
 			let output = extensions::invoke_with(
 				&self.package,
 				&Invocation {
@@ -556,7 +614,7 @@ impl Stored {
 					..Default::default()
 				},
 				&self.grants,
-				Box::new(SystemImports),
+				services,
 			)
 			.map_err(|error| error.to_string())?;
 			gate.check()?;
@@ -579,6 +637,8 @@ impl Stored {
 			if output.start_screen.is_some() && !self.grants.contains(&Capability::StartScreen) {
 				return Err("Start screen customization was not granted".into());
 			}
+			gate.check()?;
+			commit(database)?;
 			Ok(output)
 		});
 		let background_image = if active {
@@ -925,13 +985,10 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Plugin input exceeds 256 KiB".into());
 			}
 			gate.check()?;
-			let mut output = extensions::invoke_with(
-				&stored.package,
-				&invocation,
-				&stored.grants,
-				Box::new(SystemImports),
-			)
-			.map_err(|e| e.to_string())?;
+			let (services, database) = SystemImports::for_plugin(&stored, Some(&directory));
+			let mut output =
+				extensions::invoke_with(&stored.package, &invocation, &stored.grants, services)
+					.map_err(|e| e.to_string())?;
 			gate.check()?;
 			if output.api_proxy.is_some() && !stored.grants.contains(&Capability::ApiProxy) {
 				return Err("API proxy access was not granted".into());
@@ -951,10 +1008,15 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			if output.start_screen.is_some() && !stored.grants.contains(&Capability::StartScreen) {
 				return Err("Start screen customization was not granted".into());
 			}
-			if let Some(data) = output.storage.take() {
-				if !stored.grants.contains(&Capability::Storage) || data.len() > MAX_STORAGE {
-					return Err("Plugin data exceeds its granted storage budget".into());
-				}
+			let data = output.storage.take();
+			if data.as_ref().is_some_and(|data| {
+				!stored.grants.contains(&Capability::Storage) || data.len() > MAX_STORAGE
+			}) {
+				return Err("Plugin data exceeds its granted storage budget".into());
+			}
+			gate.check()?;
+			commit(database)?;
+			if let Some(data) = data {
 				atomic_write(&directory.join("data.json"), data.as_bytes(), gate)?;
 			}
 			Ok(Event::Invoked { id, output })
@@ -1081,12 +1143,22 @@ fn install_stored(
 	let activate = !updating_theme
 		|| read_bounded(&parent.join("active.json"), 64)
 			.is_ok_and(|id| id == stored.package.manifest.id.as_bytes());
-	let mut summary = stored.summary(gate, activation_storage(&stored, &directory)?, true);
+	let existed = directory.exists();
+	let mut summary = stored.summary(
+		gate,
+		activation_storage(&stored, &directory)?,
+		Some(&directory),
+		true,
+	);
 	summary.active_theme = stored.package.manifest.kind == ExtensionKind::Theme && activate;
 	if !activate {
 		summary.background_image = None;
 	}
 	if let Some(error) = &summary.error {
+		// A first activation may have created the directory for its database.
+		if !existed {
+			remove_owned_directory(&directory)?;
+		}
 		return Err(error.clone());
 	}
 	let record = serde_json::to_vec(&stored).map_err(|_| "Cannot encode extension package")?;
@@ -1235,6 +1307,7 @@ fn load(
 							let mut summary = stored.summary(
 								gate,
 								storage,
+								Some(&entry.path()),
 								kind == ExtensionKind::Theme
 									&& active_theme.as_deref() == Some(id.as_str()),
 							);
@@ -1243,7 +1316,8 @@ fn load(
 							summary
 						}
 						Err(error) => {
-							let mut summary = stored.summary(gate, None, false);
+							let mut summary =
+								stored.summary(gate, None, Some(&entry.path()), false);
 							summary.theme = None;
 							summary.preserve_deleted_messages = false;
 							summary.image_sharing = false;
@@ -2081,6 +2155,131 @@ mod tests {
 		assert!(run(&root, message_event_job(), &cancelled).is_err());
 		assert_eq!(fs::read(directory.join("data.json")).unwrap(), data);
 		assert!(!directory.join("data.partial").exists());
+	}
+
+	/// A panel plugin that creates a table, inserts a row and returns `output`.
+	fn database_plugin(output: &str) -> Package {
+		fn data(at: u32, text: &str) -> String {
+			let escaped: String = text.bytes().map(|b| format!("\\{b:02x}")).collect();
+			format!(r#"(data (i32.const {at}) "{escaped}")"#)
+		}
+		let create = r#"{"sql":"CREATE TABLE IF NOT EXISTS hits (n)"}"#;
+		let insert = r#"{"sql":"INSERT INTO hits VALUES (?)","params":[1]}"#;
+		let wasm = wat::parse_str(format!(
+			r#"(module
+			(import "serein" "db_execute" (func $db (param i32 i32) (result i32)))
+			(memory (export "memory") 1)
+			{} {} {}
+			(func (export "serein_alloc") (param i32) (result i32) (i32.const 8192))
+			(func (export "serein_invoke") (param i32 i32) (result i64)
+				(drop (call $db (i32.const 1024) (i32.const {})))
+				(drop (call $db (i32.const 2048) (i32.const {})))
+				(i64.const {})))"#,
+			data(1024, create),
+			data(2048, insert),
+			data(4096, output),
+			create.len(),
+			insert.len(),
+			(4096_u64 << 32) | output.len() as u64,
+		))
+		.unwrap();
+		Package {
+			manifest: Manifest {
+				api_version: extensions::API_VERSION,
+				id: "database-plugin".into(),
+				name: "Database plugin".into(),
+				version: "1.0.0".into(),
+				author: "Synthetic test".into(),
+				license: "MIT".into(),
+				source: "https://github.com/example/plugin".into(),
+				kind: ExtensionKind::Plugin,
+				capabilities: vec![Capability::Database],
+				actions: vec![extensions::Action {
+					id: "run".into(),
+					label: "Run".into(),
+					surface: Surface::Panel,
+				}],
+			},
+			theme: None,
+			background_image: Vec::new(),
+			cover_image: Vec::new(),
+			wasm,
+		}
+	}
+
+	#[test]
+	fn plugin_database_commits_accepted_invocations_and_is_removed_with_the_plugin() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let package = database_plugin("{}");
+		let install = |package: &Package, grants: Vec<Capability>| {
+			enable(
+				&root,
+				source(&profile, package),
+				grants,
+				Some("account"),
+				&gate(),
+			)
+		};
+		let invoke = || {
+			run(
+				&root,
+				Job::Invoke {
+					id: "database-plugin".into(),
+					account: "account".into(),
+					invocation: Invocation {
+						action: "run".into(),
+						..Default::default()
+					},
+				},
+				&gate(),
+			)
+		};
+		let directory = scope(&root, ExtensionKind::Plugin, Some("account"))
+			.unwrap()
+			.join("database-plugin");
+		let rows = || {
+			let mut database =
+				crate::database::PluginDatabase::new(directory.join(crate::database::FILE_NAME));
+			match database.execute(br#"{"sql":"SELECT count(*) FROM hits"}"#) {
+				extensions::Reply::Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+					.unwrap()["rows"][0][0]
+					.as_i64()
+					.unwrap(),
+				_ => 0,
+			}
+		};
+		// Without the grant the import is refused before any SQL runs.
+		install(&package, vec![Capability::Database]).unwrap();
+		let package_path = directory.join("package.json");
+		let mut stored = read_stored(&package_path).unwrap();
+		stored.grants.clear();
+		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+		assert!(invoke().is_err());
+		assert!(!directory.join(crate::database::FILE_NAME).exists());
+		install(&package, vec![Capability::Database]).unwrap();
+		invoke().unwrap();
+		invoke().unwrap();
+		assert_eq!(rows(), 2);
+		// Output the host rejects (storage without its grant) discards that invocation's rows.
+		let rejected = database_plugin(r#"{"storage":"x"}"#);
+		install(&rejected, vec![Capability::Database]).unwrap();
+		assert!(invoke().is_err());
+		assert_eq!(rows(), 2);
+		// Updating keeps the data; disabling removes it with the plugin directory.
+		install(&package, vec![Capability::Database]).unwrap();
+		assert_eq!(rows(), 2);
+		run(
+			&root,
+			Job::Disable {
+				id: "database-plugin".into(),
+				kind: ExtensionKind::Plugin,
+				account: Some("account".into()),
+			},
+			&gate(),
+		)
+		.unwrap();
+		assert!(!directory.exists());
 	}
 
 	#[test]

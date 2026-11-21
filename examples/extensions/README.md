@@ -503,7 +503,7 @@ Rust authors use `export!`. Other languages must export:
 
 | Export | Contract |
 | --- | --- |
-| `memory` | 32-bit linear Wasm memory. No WASI; function imports only from `serein`, each gated by a capability ([host imports](../../docs/extensions.md#host-imports-preview)). |
+| `memory` | 32-bit linear Wasm memory. No WASI; function imports only from `serein`, each gated by a capability where it reads or changes data ([host imports](../../docs/extensions.md#host-imports-preview)). |
 | `serein_alloc(i32 length) -> i32 pointer` | Allocate room for the host's UTF-8 JSON input. |
 | `serein_invoke(i32 pointer, i32 length) -> i64 output` | Return UTF-8 JSON: output pointer in the high 32 bits, byte length in the low 32 bits. |
 

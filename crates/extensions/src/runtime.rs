@@ -1,12 +1,12 @@
-use crate::imports::{self, HostImports, Kind, NoHostImports, status};
+use crate::imports::{self, HostImports, Kind, NoHostImports, Reply, status};
 use crate::{
 	Capability, Error, ExtensionKind, Invocation, MAX_IO_BYTES, MAX_MODULE_BYTES, Manifest, Output,
 	Package,
 };
 use std::collections::BTreeSet;
 use wasmi::{
-	Caller, Config, EnforcedLimits, Engine, Extern, ExternType, FuncType, Instance, Linker, Module,
-	Store, StoreLimits, StoreLimitsBuilder, TrapCode, ValType,
+	Caller, Config, EnforcedLimits, Engine, Extern, ExternType, FuncType, Instance, Linker, Memory,
+	Module, Store, StoreLimits, StoreLimitsBuilder, TrapCode, ValType,
 };
 
 const MEMORY_BYTES: usize = 16 * 1024 * 1024;
@@ -50,12 +50,14 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			.ok_or(Error::Module)?;
 		let expected = match host.kind {
 			Kind::ClockNowMs => FuncType::new([], [ValType::I64]),
-			Kind::RandomFill => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+			Kind::RandomFill | Kind::DbExecute | Kind::ResultRead => {
+				FuncType::new([ValType::I32, ValType::I32], [ValType::I32])
+			}
 		};
 		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
 			return Err(Error::Module);
 		}
-		required.insert(host.capability);
+		required.extend(host.capability);
 	}
 	Ok(required)
 }
@@ -92,6 +94,22 @@ struct HostState {
 	limits: StoreLimits,
 	services: Box<dyn HostImports>,
 	calls: u32,
+	/// Reply of the last variable-size call, until `result_read` copies it.
+	pending: Option<Vec<u8>>,
+}
+
+fn exported_memory(caller: &Caller<'_, HostState>) -> Result<Memory, wasmi::Error> {
+	match caller.get_export("memory") {
+		Some(Extern::Memory(memory)) => Ok(memory),
+		_ => Err(TrapCode::MemoryOutOfBounds.into()),
+	}
+}
+
+/// Validates a `(pointer, length)` pair from Wasm; `None` when `length` is negative or over
+/// `max`.
+fn span(pointer: i32, length: i32, max: u32) -> Option<(usize, usize)> {
+	let length = u32::try_from(length).ok().filter(|length| *length <= max)?;
+	Some((pointer as u32 as usize, length as usize))
 }
 
 /// Charges one host call plus `bytes` copied, trapping when the call budget or fuel runs out.
@@ -133,25 +151,84 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 			module,
 			"random_fill",
 			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
-				let length = match u32::try_from(length) {
-					Ok(length) if length <= imports::MAX_RANDOM_BYTES => length,
-					_ => {
-						charge(&mut caller, 0)?;
-						return Ok(status::INVALID);
-					}
+				let Some((pointer, length)) = span(pointer, length, imports::MAX_RANDOM_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
 				};
-				charge(&mut caller, u64::from(length))?;
-				let mut bytes = vec![0; length as usize];
+				charge(&mut caller, length as u64)?;
+				let mut bytes = vec![0; length];
 				if !caller.data_mut().services.fill_random(&mut bytes) {
 					return Ok(status::UNAVAILABLE);
 				}
-				let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
-					return Err(TrapCode::MemoryOutOfBounds.into());
-				};
-				memory
-					.write(&mut caller, pointer as u32 as usize, &bytes)
+				exported_memory(&caller)?
+					.write(&mut caller, pointer, &bytes)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
 				Ok(status::OK)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"db_execute",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				// Any earlier unread reply is discarded, so at most one is ever held.
+				caller.data_mut().pending = None;
+				let Some((pointer, length)) = span(pointer, length, imports::MAX_DB_REQUEST_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let mut request = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut request)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let (code, reply) = match caller.data_mut().services.db_execute(&request) {
+					Reply::Ok(bytes) if bytes.len() <= imports::MAX_REPLY_BYTES => {
+						(bytes.len() as i32, bytes)
+					}
+					Reply::Ok(_) => (
+						status::FAILED,
+						b"Result exceeds 256 KiB; select fewer rows or columns".to_vec(),
+					),
+					Reply::Failed(message) => {
+						let mut end = message.len().min(imports::MAX_ERROR_BYTES);
+						while !message.is_char_boundary(end) {
+							end -= 1;
+						}
+						(status::FAILED, message.as_bytes()[..end].to_vec())
+					}
+					Reply::Unavailable => return Ok(status::UNAVAILABLE),
+				};
+				// The reply is charged here, so `result_read` only charges a call.
+				charge(&mut caller, reply.len() as u64)?;
+				caller.data_mut().pending = Some(reply);
+				Ok(code)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"result_read",
+			|mut caller: Caller<'_, HostState>, pointer: i32, capacity: i32| {
+				charge(&mut caller, 0)?;
+				let Some((pointer, capacity)) = span(pointer, capacity, i32::MAX as u32) else {
+					return Ok(status::INVALID);
+				};
+				let Some(reply) = caller
+					.data_mut()
+					.pending
+					.take_if(|reply| reply.len() <= capacity)
+				else {
+					return Ok(status::INVALID);
+				};
+				exported_memory(&caller)?
+					.write(&mut caller, pointer, &reply)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				Ok(reply.len() as i32)
 			},
 		)
 		.map_err(|_| Error::Execution)?;
@@ -177,6 +254,7 @@ fn instantiate(
 			limits,
 			services,
 			calls: 0,
+			pending: None,
 		},
 	);
 	store.limiter(|state| &mut state.limits);
