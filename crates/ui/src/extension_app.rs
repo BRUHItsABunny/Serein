@@ -1637,3 +1637,53 @@ mod tests {
 		assert_eq!(view.notification_options, applied);
 	}
 }
+
+impl extension_host::HostLocal for MessagingUi {
+	fn local_settings(&self) -> LocalSettingsSnapshot {
+		self.extension_local_settings()
+	}
+	fn notification_settings(&self) -> NotificationSettingsSnapshot {
+		self.extension_notification_settings()
+	}
+	fn audio_settings(&self) -> extensions::AudioSettingsSnapshot {
+		self.extension_audio_settings()
+	}
+	fn own_presence(&self) -> extensions::OwnPresenceSnapshot {
+		self.extension_own_presence()
+	}
+	fn screen_sharing(&self) -> bool {
+		self.screen.busy
+	}
+	fn preferences_key(&self) -> u64 {
+		use std::hash::{Hash, Hasher};
+		let mut hash = std::collections::hash_map::DefaultHasher::new();
+		(
+			self.voice_gain,
+			self.voice_processing,
+			self.voice_push_to_talk,
+			self.own_presence.status.wire(),
+			self.own_presence.custom_status.as_str(),
+			self.own_presence_expires,
+			self.share_game_activity,
+		)
+			.hash(&mut hash);
+		hash.finish()
+	}
+	fn voice_roster(
+		&self,
+		state: &State,
+		each: &mut dyn FnMut(extension_host::RosterRow<'_>) -> bool,
+	) {
+		for row in MessagingUi::voice_roster(self, state) {
+			let row = extension_host::RosterRow {
+				entry: row.entry,
+				name: row.name,
+				shown: row.shown,
+				speaking: row.speaking,
+			};
+			if !each(row) {
+				break;
+			}
+		}
+	}
+}

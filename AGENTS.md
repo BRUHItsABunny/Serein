@@ -72,6 +72,8 @@ a quick read of the code would not. Prefer extending an existing test over addin
 - `crates/client-core`, `session-cache`: state, reconciliation and bounded RAM.
 - `crates/discord-api`, `discord-gateway`, `discord-voice`: transports and voice.
 - `crates/local-store`, `platform`: persistence and native integrations.
+- `crates/extensions`, `extension-host`: Wasm sandbox and wire contract; toolkit-free plugin host
+  (package store, worker, snapshots, event admission) shared by front ends.
 - `crates/ui`, `apps/desktop`: interface and app wiring.
 - `crates/test-support`, `tools/replay-bench`: synthetic fixtures and workloads.
 

@@ -19,15 +19,10 @@ mod credentials;
 mod dm_demo;
 mod downloads;
 mod emoji_upload;
-mod extension_app;
 mod extension_bridge;
-mod extension_data_events;
-mod extension_events;
-mod extension_forum_data;
-mod extension_member_details;
-mod extension_message_content;
+#[cfg(test)]
+mod extension_snapshot_tests;
 mod extension_start_screen;
-mod extensions;
 mod font_import;
 mod game_activity;
 mod game_mentions;
@@ -726,7 +721,8 @@ fn demo_check_updates() {
 /// One offline debug path through the shipped Wasm, reducer, and egui rows.
 #[cfg(feature = "demo")]
 fn demo_check_extensions() {
-	let _ = extensions::demo_check_examples().expect("starter packages activate with consent");
+	let _ = extension_host::store::demo_check_examples()
+		.expect("starter packages activate with consent");
 	let mut state = test_support::demo_state();
 	state.set_preserve_deleted_messages(true);
 	let channel = state.selected.expect("demo conversation");
@@ -5586,9 +5582,9 @@ impl Desktop {
 				)) {
 				self.notifications.dismiss();
 			}
-			let data_changes = extension_data_events::Changes::capture(&self.state, &event);
+			let data_changes = extension_host::data_events::Changes::capture(&self.state, &event);
 			let extension_events = if self.extensions.has_message_events(&self.state) {
-				extension_events::capture(&self.state, &event.event)
+				extension_host::message_events::capture(&self.state, &event.event)
 			} else {
 				Vec::new()
 			};

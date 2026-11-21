@@ -1,0 +1,31 @@
+[package]
+name = "extension-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent Serein extension host: package store, worker, snapshots and event admission."
+
+[features]
+# Embeds the demo-only starter packages, as in the desktop `demo` build.
+demo = []
+
+[dependencies]
+client-core.workspace = true
+egui.workspace = true
+extensions.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+tokio.workspace = true
+url.workspace = true
+wreq.workspace = true
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[dev-dependencies]
+test-support.workspace = true
+
+[lints]
+workspace = true

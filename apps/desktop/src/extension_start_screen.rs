@@ -5,8 +5,8 @@
 //! and interface replacement. Disabling, removing or failing the owning plugin, revoking its
 //! grant, ending its account session or its explicit `null` clears it.
 
-use crate::extensions::{account_key, read_bounded, write_device_file};
 use eframe::egui;
+use extension_host::store::{account_key, read_bounded, write_device_file};
 use extensions::StartScreen;
 use serde::{Deserialize, Serialize};
 use std::{

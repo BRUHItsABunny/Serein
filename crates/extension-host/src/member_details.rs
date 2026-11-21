@@ -1,5 +1,5 @@
 //! Read-only metadata from the selected, readable guild's loaded member pane.
-use crate::extension_app::{name, push, text};
+use crate::snapshot::{name, push, text};
 use client_core::{State, auth::AuthState};
 use extensions::*;
 use model::{Freshness, MemberSlot};

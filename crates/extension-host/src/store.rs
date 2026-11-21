@@ -31,7 +31,7 @@ const MAX_PER_SCOPE: usize = 8;
 const MAX_ACCOUNTS: usize = 8;
 const MAX_QUEUE: usize = 4;
 
-pub(crate) fn trim_extended_input(invocation: &mut Invocation, limit: usize) -> bool {
+pub fn trim_extended_input(invocation: &mut Invocation, limit: usize) -> bool {
 	for field in 0..=3 {
 		if serde_json::to_vec(invocation).is_ok_and(|wire| wire.len() <= limit) {
 			return true;
@@ -115,7 +115,7 @@ pub struct Starter {
 	pub download_bytes: u64,
 }
 
-pub(crate) fn starters() -> Result<Vec<Starter>, String> {
+pub fn starters() -> Result<Vec<Starter>, String> {
 	let packages: &[(&'static [u8], &'static str)] = &[
 		#[cfg(any(test, feature = "demo"))]
 		(
@@ -306,8 +306,8 @@ pub fn demo_check_examples() -> Result<bool, String> {
 
 #[derive(Clone)]
 pub struct InstalledExtension {
-	pub background_image: Option<Arc<eframe::egui::ColorImage>>,
-	pub cover_image: Option<Arc<eframe::egui::ColorImage>>,
+	pub background_image: Option<Arc<egui::ColorImage>>,
+	pub cover_image: Option<Arc<egui::ColorImage>>,
 	pub local_theme: bool,
 	pub active_theme: bool,
 	pub manifest: Manifest,
@@ -332,12 +332,12 @@ pub struct InstalledExtension {
 pub enum Event {
 	ThemeSelected {
 		id: Option<String>,
-		background_image: Option<Arc<eframe::egui::ColorImage>>,
+		background_image: Option<Arc<egui::ColorImage>>,
 	},
 	EditTheme {
 		package: Box<Package>,
-		image: Option<Arc<eframe::egui::ColorImage>>,
-		cover: Option<Arc<eframe::egui::ColorImage>>,
+		image: Option<Arc<egui::ColorImage>>,
+		cover: Option<Arc<egui::ColorImage>>,
 		local_theme: bool,
 		preview: bool,
 	},
@@ -350,7 +350,7 @@ pub enum Event {
 	Catalog(Catalog),
 	Preview {
 		id: String,
-		image: Option<eframe::egui::ColorImage>,
+		image: Option<egui::ColorImage>,
 	},
 	Imported {
 		manifest: Manifest,
@@ -366,6 +366,10 @@ pub enum Event {
 	LoggedOut,
 }
 
+/// Called from the worker thread after a job finishes so the front end polls its result,
+/// for example by requesting a repaint.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
 /// A single worker exists only while a job runs. Queued jobs and results have fixed limits.
 pub struct ExtensionHost {
 	root: PathBuf,
@@ -374,7 +378,7 @@ pub struct ExtensionHost {
 	queue: VecDeque<(u64, Job)>,
 	next_token: u64,
 	active: Option<(u64, Receiver<Result<Event, String>>)>,
-	context: Option<eframe::egui::Context>,
+	wake: Option<Wake>,
 }
 
 impl ExtensionHost {
@@ -386,7 +390,7 @@ impl ExtensionHost {
 			queue: VecDeque::new(),
 			next_token: 0,
 			active: None,
-			context: None,
+			wake: None,
 		}
 	}
 
@@ -397,7 +401,7 @@ impl ExtensionHost {
 			.retain(|(_, job)| matches!(job, Job::Disable { .. } | Job::Logout { .. }));
 	}
 
-	pub fn submit(&mut self, job: Job, context: &eframe::egui::Context) -> Result<u64, String> {
+	pub fn submit(&mut self, job: Job, wake: &Wake) -> Result<u64, String> {
 		if matches!(job, Job::Disable { .. } | Job::Logout { .. }) {
 			self.cancel();
 		}
@@ -405,7 +409,7 @@ impl ExtensionHost {
 			return Err("Extensions are busy; try again after the current operation".into());
 		}
 		validate_job(&job)?;
-		self.context = Some(context.clone());
+		self.wake = Some(wake.clone());
 		let token = self.next_token;
 		self.next_token = self.next_token.wrapping_add(1);
 		self.queue.push_back((token, job));
@@ -455,22 +459,22 @@ impl ExtensionHost {
 			generation,
 			wake_cancel: self.wake_cancel.clone(),
 		};
-		let context = self.context.clone();
+		let wake = self.wake.clone();
 		self.active = Some((token, receiver));
 		if std::thread::Builder::new()
 			.name("serein-extension".into())
 			.spawn(move || {
 				let result = run(&root, job, &gate);
 				let _ = sender.send(result);
-				if let Some(context) = context {
-					context.request_repaint();
+				if let Some(wake) = wake {
+					wake();
 				}
 			})
 			.is_err()
 		{
 			// The disconnected receiver reports the failure through the ordinary error UI.
-			if let Some(context) = &self.context {
-				context.request_repaint();
+			if let Some(wake) = &self.wake {
+				wake();
 			}
 		}
 	}
@@ -1122,7 +1126,7 @@ fn scope(root: &Path, kind: ExtensionKind, account: Option<&str>) -> Result<Path
 	}
 }
 
-pub(crate) fn account_key(account: &str) -> Result<String, String> {
+pub fn account_key(account: &str) -> Result<String, String> {
 	if account.is_empty() || account.len() > 128 {
 		return Err("Invalid extension account scope".into());
 	}
@@ -1370,7 +1374,7 @@ fn count_directories(path: &Path) -> Result<usize, String> {
 	Ok(count)
 }
 
-pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+pub fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
 	let file = File::open(path).map_err(|_| "Cannot read extension file")?;
 	if !file
 		.metadata()
@@ -1443,7 +1447,7 @@ fn atomic_write(path: &Path, bytes: &[u8], gate: &Gate) -> Result<(), String> {
 
 /// Atomically replaces, or with `None` removes, a device-level file beside the extension
 /// directories, outside the job queue and its cancellation.
-pub(crate) fn write_device_file(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
+pub fn write_device_file(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
 	let Some(bytes) = bytes else {
 		return remove_file(path);
 	};
@@ -1473,7 +1477,7 @@ fn remove_owned_directory(path: &Path) -> Result<(), String> {
 	fs::remove_dir_all(path).map_err(|_| "Extension cleanup failed; it will retry on launch".into())
 }
 
-fn load_preview(preview: &Preview, gate: &Gate) -> Option<eframe::egui::ColorImage> {
+fn load_preview(preview: &Preview, gate: &Gate) -> Option<egui::ColorImage> {
 	gate.check().ok()?;
 	preview.validate().ok()?;
 	let bytes = if let Some(bytes) = cached_preview(&preview.sha256) {
@@ -1529,19 +1533,19 @@ fn remember_preview(sha256: &str, bytes: Vec<u8>) {
 	}
 }
 
-pub fn read_background(path: &Path) -> Result<(Vec<u8>, eframe::egui::ColorImage), String> {
+pub fn read_background(path: &Path) -> Result<(Vec<u8>, egui::ColorImage), String> {
 	let bytes = read_bounded(path, extensions::MAX_BACKGROUND_BYTES)?;
 	let image = decode_background(&bytes)?;
 	Ok((bytes, image))
 }
 
-pub fn read_cover(path: &Path) -> Result<(Vec<u8>, eframe::egui::ColorImage), String> {
+pub fn read_cover(path: &Path) -> Result<(Vec<u8>, egui::ColorImage), String> {
 	let bytes = read_bounded(path, extensions::MAX_BACKGROUND_BYTES)?;
 	let image = decode_cover(&bytes)?;
 	Ok((bytes, image))
 }
 
-fn decode_cover(bytes: &[u8]) -> Result<eframe::egui::ColorImage, String> {
+fn decode_cover(bytes: &[u8]) -> Result<egui::ColorImage, String> {
 	if bytes.len() > extensions::MAX_BACKGROUND_BYTES {
 		return Err("Cover image exceeds 2 MiB".into());
 	}
@@ -1549,13 +1553,13 @@ fn decode_cover(bytes: &[u8]) -> Result<eframe::egui::ColorImage, String> {
 		.ok_or("Choose a static PNG or JPEG within 4096 pixels per edge and 4 million pixels")?
 		.thumbnail(640, 360)
 		.into_rgba8();
-	Ok(eframe::egui::ColorImage::from_rgba_unmultiplied(
+	Ok(egui::ColorImage::from_rgba_unmultiplied(
 		[image.width() as usize, image.height() as usize],
 		image.as_raw(),
 	))
 }
 
-fn package_cover(package: &Package) -> Result<Option<Arc<eframe::egui::ColorImage>>, String> {
+fn package_cover(package: &Package) -> Result<Option<Arc<egui::ColorImage>>, String> {
 	if package.cover_image.is_empty() {
 		Ok(None)
 	} else {
@@ -1563,20 +1567,20 @@ fn package_cover(package: &Package) -> Result<Option<Arc<eframe::egui::ColorImag
 	}
 }
 
-pub fn decode_background(bytes: &[u8]) -> Result<eframe::egui::ColorImage, String> {
+pub fn decode_background(bytes: &[u8]) -> Result<egui::ColorImage, String> {
 	if bytes.len() > extensions::MAX_BACKGROUND_BYTES {
 		return Err("Background image exceeds 2 MiB".into());
 	}
 	let image = decode_static_image(bytes, 4_000_000)
 		.ok_or("Choose a static PNG or JPEG within 4096 pixels per edge and 4 million pixels")?
 		.into_rgba8();
-	Ok(eframe::egui::ColorImage::from_rgba_unmultiplied(
+	Ok(egui::ColorImage::from_rgba_unmultiplied(
 		[image.width() as usize, image.height() as usize],
 		image.as_raw(),
 	))
 }
 
-fn package_background(package: &Package) -> Result<Option<Arc<eframe::egui::ColorImage>>, String> {
+fn package_background(package: &Package) -> Result<Option<Arc<egui::ColorImage>>, String> {
 	if package.background_image.is_empty() {
 		Ok(None)
 	} else {
@@ -1610,7 +1614,7 @@ fn decode_static_image(bytes: &[u8], max_pixels: u64) -> Option<image::DynamicIm
 	image::DynamicImage::from_decoder(decoder).ok()
 }
 
-fn decode_preview(bytes: &[u8], preview: &Preview) -> Option<eframe::egui::ColorImage> {
+fn decode_preview(bytes: &[u8], preview: &Preview) -> Option<egui::ColorImage> {
 	if bytes.len() > extensions::MAX_PREVIEW_BYTES
 		|| bytes.len() as u64 != preview.download_bytes
 		|| !digest(bytes).eq_ignore_ascii_case(&preview.sha256)
@@ -1622,7 +1626,7 @@ fn decode_preview(bytes: &[u8], preview: &Preview) -> Option<eframe::egui::Color
 		image = image.thumbnail(640, 360);
 	}
 	let image = image.into_rgba8();
-	Some(eframe::egui::ColorImage::from_rgba_unmultiplied(
+	Some(egui::ColorImage::from_rgba_unmultiplied(
 		[image.width() as usize, image.height() as usize],
 		image.as_raw(),
 	))
@@ -1753,6 +1757,9 @@ fn public_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	fn no_wake() -> Wake {
+		Arc::new(|| {})
+	}
 
 	#[test]
 	fn extended_input_is_trimmed_after_storage_is_loaded() {
@@ -1980,7 +1987,7 @@ mod tests {
 				invocation.storage =
 					Some("x".repeat(extensions::MAX_IO_BYTES - invocation.action.len()));
 			}
-			assert!(host.submit(job, &eframe::egui::Context::default()).is_err());
+			assert!(host.submit(job, &no_wake()).is_err());
 			assert!(!host.busy());
 		}
 		assert!(!host.root.exists());
@@ -2017,7 +2024,7 @@ mod tests {
 		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
 		let mut host = ExtensionHost::new(root.clone());
-		let context = eframe::egui::Context::default();
+		let context = no_wake();
 		let first = host.submit(message_event_job(), &context).unwrap();
 		let mut second_job = message_event_job();
 		let Job::Invoke { invocation, .. } = &mut second_job else {

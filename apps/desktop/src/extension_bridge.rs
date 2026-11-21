@@ -1,7 +1,9 @@
 //! Maps the bounded extension worker to native UI requests; no plugin runs here.
-use crate::extensions::{Event, ExtensionHost, InstallSource, InstalledExtension, Job, Starter};
 use client_core::State;
 use eframe::egui;
+use extension_host::store::{
+	Event, ExtensionHost, InstallSource, InstalledExtension, Job, Starter,
+};
 use extensions::{
 	ActionResult, AppEventKind, Capability, CatalogEntry, ExtensionKind, Invocation, Manifest,
 	MessageEvent, Surface,
@@ -13,6 +15,12 @@ use std::{
 	time::{Duration, Instant},
 };
 use ui::{ExtensionContext, ExtensionEntry, ExtensionRequest};
+
+/// Wakes the UI thread to poll a finished extension job.
+fn repaint(ctx: &egui::Context) -> extension_host::store::Wake {
+	let ctx = ctx.clone();
+	std::sync::Arc::new(move || ctx.request_repaint())
+}
 
 struct Pending {
 	catalog: bool,
@@ -120,13 +128,13 @@ fn attach_app_data(
 	manifest: &Manifest,
 	interface: Option<&extensions::InterfaceUi>,
 ) {
-	let focus = crate::extension_app::focus_guild(state, invocation, interface);
-	invocation.app = crate::extension_app::snapshot(state, messaging, manifest, focus);
-	invocation.queries = crate::extension_app::query_snapshot(state, manifest);
+	let focus = extension_host::snapshot::focus_guild(state, invocation, interface);
+	invocation.app = extension_host::snapshot::snapshot(state, messaging, manifest, focus);
+	invocation.queries = extension_host::snapshot::query_snapshot(state, manifest);
 	invocation.messaging_settings =
-		crate::extension_app::messaging_settings_snapshot(state, manifest);
-	invocation.guild_folders = crate::extension_app::guild_folders_snapshot(state, manifest);
-	crate::extensions::trim_extended_input(invocation, extensions::MAX_IO_BYTES - 8 * 1024);
+		extension_host::snapshot::messaging_settings_snapshot(state, manifest);
+	invocation.guild_folders = extension_host::snapshot::guild_folders_snapshot(state, manifest);
+	extension_host::store::trim_extended_input(invocation, extensions::MAX_IO_BYTES - 8 * 1024);
 }
 
 enum ReactiveEvent {
@@ -137,8 +145,8 @@ enum ReactiveEvent {
 impl ReactiveEvent {
 	fn available(&self, state: &State) -> bool {
 		match self {
-			Self::Message(_) => crate::extension_events::available(state),
-			Self::App(_) | Self::ActionResult(_) => crate::extension_app::available(state),
+			Self::Message(_) => extension_host::message_events::available(state),
+			Self::App(_) | Self::ActionResult(_) => extension_host::snapshot::available(state),
 		}
 	}
 }
@@ -193,11 +201,11 @@ pub struct Bridge {
 	message_events: VecDeque<QueuedEvent>,
 	message_event_at: Option<Instant>,
 	message_events_dropped: bool,
-	app_key: Option<crate::extension_app::ChangeKey>,
+	app_key: Option<extension_host::snapshot::ChangeKey>,
 	extended_key: Option<u64>,
 	app_context_changed: bool,
-	data_changes: crate::extension_data_events::Changes,
-	data_key: Option<crate::extension_data_events::DataKey>,
+	data_changes: extension_host::data_events::Changes,
+	data_key: Option<extension_host::data_events::DataKey>,
 	connection_observed: bool,
 	connection_interrupted: bool,
 	ticks: BTreeMap<String, TickSchedule>,
@@ -323,7 +331,7 @@ impl Bridge {
 			.unwrap_or_default();
 	}
 
-	pub fn data_changed(&mut self, mut changes: crate::extension_data_events::Changes) {
+	pub fn data_changed(&mut self, mut changes: extension_host::data_events::Changes) {
 		if let Some(connected) = changes.connection() {
 			self.observe_connection(connected, &mut changes);
 		}
@@ -332,7 +340,7 @@ impl Bridge {
 	fn observe_connection(
 		&mut self,
 		connected: bool,
-		changes: &mut crate::extension_data_events::Changes,
+		changes: &mut extension_host::data_events::Changes,
 	) {
 		if connected {
 			if self.connection_interrupted {
@@ -361,7 +369,7 @@ impl Bridge {
 			self.pending.retain(|_, pending| pending.cleanup);
 		}
 		for entry in &self.installed {
-			if crate::extension_app::uses_app(&entry.manifest.capabilities) {
+			if extension_host::snapshot::uses_app(&entry.manifest.capabilities) {
 				messaging.extensions.remove_runtime(&entry.manifest.id);
 			}
 		}
@@ -375,13 +383,13 @@ impl Bridge {
 		})
 	}
 	fn app_events(&mut self, state: &State, messaging: &ui::MessagingUi) {
-		if self.scope_current(state) && crate::extension_app::available(state) {
+		if self.scope_current(state) && extension_host::snapshot::available(state) {
 			let mut changes = Default::default();
 			self.observe_connection(state.gateway_connected, &mut changes);
 			self.data_changes.merge(changes);
 		}
 		if !self.scope_current(state)
-			|| !crate::extension_app::available(state)
+			|| !extension_host::snapshot::available(state)
 			|| !self.installed.iter().any(|entry| {
 				entry.error.is_none()
 					&& !self.disabled.contains(&entry.manifest.id)
@@ -393,13 +401,13 @@ impl Bridge {
 			self.data_key = None;
 			return;
 		}
-		let data_key = crate::extension_data_events::DataKey::capture(state);
+		let data_key = extension_host::data_events::DataKey::capture(state);
 		if let Some(old) = &self.data_key {
 			self.data_changes.merge(data_key.changed(old));
 		}
 		self.data_key = Some(data_key);
 		let changes = std::mem::take(&mut self.data_changes);
-		let key = crate::extension_app::ChangeKey::capture(state, messaging);
+		let key = extension_host::snapshot::ChangeKey::capture(state, messaging);
 		let invalidated = std::mem::take(&mut self.app_context_changed);
 		let extended = self.installed.iter().any(|entry| {
 			entry.error.is_none()
@@ -413,7 +421,8 @@ impl Bridge {
 					)
 				})
 		});
-		let next_extended_key = extended.then(|| crate::extension_app::extended_change_key(state));
+		let next_extended_key =
+			extended.then(|| extension_host::snapshot::extended_change_key(state));
 		let extended_changed = next_extended_key.is_some()
 			&& self.extended_key.is_some()
 			&& next_extended_key != self.extended_key;
@@ -497,7 +506,7 @@ impl Bridge {
 	}
 	pub fn has_message_events(&self, state: &State) -> bool {
 		self.installed.iter().any(|entry| self.subscribes(entry))
-			&& crate::extension_events::available(state)
+			&& extension_host::message_events::available(state)
 			&& self.scope_current(state)
 	}
 	pub fn message_event(&mut self, state: &State, event: MessageEvent) {
@@ -548,8 +557,9 @@ impl Bridge {
 						!available
 							|| !context.is_current(state)
 							|| input.message_event.is_some()
-								&& !crate::extension_events::available(state)
-							|| input.app_event.is_some() && !crate::extension_app::available(state)
+								&& !extension_host::message_events::available(state)
+							|| input.app_event.is_some()
+								&& !extension_host::snapshot::available(state)
 					})
 		}) && let Some(host) = &mut self.host
 		{
@@ -595,7 +605,7 @@ impl Bridge {
 					Job::Logout {
 						account: account.clone(),
 					},
-					ctx,
+					&repaint(ctx),
 				)?;
 				self.pending.insert(
 					token,
@@ -689,7 +699,7 @@ impl Bridge {
 				.is_some_and(|(_, input, context)| {
 					!context.is_current(state)
 						|| input.message_event.is_some()
-							&& !crate::extension_events::available(state)
+							&& !extension_host::message_events::available(state)
 				})
 		}) {
 			self.cancel_previews(messaging);
@@ -1101,7 +1111,7 @@ impl Bridge {
 					runtime.spawn(async move {
 						let result = if let Some(path) = future.await {
 							tokio::task::spawn_blocking(move || {
-								crate::extensions::read_background(&path)
+								extension_host::store::read_background(&path)
 									.map(|(bytes, image)| Some((bytes, Arc::new(image))))
 							})
 							.await
@@ -1121,7 +1131,7 @@ impl Bridge {
 					runtime.spawn(async move {
 						let result = if let Some(path) = future.await {
 							tokio::task::spawn_blocking(move || {
-								crate::extensions::read_cover(&path)
+								extension_host::store::read_cover(&path)
 									.map(|(bytes, image)| Some((bytes, Arc::new(image))))
 							})
 							.await
@@ -1281,7 +1291,7 @@ impl Bridge {
 								entry.interface_ui.as_ref(),
 							);
 						}
-						if crate::extension_app::uses_app(&manifest.capabilities) {
+						if extension_host::snapshot::uses_app(&manifest.capabilities) {
 							// App snapshots and proposals belong to the conversation that produced them.
 							context.app_wide = false;
 							context.channel = state.selected;
@@ -1560,7 +1570,7 @@ impl Bridge {
 						..Default::default()
 					},
 				};
-				match self.host.as_mut().unwrap().submit(job, ctx) {
+				match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
 					Ok(token) => {
 						self.pending.insert(
 							token,
@@ -1645,7 +1655,7 @@ impl Bridge {
 		let catalog = matches!(job, Job::RefreshCatalog);
 		let reconcile =
 			cleanup || theme_save || matches!(job, Job::Enable { .. } | Job::SelectTheme { .. });
-		match self.host.as_mut().unwrap().submit(job, ctx) {
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
 			Ok(token) => {
 				self.pending.insert(
 					token,
@@ -2542,7 +2552,7 @@ mod tests {
 				freshness: model::Freshness::Fresh,
 			}),
 		};
-		let changes = crate::extension_data_events::Changes::capture(&state, &envelope);
+		let changes = extension_host::data_events::Changes::capture(&state, &envelope);
 		bridge.data_changed(changes);
 		bridge.app_events(&state, &messaging);
 		assert_eq!(bridge.message_events.len(), 1);

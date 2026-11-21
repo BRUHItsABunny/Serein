@@ -1,5 +1,5 @@
 //! Bounded summaries of already-loaded rich messages; no media fetches or raw service payloads.
-use crate::extension_app::{name, push, text};
+use crate::snapshot::{name, push, text};
 use client_core::{State, auth::AuthState};
 use extensions::*;
 use model::Freshness;
