@@ -1047,6 +1047,7 @@ mod tests {
 				source: "https://example.com/source".into(),
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: vec![capability],
 				actions: vec![],
 			},

@@ -21,6 +21,23 @@ pub struct Manifest {
 	/// requires the `network` capability.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub network: Vec<String>,
+	/// Values the user enters, such as API keys. Reference one as `{{secret.<id>}}` in a
+	/// [`crate::host::https`] request; the host fills it in for its origins only and the
+	/// plugin never reads it.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub secrets: Vec<SecretSpec>,
+}
+
+/// A secret the user enters for the plugin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+	/// Lowercase letters, digits and `_`, at most 32.
+	pub id: String,
+	/// Shown where the user enters the value.
+	pub label: String,
+	/// Origins from `network` that may receive it.
+	pub origins: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

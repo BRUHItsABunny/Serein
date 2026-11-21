@@ -8,6 +8,11 @@
 //! automatic decompression or Serein credentials are involved, and the plugin never sees
 //! a socket: each call is one bounded request and one bounded response.
 //!
+//! Secrets the user entered for the plugin appear in requests only as `{{secret.<id>}}`
+//! placeholders. The host fills them in for the secret's declared origins, refuses to
+//! follow a redirect that would carry one elsewhere, and replaces any echo of a value in
+//! the response with `[secret]`, so the plugin never reads one.
+//!
 //! The call blocks the invocation on the extension worker. It is bounded by a per-request
 //! timeout, a wall-clock budget for the whole invocation and a request count, and ends at
 //! once when the worker job is cancelled.
@@ -17,9 +22,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use extensions::Reply;
-use extensions::network::Origin;
+use extensions::network::{Origin, SecretSpec};
 use serde::Deserialize;
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::store::{Gate, public_ip};
 
@@ -76,9 +82,14 @@ fn get() -> String {
 	"GET".into()
 }
 
+/// Looks up a secret's value by ID; `None` when the user has not set it.
+pub(crate) type Resolve = Box<dyn Fn(&str) -> Result<Option<Zeroizing<String>>, String> + Send>;
+
 /// One invocation's network session for one plugin.
 pub struct PluginNetwork {
 	origins: Vec<Origin>,
+	secrets: Vec<SecretSpec>,
+	resolve: Option<Resolve>,
 	gate: Gate,
 	runtime: Option<tokio::runtime::Runtime>,
 	requests: u32,
@@ -94,6 +105,10 @@ struct Prepared {
 	headers: wreq::header::HeaderMap,
 	body: Vec<u8>,
 	timeout: Duration,
+	/// Origins every secret in this request may reach; `None` when it carries none.
+	secret_origins: Option<Vec<Origin>>,
+	/// Values filled in, replaced by `[secret]` wherever the response echoes them.
+	redact: Vec<Zeroizing<String>>,
 }
 
 impl PluginNetwork {
@@ -104,6 +119,8 @@ impl PluginNetwork {
 				.iter()
 				.filter_map(|origin| Origin::parse(origin))
 				.collect(),
+			secrets: Vec::new(),
+			resolve: None,
 			gate,
 			runtime: None,
 			requests: 0,
@@ -111,6 +128,12 @@ impl PluginNetwork {
 			#[cfg(test)]
 			loopback: false,
 		}
+	}
+
+	/// Lets requests use the manifest's `secrets`, looked up with `resolve`.
+	pub(crate) fn secrets(&mut self, secrets: Vec<SecretSpec>, resolve: Resolve) {
+		self.secrets = secrets;
+		self.resolve = Some(resolve);
 	}
 
 	pub fn request(&mut self, request: &[u8]) -> Reply {
@@ -165,8 +188,14 @@ impl PluginNetwork {
 			return Err("Method must be GET, HEAD, POST, PUT, PATCH or DELETE".into());
 		}
 		let url = url::Url::parse(&request.url).map_err(|_| "Invalid request URL")?;
-		if self.declared(&url).is_none() {
+		let Some(origin) = self.declared(&url) else {
 			return Err("The request URL's origin is not in this plugin's network list".into());
+		};
+		let mut request = request;
+		let (secret_origins, redact) = self.fill_secrets(&mut request, &origin)?;
+		let url = url::Url::parse(&request.url).map_err(|_| "Invalid request URL")?;
+		if self.declared(&url).as_ref() != Some(&origin) {
+			return Err("A secret may not change the request's origin".into());
 		}
 		if request.headers.len() > MAX_REQUEST_HEADERS
 			|| request
@@ -226,7 +255,92 @@ impl PluginNetwork {
 			headers,
 			body,
 			timeout,
+			secret_origins,
+			redact,
 		})
+	}
+
+	/// Replaces `{{secret.<id>}}` in the URL, header values and text body. Every secret must
+	/// be declared, allowed for `origin` and set. Messages never contain a value.
+	#[allow(clippy::type_complexity)]
+	fn fill_secrets(
+		&self,
+		request: &mut Request,
+		origin: &Origin,
+	) -> Result<(Option<Vec<Origin>>, Vec<Zeroizing<String>>), String> {
+		let malformed = || "Malformed {{secret.<id>}} placeholder".to_string();
+		let mut ids: Vec<String> = Vec::new();
+		let texts = std::iter::once(&request.url)
+			.chain(request.headers.iter().map(|(_, value)| value))
+			.chain(request.body.iter());
+		for text in texts {
+			for id in extensions::network::placeholders(text).ok_or_else(malformed)? {
+				if !ids.iter().any(|known| known == id) {
+					ids.push(id.to_owned());
+				}
+			}
+		}
+		if ids.is_empty() {
+			return Ok((None, Vec::new()));
+		}
+		let mut allowed = self.origins.clone();
+		let mut values = Vec::new();
+		for id in &ids {
+			let spec = self
+				.secrets
+				.iter()
+				.find(|spec| spec.id == *id)
+				.ok_or_else(|| format!("Secret {id} is not declared in the manifest"))?;
+			let origins = self.spec_origins(spec);
+			if !origins.contains(origin) {
+				return Err(format!("Secret {id} may not be sent to {origin}"));
+			}
+			allowed.retain(|origin| origins.contains(origin));
+			let resolve = self
+				.resolve
+				.as_ref()
+				.ok_or("Plugin secrets are unavailable on this device")?;
+			let value = resolve(id)?
+				.ok_or_else(|| format!("Secret {id} is not set; set it in the plugin's details"))?;
+			values.push((format!("{{{{secret.{id}}}}}"), value));
+		}
+		for (placeholder, value) in &values {
+			let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect();
+			request.url = request.url.replace(placeholder.as_str(), &encoded);
+			for (_, header) in &mut request.headers {
+				*header = header.replace(placeholder.as_str(), value);
+			}
+			if let Some(body) = &mut request.body {
+				*body = body.replace(placeholder.as_str(), value);
+			}
+		}
+		// The URL carries the encoded form, which a response may echo too.
+		let mut redact = Vec::new();
+		for (_, value) in values {
+			let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect();
+			if encoded != *value {
+				redact.push(Zeroizing::new(encoded));
+			}
+			redact.push(value);
+		}
+		Ok((Some(allowed), redact))
+	}
+
+	fn spec_origins(&self, spec: &SecretSpec) -> Vec<Origin> {
+		spec.origins
+			.iter()
+			.filter_map(|origin| {
+				#[cfg(test)]
+				if self.loopback {
+					let url = url::Url::parse(origin).ok()?;
+					return Some(Origin {
+						host: url.host_str()?.to_owned(),
+						port: url.port_or_known_default()?,
+					});
+				}
+				Origin::parse(origin)
+			})
+			.collect()
 	}
 
 	/// The declared origin `url` belongs to, if any.
@@ -267,6 +381,8 @@ impl PluginNetwork {
 			mut url,
 			headers,
 			mut body,
+			secret_origins,
+			redact,
 			..
 		} = prepared;
 		let mut redirected = false;
@@ -305,8 +421,15 @@ impl PluginNetwork {
 					.get(wreq::header::LOCATION)
 					.and_then(|location| location.to_str().ok())
 					.and_then(|location| url.join(location).ok());
-				// A redirect to an undeclared origin is the plugin's answer, not a new request.
-				if let Some(next) = next.filter(|next| self.declared(next).is_some()) {
+				// A redirect to an undeclared origin, or one a secret in this request may not
+				// reach, is the plugin's answer, not a new request.
+				if let Some(next) = next.filter(|next| {
+					self.declared(next).is_some_and(|origin| {
+						secret_origins
+							.as_ref()
+							.is_none_or(|allowed| allowed.contains(&origin))
+					})
+				}) {
 					if matches!(status.as_u16(), 301..=303) && method != wreq::Method::HEAD {
 						method = wreq::Method::GET;
 						body.clear();
@@ -316,12 +439,22 @@ impl PluginNetwork {
 					continue;
 				}
 			}
-			return self.reply(response, redirected).await;
+			return self.reply(response, redirected, &redact).await;
 		}
 		Err("Too many redirects".into())
 	}
 
-	async fn reply(&self, response: wreq::Response, redirected: bool) -> Result<Vec<u8>, String> {
+	async fn reply(
+		&self,
+		response: wreq::Response,
+		redirected: bool,
+		redact: &[Zeroizing<String>],
+	) -> Result<Vec<u8>, String> {
+		let scrub = |text: String| {
+			redact
+				.iter()
+				.fold(text, |text, value| text.replace(value.as_str(), "[secret]"))
+		};
 		if response
 			.content_length()
 			.is_some_and(|length| length > MAX_RESPONSE_BODY as u64)
@@ -335,7 +468,10 @@ impl PluginNetwork {
 			.headers()
 			.iter()
 			.filter_map(|(name, value)| {
-				Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+				Some((
+					name.as_str().to_owned(),
+					scrub(value.to_str().ok()?.to_owned()),
+				))
 			})
 			.take(MAX_RESPONSE_HEADERS)
 			.take_while(|(name, value)| {
@@ -358,12 +494,12 @@ impl PluginNetwork {
 		}
 		let mut reply = json!({
 			"status": status,
-			"url": url,
+			"url": scrub(url),
 			"redirected": redirected,
 			"headers": headers,
 		});
 		match String::from_utf8(bytes) {
-			Ok(text) => reply["body"] = text.into(),
+			Ok(text) => reply["body"] = scrub(text).into(),
 			Err(error) => reply["body_base64"] = BASE64.encode(error.into_bytes()).into(),
 		}
 		Ok(reply.to_string().into_bytes())
@@ -552,6 +688,114 @@ mod tests {
 		// The request budget is per invocation.
 		network.requests = MAX_REQUESTS;
 		assert!(failure(&mut network, json!({ "url": url })).contains("At most"));
+	}
+
+	fn with_secret(
+		mut network: PluginNetwork,
+		origins: &[&str],
+		value: Option<&str>,
+	) -> PluginNetwork {
+		let value = value.map(str::to_owned);
+		network.secrets(
+			vec![SecretSpec {
+				id: "api_key".into(),
+				label: "API key".into(),
+				origins: origins.iter().map(|o| o.to_string()).collect(),
+			}],
+			Box::new(move |id| {
+				Ok(value
+					.clone()
+					.filter(|_| id == "api_key")
+					.map(Zeroizing::new))
+			}),
+		);
+		network
+	}
+
+	#[test]
+	fn secrets_fill_only_declared_set_and_allowed_placeholders() {
+		let both = ["https://api.example.org", "https://other.example.org"];
+		let mut network = with_secret(
+			session(&both),
+			&["https://api.example.org"],
+			Some("s3cr3t-value"),
+		);
+		for (request, expected) in [
+			(
+				json!({ "url": "https://api.example.org/?k={{secret.missing}}" }),
+				"not declared",
+			),
+			(
+				json!({ "url": "https://other.example.org/", "headers": [["Authorization", "{{secret.api_key}}"]] }),
+				"may not be sent",
+			),
+			(
+				json!({ "url": "https://api.example.org/", "headers": [["X", "{{secret.api_key"]] }),
+				"Malformed",
+			),
+			(
+				json!({ "url": "https://{{secret.api_key}}.example.org/" }),
+				"network list",
+			),
+		] {
+			let message = failure(&mut network, request.clone());
+			assert!(message.contains(expected), "{request}: {message}");
+			assert!(!message.contains("s3cr3t"), "{message}");
+		}
+		let mut unset = with_secret(session(&both), &["https://api.example.org"], None);
+		let message = failure(
+			&mut unset,
+			json!({ "url": "https://api.example.org/?k={{secret.api_key}}" }),
+		);
+		assert!(message.contains("not set"), "{message}");
+		let mut undeclared = session(&both);
+		let message = failure(
+			&mut undeclared,
+			json!({ "url": "https://api.example.org/?k={{secret.api_key}}" }),
+		);
+		assert!(message.contains("not declared"), "{message}");
+		assert_eq!(network.requests, 0);
+	}
+
+	#[test]
+	fn filled_secrets_reach_their_origin_and_never_come_back() {
+		let server = tokio::runtime::Runtime::new().unwrap();
+		let (port, task) = server.block_on(serve(|_| {
+			vec![
+				"HTTP/1.1 200 OK\r\nX-Echo: key s3cr3t value\r\nContent-Length: 22\r\n\r\nyou sent s3cr3t value!".into(),
+				// The next hop is declared, but this request's secret may not go there.
+				"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n".into(),
+			]
+		}));
+		let mut network = loopback(port);
+		network.origins.push(Origin {
+			host: "127.0.0.1".into(),
+			port: 1,
+		});
+		let origin = format!("http://localhost:{port}");
+		let mut network = with_secret(network, &[origin.as_str()], Some("s3cr3t value"));
+		let url = format!("http://localhost:{port}/q?key={{{{secret.api_key}}}}");
+		let request =
+			json!({ "url": url, "headers": [["Authorization", "Bearer {{secret.api_key}}"]] });
+		let Reply::Ok(bytes) = network.request(request.to_string().as_bytes()) else {
+			panic!("request failed")
+		};
+		let text = String::from_utf8(bytes).unwrap();
+		assert!(!text.contains("s3cr3t"), "{text}");
+		let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+		assert_eq!(reply["body"], "you sent [secret]!");
+		let Reply::Ok(bytes) = network.request(request.to_string().as_bytes()) else {
+			panic!("request failed")
+		};
+		let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(reply["status"], 302);
+		let seen = server.block_on(task).unwrap();
+		assert!(
+			seen[0].starts_with("GET /q?key=s3cr3t+value "),
+			"{}",
+			seen[0]
+		);
+		assert!(seen[0].contains("authorization: Bearer s3cr3t value"));
 	}
 
 	#[test]

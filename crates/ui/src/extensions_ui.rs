@@ -114,6 +114,13 @@ pub enum ExtensionRequest {
 		id: String,
 		connection: bool,
 	},
+	/// Save, or with `None` remove, a secret the plugin declares.
+	SetSecret {
+		id: String,
+		connection: bool,
+		secret: String,
+		value: Option<zeroize::Zeroizing<String>>,
+	},
 	/// Change how large a plugin's database may grow.
 	SetDatabaseQuota {
 		id: String,
@@ -306,6 +313,8 @@ pub struct ExtensionUi {
 	confirm_disable: Option<String>,
 	/// Kept data waiting for the user to confirm deletion: plugin ID and connection scope.
 	confirm_delete_data: Option<(String, bool)>,
+	/// The secret being typed: plugin ID, secret ID and the masked value so far.
+	secret_edit: Option<(String, String, zeroize::Zeroizing<String>)>,
 }
 
 /// "1.5 MiB"-style size for data shown to the user.
@@ -1954,6 +1963,10 @@ impl ExtensionUi {
 		let data = self.data_of(&id).cloned();
 		let quota_editable = usable && entry.manifest.capabilities.contains(&Capability::Database);
 		let mut quota = None;
+		let mut secret_request: Option<(String, Option<zeroize::Zeroizing<String>>)> = None;
+		let set_secrets: Vec<String> = data
+			.as_ref()
+			.map_or_else(Vec::new, |data| data.secrets.clone());
 		let mut close = false;
 		let response = crate::dialog::Dialog::new("extension-details", &entry.manifest.name)
 			.subtitle(crate::i18n::translate(
@@ -2106,6 +2119,104 @@ impl ExtensionUi {
 							});
 						}
 					}
+					if !entry.manifest.secrets.is_empty() {
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-secrets-section"),
+							colors.muted,
+						));
+						for spec in &entry.manifest.secrets {
+							let set = set_secrets.contains(&spec.id);
+							ui.horizontal_wrapped(|ui| {
+								ui.label(egui::RichText::new(&spec.label).color(colors.text));
+								ui.label(
+									egui::RichText::new(crate::i18n::translate(if set {
+										"extensions-ui-secret-set"
+									} else {
+										"extensions-ui-secret-not-set"
+									}))
+									.color(if set {
+										colors.positive
+									} else {
+										colors.muted
+									}),
+								);
+							});
+							crate::dialog::hint(
+								ui,
+								&crate::i18n::translate_args(
+									"extensions-ui-secret-hint",
+									&[("origins", &spec.origins.join(", "))],
+								),
+							);
+							let editing =
+								self.secret_edit
+									.as_ref()
+									.is_some_and(|(plugin, secret, _)| {
+										*plugin == id && *secret == spec.id
+									});
+							if editing {
+								let (_, _, value) = self.secret_edit.as_mut().expect("editing");
+								ui.add(
+									egui::TextEdit::singleline(&mut **value)
+										.password(true)
+										.desired_width(f32::INFINITY),
+								);
+								ui.horizontal(|ui| {
+									let valid = extension_host::secrets::valid_value(value);
+									if ui
+										.add_enabled(
+											usable && valid,
+											egui::Button::new(crate::i18n::translate(
+												"extensions-ui-secret-save",
+											)),
+										)
+										.clicked()
+									{
+										secret_request =
+											Some((spec.id.clone(), Some(std::mem::take(value))));
+									}
+									if ui
+										.button(crate::i18n::translate("dialog-module-cancel"))
+										.clicked()
+									{
+										secret_request = Some((String::new(), None));
+									}
+								});
+							} else {
+								ui.horizontal(|ui| {
+									if ui
+										.add_enabled(
+											usable,
+											egui::Button::new(crate::i18n::translate(
+												"extensions-ui-secret-edit",
+											)),
+										)
+										.clicked()
+									{
+										self.secret_edit = Some((
+											id.clone(),
+											spec.id.clone(),
+											zeroize::Zeroizing::default(),
+										));
+									}
+									if set
+										&& ui
+											.add_enabled(
+												usable,
+												egui::Button::new(crate::i18n::translate(
+													"extensions-ui-secret-remove",
+												)),
+											)
+											.clicked()
+									{
+										secret_request = Some((spec.id.clone(), None));
+									}
+								});
+							}
+						}
+					}
 					ui.separator();
 					ui.label(design::eyebrow(
 						ui,
@@ -2176,6 +2287,22 @@ impl ExtensionUi {
 					}
 				});
 			});
+		let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
+		if let Some((secret, value)) = secret_request {
+			// An empty ID is Cancel: the typed value is dropped (and zeroized) unsent.
+			self.secret_edit = None;
+			if !secret.is_empty() {
+				self.queue(
+					ctx,
+					ExtensionRequest::SetSecret {
+						id: id.clone(),
+						connection,
+						secret,
+						value,
+					},
+				);
+			}
+		}
 		if let Some(bytes) = quota {
 			let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
 			self.queue(
@@ -2189,6 +2316,7 @@ impl ExtensionUi {
 		}
 		if close || response.close || enable.is_some() || disable.is_some() || invoke.is_some() {
 			self.details = None;
+			self.secret_edit = None;
 		}
 	}
 	fn card_body(
@@ -2819,6 +2947,23 @@ impl ExtensionUi {
 						}
 					}
 				}
+				if !consent.entry.manifest.secrets.is_empty() {
+					let labels: Vec<&str> = consent
+						.entry
+						.manifest
+						.secrets
+						.iter()
+						.map(|spec| spec.label.as_str())
+						.collect();
+					ui.label(
+						egui::RichText::new(crate::i18n::translate_args(
+							"extensions-ui-consent-secrets",
+							&[("labels", &labels.join(", "))],
+						))
+						.size(13.0)
+						.color(colors.text),
+					);
+				}
 				if !consent.entry.manifest.network.is_empty() {
 					design::notice(
 						ui,
@@ -3150,6 +3295,9 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			| ExtensionRequest::DeleteData { id, .. }
 			| ExtensionRequest::SetDatabaseQuota { id, .. }
 			| ExtensionRequest::Preview { id } => id.len(),
+			ExtensionRequest::SetSecret {
+				id, secret, value, ..
+			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),
 			ExtensionRequest::Invoke {
 				id,
 				invocation,
@@ -3942,6 +4090,7 @@ mod tests {
 				source: "https://example.com/source".into(),
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: vec![Capability::Composer],
 				actions: vec![],
 			},
@@ -4092,6 +4241,7 @@ mod tests {
 			connection: false,
 			bytes: 3 * 1024 * 1024,
 			database_quota: extension_host::database::DEFAULT_QUOTA,
+			secrets: Vec::new(),
 		}];
 		let ask = |shop: &mut ExtensionUi| {
 			shop.open_details(&plugin.manifest.id);
@@ -4844,6 +4994,89 @@ mod tests {
 			);
 		}
 	}
+	#[test]
+	fn secrets_are_typed_masked_and_sent_only_as_a_request() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut plugin = entry();
+		plugin.enabled = true;
+		plugin.manifest.capabilities.push(Capability::Network);
+		plugin.manifest.network = vec!["https://api.example.org".into()];
+		plugin.manifest.secrets = vec![extensions::network::SecretSpec {
+			id: "api_key".into(),
+			label: "Example API key".into(),
+			origins: vec!["https://api.example.org".into()],
+		}];
+		shop.set_entries(vec![plugin.clone()]);
+		shop.open_details(&plugin.manifest.id);
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		let has =
+			|labels: &[(String, egui::Rect)], text: &str| labels.iter().any(|(t, _)| t == text);
+		assert!(has(&labels, "Example API key"));
+		assert!(has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-not-set")
+		));
+		assert!(!has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-remove")
+		));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-edit"),
+		);
+		let (_, _, value) = shop.secret_edit.as_mut().expect("editing");
+		value.push_str("typed-secret");
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		// The field is masked.
+		assert!(!labels.iter().any(|(text, _)| text.contains("typed-secret")));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-save"),
+		);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSecret { id, secret, value: Some(value), .. }]
+				if id == "synthetic.words" && secret == "api_key" && value.as_str() == "typed-secret"
+		));
+		assert!(shop.secret_edit.is_none());
+		shop.requests.clear();
+		// Once set, it can be removed.
+		shop.plugin_data = vec![extension_host::store::PluginData {
+			id: plugin.manifest.id.clone(),
+			connection: false,
+			bytes: 0,
+			database_quota: extension_host::database::DEFAULT_QUOTA,
+			secrets: vec!["api_key".into()],
+		}];
+		shop.open_details(&plugin.manifest.id);
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		assert!(has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-set")
+		));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-remove"),
+		);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSecret { value: None, .. }]
+		));
+	}
+
 	#[test]
 	fn network_consent_names_the_servers_and_warns_about_data_leaving() {
 		let ctx = egui::Context::default();

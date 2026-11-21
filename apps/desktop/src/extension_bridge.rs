@@ -16,6 +16,29 @@ use std::{
 };
 use ui::{ExtensionContext, ExtensionEntry, ExtensionRequest};
 
+/// Plugin secrets in the OS credential store.
+struct OsSecrets;
+impl extension_host::secrets::SecretStore for OsSecrets {
+	fn load(&self, key: &str) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+		platform::plugin_secrets::load(key).map_err(secret_error)
+	}
+	fn save(&self, key: &str, value: &str) -> Result<(), String> {
+		platform::plugin_secrets::save(key, value).map_err(secret_error)
+	}
+	fn forget(&self, key: &str) -> Result<(), String> {
+		platform::plugin_secrets::forget(key).map_err(secret_error)
+	}
+}
+fn secret_error(error: platform::CredentialError) -> String {
+	match error {
+		platform::CredentialError::NoStore => {
+			"No system credential store is available for plugin secrets".into()
+		}
+		platform::CredentialError::Invalid => "The secret is not valid".into(),
+		_ => "The system credential store is unavailable".into(),
+	}
+}
+
 /// Wakes the UI thread to poll a finished extension job.
 fn repaint(ctx: &egui::Context) -> extension_host::store::Wake {
 	let ctx = ctx.clone();
@@ -863,6 +886,12 @@ impl Bridge {
 				return;
 			};
 			self.start_screen = crate::extension_start_screen::DeviceStartScreen::load(&root, ctx);
+			// The demo never touches the OS credential store.
+			extension_host::secrets::install(if demo {
+				Arc::new(extension_host::secrets::MemoryStore::default())
+			} else {
+				Arc::new(OsSecrets)
+			});
 			self.host = Some(ExtensionHost::new(root));
 		}
 		let scope = (state.generation, account.clone());
@@ -1467,6 +1496,26 @@ impl Bridge {
 							id,
 							account: account.clone(),
 							connection,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::SetSecret {
+					id,
+					connection,
+					secret,
+					value,
+				} => {
+					self.submit(
+						Job::SetSecret {
+							id,
+							account: account.clone(),
+							connection,
+							secret,
+							value,
 						},
 						None,
 						state.generation,
@@ -2504,6 +2553,7 @@ mod tests {
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
 			network: Vec::new(),
+			secrets: Vec::new(),
 			capabilities: vec![
 				Capability::InterfaceUi,
 				Capability::AppEvents,
@@ -2616,6 +2666,7 @@ mod tests {
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
 			network: Vec::new(),
+			secrets: Vec::new(),
 			capabilities: vec![Capability::InterfaceUi, Capability::StartScreen],
 			actions: vec![
 				extensions::Action {

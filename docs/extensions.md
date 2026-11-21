@@ -677,6 +677,38 @@ and one complete response, `{"status", "url", "redirected", "headers", "body" |
 - The invocation waits on the extension worker while a request runs; cancelling the
   job, such as on navigation or logout, ends it at once.
 
+## Plugin secrets (preview)
+
+A plugin with `network` may declare secrets the user enters, such as API keys:
+
+```json
+"secrets": [
+  { "id": "api_key", "label": "DeepL API key", "origins": ["https://api-free.deepl.com"] }
+]
+```
+
+IDs are 1-32 lowercase letters, digits and `_`; labels at most 64 characters; at most 8
+secrets; every origin must also be in `network`. The consent dialog names them, and
+the plugin's details show each one with its origins, whether it is set, and a masked
+field to enter, replace or remove it. Values (1-4,096 characters without control
+characters) are saved only in the OS credential store; the demo keeps them in memory.
+Without an OS credential store, secrets are unavailable rather than written to a file.
+
+The plugin never reads a value. It writes `{{secret.<id>}}` in a request's URL, header
+values or text body, and the host fills it in (URL-encoded in the URL) when:
+
+- the secret is declared, set, and the request's origin is one of its origins;
+- otherwise the request fails before any network access, naming the secret but never
+  its value.
+
+A redirect is not followed to an origin any of the request's secrets may not reach, and
+every occurrence of a value (raw or URL-encoded) in the response's URL, headers and text
+body is replaced by `[secret]`. Values pass through host memory and the HTTP client
+only for the request; Serein zeroizes its own copies where practical.
+
+Secrets follow the plugin's data: keeping data on disable or logout keeps them; deleting
+the plugin's data also removes them from the credential store.
+
 ## Plugin data (preview)
 
 Plugin data lives apart from packages in `extensions/plugin-data/<account>/<plugin id>/`

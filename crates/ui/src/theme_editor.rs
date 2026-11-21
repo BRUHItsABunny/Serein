@@ -144,6 +144,7 @@ impl ThemeEditor {
 					source: String::new(),
 					kind: ExtensionKind::Theme,
 					network: Vec::new(),
+					secrets: Vec::new(),
 					capabilities: vec![],
 					actions: vec![],
 				},

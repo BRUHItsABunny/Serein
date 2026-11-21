@@ -25,6 +25,7 @@ sha2 = "=0.10.9"
 tokio.workspace = true
 url.workspace = true
 wreq.workspace = true
+zeroize.workspace = true
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]

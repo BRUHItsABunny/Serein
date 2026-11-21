@@ -275,6 +275,10 @@ pub struct Manifest {
 	/// HTTPS origins `serein.https_request` may reach; requires the `network` capability.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub network: Vec<String>,
+	/// Values the user enters for this plugin, such as API keys. The host fills them into
+	/// requests to their origins; the plugin never reads them.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub secrets: Vec<network::SecretSpec>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,6 +927,7 @@ impl Manifest {
 		if capabilities.contains(&Capability::Network) == self.network.is_empty() {
 			return Err(Error::Capability);
 		}
+		network::validate_secrets(&self.secrets, &origins)?;
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)
 		{

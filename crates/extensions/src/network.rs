@@ -76,6 +76,73 @@ impl std::fmt::Display for Origin {
 	}
 }
 
+/// Secrets one manifest may declare.
+pub const MAX_SECRETS: usize = 8;
+/// Placeholder a request uses for a secret: `{{secret.<id>}}`.
+pub const PLACEHOLDER_PREFIX: &str = "{{secret.";
+
+/// A value the user enters for the plugin, sent only to `origins`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+	/// Referenced as `{{secret.<id>}}` in request headers, URLs and bodies.
+	pub id: String,
+	/// Shown to the user where they enter the value, such as "DeepL API key".
+	pub label: String,
+	/// Origins that may receive it; each must also be in the manifest's `network` list.
+	pub origins: Vec<String>,
+}
+
+fn valid_secret_id(id: &str) -> bool {
+	(1..=32).contains(&id.len())
+		&& id
+			.bytes()
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+pub(crate) fn validate_secrets(
+	secrets: &[SecretSpec],
+	network: &std::collections::BTreeSet<Origin>,
+) -> Result<(), crate::Error> {
+	if secrets.len() > MAX_SECRETS {
+		return Err(crate::Error::Limit);
+	}
+	let mut ids = std::collections::BTreeSet::new();
+	for secret in secrets {
+		let origins: Option<Vec<Origin>> =
+			secret.origins.iter().map(|o| Origin::parse(o)).collect();
+		if !valid_secret_id(&secret.id)
+			|| !ids.insert(&secret.id)
+			|| secret.label.trim().is_empty()
+			|| secret.label.len() > 64
+			|| secret.label.chars().any(char::is_control)
+			|| origins.is_none_or(|origins| {
+				origins.is_empty() || origins.iter().any(|origin| !network.contains(origin))
+			}) {
+			return Err(crate::Error::Invalid);
+		}
+	}
+	Ok(())
+}
+
+/// The secret IDs `text` references as `{{secret.<id>}}`, or `None` when a placeholder is
+/// malformed.
+pub fn placeholders(text: &str) -> Option<Vec<&str>> {
+	let mut found = Vec::new();
+	let mut rest = text;
+	while let Some(start) = rest.find(PLACEHOLDER_PREFIX) {
+		let after = &rest[start + PLACEHOLDER_PREFIX.len()..];
+		let end = after.find("}}")?;
+		let id = &after[..end];
+		if !valid_secret_id(id) {
+			return None;
+		}
+		found.push(id);
+		rest = &after[end + 2..];
+	}
+	Some(found)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -108,5 +175,35 @@ mod tests {
 		] {
 			assert_eq!(Origin::parse(rejected), None, "{rejected}");
 		}
+	}
+
+	#[test]
+	fn secrets_bind_to_declared_origins_and_placeholders_parse_strictly() {
+		let network: std::collections::BTreeSet<Origin> =
+			[Origin::parse("https://api.example.org").unwrap()].into();
+		let secret = |id: &str, origins: &[&str]| SecretSpec {
+			id: id.into(),
+			label: "API key".into(),
+			origins: origins.iter().map(|o| o.to_string()).collect(),
+		};
+		validate_secrets(&[secret("api_key", &["https://api.example.org"])], &network).unwrap();
+		for invalid in [
+			vec![secret("api_key", &["https://other.example.org"])],
+			vec![secret("api_key", &[])],
+			vec![secret("API-Key", &["https://api.example.org"])],
+			vec![
+				secret("api_key", &["https://api.example.org"]),
+				secret("api_key", &["https://api.example.org"]),
+			],
+		] {
+			assert!(validate_secrets(&invalid, &network).is_err(), "{invalid:?}");
+		}
+		assert_eq!(
+			placeholders("Bearer {{secret.api_key}} and {{secret.other}}"),
+			Some(vec!["api_key", "other"])
+		);
+		assert_eq!(placeholders("no secrets"), Some(vec![]));
+		assert_eq!(placeholders("{{secret.api_key"), None);
+		assert_eq!(placeholders("{{secret.Bad-Id}}"), None);
 	}
 }

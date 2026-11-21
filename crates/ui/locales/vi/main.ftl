@@ -1005,6 +1005,14 @@ extensions-ui-details-modal-author = tác giả
 extensions-ui-details-modal-capabilities = Khả năng
 # Context: details_modal
 extensions-ui-details-modal-disable = Tắt tiện ích mở rộng
+extensions-ui-secrets-section = Bí mật
+extensions-ui-secret-set = Đã đặt
+extensions-ui-secret-not-set = Chưa đặt
+extensions-ui-secret-edit = Nhập giá trị
+extensions-ui-secret-save = Lưu
+extensions-ui-secret-remove = Xóa
+extensions-ui-secret-hint = Được giữ trong kho thông tin xác thực của hệ thống. Tiện ích mở rộng không bao giờ thấy nó; Serein chỉ gửi nó đến { $origins }.
+extensions-ui-consent-secrets = Sau khi bật, tiện ích sẽ yêu cầu bạn nhập: { $labels }.
 extensions-ui-data-disable-title = Gỡ { $name }?
 extensions-ui-data-disable-body = Plugin này lưu { $size } dữ liệu trên thiết bị này. Giữ lại để tiếp tục khi bạn cài lại plugin, hoặc xóa ngay bây giờ.
 extensions-ui-data-keep = Giữ dữ liệu

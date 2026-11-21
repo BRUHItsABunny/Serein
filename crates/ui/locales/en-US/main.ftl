@@ -1005,6 +1005,14 @@ extensions-ui-details-modal-author = Author
 extensions-ui-details-modal-capabilities = Capabilities
 # Context: details_modal
 extensions-ui-details-modal-disable = Disable extension
+extensions-ui-secrets-section = Secrets
+extensions-ui-secret-set = Set
+extensions-ui-secret-not-set = Not set
+extensions-ui-secret-edit = Enter value
+extensions-ui-secret-save = Save
+extensions-ui-secret-remove = Remove
+extensions-ui-secret-hint = Kept in your system's credential store. The extension never sees it; Serein sends it only to { $origins }.
+extensions-ui-consent-secrets = After enabling, it asks you for: { $labels }.
 extensions-ui-data-disable-title = Remove { $name }?
 extensions-ui-data-disable-body = This plugin keeps { $size } of data on this device. Keep it to continue where it left off if you install the plugin again, or delete it now.
 extensions-ui-data-keep = Keep data

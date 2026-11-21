@@ -2156,6 +2156,17 @@ keeps the latest journaled message ID for at most 10,000 channels to report `mis
 entries. Nothing is recorded without a consumer. Disabling a plugin drops its cursor.
 The file lives with the account's plugin data, so logout keeps it. Not encrypted.
 
+## Plugin secrets (preview, November 21, 2026)
+
+Secret values a user enters for a plugin are stored only in the OS credential store,
+under the Serein service with a `plugin-secret.<account key or connection>/<plugin>/<secret>`
+name; the account key is the existing hash, not the account ID. The plugin's
+`settings.json` records only which secret IDs are set, so deleting the data can remove
+them. Values are at most 4,096 characters, are never written to plugin data, journals,
+logs or diagnostics, and are read on the extension worker only to fill a request. No OS
+store means no plugin secrets; there is no plaintext fallback. The demo keeps them in
+process memory.
+
 ## Plugin data lifecycle (preview, November 21, 2026)
 
 Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`

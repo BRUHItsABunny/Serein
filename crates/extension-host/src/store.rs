@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::database::{self, PluginDatabase};
 use crate::journal::{self, JournalSession};
 use crate::network::PluginNetwork;
+use crate::secrets;
 
 /// Generated from `extensions/` and pinned to a merged commit by the catalog workflow.
 const CATALOG_URL: &str =
@@ -112,6 +113,14 @@ pub enum Job {
 		id: String,
 		account: Option<String>,
 		connection: bool,
+	},
+	/// Saves or, with `None`, removes a secret the plugin's manifest declares.
+	SetSecret {
+		id: String,
+		account: Option<String>,
+		connection: bool,
+		secret: String,
+		value: Option<zeroize::Zeroizing<String>>,
 	},
 	/// Sets a plugin's database quota to one of [`database::QUOTAS`].
 	SetDatabaseQuota {
@@ -360,6 +369,8 @@ pub struct PluginData {
 	pub connection: bool,
 	pub bytes: u64,
 	pub database_quota: u64,
+	/// Secret IDs the user has set; values stay in the secret store.
+	pub secrets: Vec<String>,
 }
 
 pub enum Event {
@@ -481,10 +492,20 @@ impl SystemImports {
 			Box::new(Self {
 				database: database.clone(),
 				journal: journal.clone(),
-				network: stored
-					.grants
-					.contains(&Capability::Network)
-					.then(|| PluginNetwork::new(&stored.package.manifest.network, gate.clone())),
+				network: stored.grants.contains(&Capability::Network).then(|| {
+					let mut network =
+						PluginNetwork::new(&stored.package.manifest.network, gate.clone());
+					if let Some(directory) = directory {
+						let directory = directory.to_path_buf();
+						network.secrets(
+							stored.package.manifest.secrets.clone(),
+							Box::new(move |secret| {
+								secrets::store()?.load(&secret_key(&directory, secret)?)
+							}),
+						);
+					}
+					network
+				}),
 			}),
 			Pending { database, journal },
 		)
@@ -883,6 +904,19 @@ fn validate_job(job: &Job) -> Result<(), String> {
 		| Job::Disable { id, .. }
 		| Job::EditTheme { id, .. }
 		| Job::DeleteData { id, .. } => valid_id(id)?,
+		Job::SetSecret {
+			id, secret, value, ..
+		} => {
+			valid_id(id)?;
+			if extensions::network::placeholders(&format!("{{{{secret.{secret}}}}}"))
+				.is_none_or(|ids| ids.len() != 1)
+				|| value
+					.as_ref()
+					.is_some_and(|value| !secrets::valid_value(value))
+			{
+				return Err("Secrets are 1 to 4,096 characters without line breaks".into());
+			}
+		}
 		Job::SetDatabaseQuota { id, bytes, .. } => {
 			valid_id(id)?;
 			if !database::QUOTAS.contains(bytes) {
@@ -1048,7 +1082,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			let parent = scope(root, kind, account.as_deref())?;
 			disable(&parent, &id, gate)?;
 			if delete_data && kind == ExtensionKind::Plugin {
-				remove_owned_directory(&data_dir(root, &id, account.as_deref())?)?;
+				delete_data_dir(&data_dir(root, &id, account.as_deref())?)?;
 			}
 			Ok(Event::Disabled(id))
 		}
@@ -1062,7 +1096,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			if account.is_none() && !connection {
 				return Err("Sign in to manage this account's plugin data".into());
 			}
-			remove_owned_directory(&data_dir(root, &id, account.as_deref())?)?;
+			delete_data_dir(&data_dir(root, &id, account.as_deref())?)?;
 			data_usage(root, account.as_deref()).map(Event::DataUsage)
 		}
 		Job::SetDatabaseQuota {
@@ -1076,12 +1110,43 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Sign in to manage this account's plugin data".into());
 			}
 			let directory = data_dir(root, &id, account.as_deref())?;
-			fs::create_dir_all(&directory).map_err(|_| "Cannot create plugin data directory")?;
-			let settings = serde_json::to_vec(&DataSettings {
-				database_bytes: Some(bytes),
-			})
-			.map_err(|_| "Cannot encode plugin data settings")?;
-			atomic_write(&directory.join(SETTINGS_FILE), &settings, gate)?;
+			let mut settings = read_settings(&directory);
+			settings.database_bytes = Some(bytes);
+			write_settings(&directory, &settings, gate)?;
+			data_usage(root, account.as_deref()).map(Event::DataUsage)
+		}
+		Job::SetSecret {
+			id,
+			account,
+			connection,
+			secret,
+			value,
+		} => {
+			let account = if connection { None } else { account };
+			let parent = scope(root, ExtensionKind::Plugin, account.as_deref())?;
+			let stored = read_stored(&parent.join(&id).join("package.json"))?;
+			if !stored
+				.package
+				.manifest
+				.secrets
+				.iter()
+				.any(|spec| spec.id == secret)
+			{
+				return Err("This plugin does not declare that secret".into());
+			}
+			let directory = data_dir(root, &id, account.as_deref())?;
+			let key = secret_key(&directory, &secret)?;
+			let store = secrets::store()?;
+			let mut settings = read_settings(&directory);
+			settings.secrets.retain(|set| *set != secret);
+			match value {
+				Some(value) => {
+					store.save(&key, &value)?;
+					settings.secrets.push(secret);
+				}
+				None => store.forget(&key)?,
+			}
+			write_settings(&directory, &settings, gate)?;
 			data_usage(root, account.as_deref()).map(Event::DataUsage)
 		}
 		Job::Invoke {
@@ -1364,6 +1429,50 @@ const MAX_DATA_ENTRIES: usize = 256;
 struct DataSettings {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	database_bytes: Option<u64>,
+	/// Secret IDs saved in the secret store, so deleting the data can forget them.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	secrets: Vec<String>,
+}
+
+fn read_settings(directory: &Path) -> DataSettings {
+	read_bounded(&directory.join(SETTINGS_FILE), 4096)
+		.ok()
+		.and_then(|bytes| serde_json::from_slice(&bytes).ok())
+		.unwrap_or_default()
+}
+
+fn write_settings(directory: &Path, settings: &DataSettings, gate: &Gate) -> Result<(), String> {
+	fs::create_dir_all(directory).map_err(|_| "Cannot create plugin data directory")?;
+	let bytes = serde_json::to_vec(settings).map_err(|_| "Cannot encode plugin data settings")?;
+	atomic_write(&directory.join(SETTINGS_FILE), &bytes, gate)
+}
+
+/// The secret store key of `secret` for the plugin whose data directory is `directory`:
+/// its scope directory's name (an account key or `connection`), plugin ID and secret ID.
+fn secret_key(directory: &Path, secret: &str) -> Result<String, String> {
+	let name = |path: Option<&Path>| {
+		path.and_then(Path::file_name)
+			.and_then(|name| name.to_str())
+			.map(str::to_owned)
+			.ok_or_else(|| "Invalid plugin data directory".to_string())
+	};
+	Ok(secrets::key(
+		&name(directory.parent())?,
+		&name(Some(directory))?,
+		secret,
+	))
+}
+
+/// Removes a plugin's data directory and forgets the secrets it recorded.
+fn delete_data_dir(directory: &Path) -> Result<(), String> {
+	let settings = read_settings(directory);
+	if !settings.secrets.is_empty() {
+		let store = secrets::store()?;
+		for secret in &settings.secrets {
+			store.forget(&secret_key(directory, secret)?)?;
+		}
+	}
+	remove_owned_directory(directory)
 }
 
 fn data_scope(root: &Path, account: Option<&str>) -> Result<PathBuf, String> {
@@ -1392,10 +1501,8 @@ fn migrate_data(package: &Path, data: &Path) -> Result<(), String> {
 }
 
 fn database_quota(directory: &Path) -> u64 {
-	read_bounded(&directory.join(SETTINGS_FILE), 1024)
-		.ok()
-		.and_then(|bytes| serde_json::from_slice::<DataSettings>(&bytes).ok())
-		.and_then(|settings| settings.database_bytes)
+	read_settings(directory)
+		.database_bytes
 		.filter(|bytes| database::QUOTAS.contains(bytes))
 		.unwrap_or(database::DEFAULT_QUOTA)
 }
@@ -1429,6 +1536,7 @@ fn data_usage(root: &Path, account: Option<&str>) -> Result<Vec<PluginData>, Str
 			usage.push(PluginData {
 				bytes: directory_bytes(&entry.path()),
 				database_quota: database_quota(&entry.path()),
+				secrets: read_settings(&entry.path()).secrets,
 				id,
 				connection,
 			});
@@ -1616,6 +1724,7 @@ fn load(
 							},
 							actions: Vec::new(),
 							network: Vec::new(),
+							secrets: Vec::new(),
 						},
 						theme: None,
 						reviewed: false,
@@ -2171,6 +2280,7 @@ mod tests {
 				source: "https://github.com/ViceVerse-cz/rustcord".into(),
 				kind: ExtensionKind::Theme,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: Vec::new(),
 				actions: Vec::new(),
 			},
@@ -2464,6 +2574,7 @@ mod tests {
 				source: "https://github.com/example/plugin".into(),
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: vec![Capability::Database],
 				actions: vec![extensions::Action {
 					id: "run".into(),
@@ -2569,7 +2680,7 @@ mod tests {
 			panic!("expected data usage")
 		};
 		assert!(
-			matches!(&usage[..], [PluginData { id, connection: false, bytes, database_quota }]
+			matches!(&usage[..], [PluginData { id, connection: false, bytes, database_quota, .. }]
 			if id == "database-plugin" && *bytes > 0 && *database_quota == crate::database::DEFAULT_QUOTA)
 		);
 		install(&package, vec![Capability::Database]).unwrap();
@@ -2614,6 +2725,108 @@ mod tests {
 		// Deleting on disable removes the data too.
 		disable(true);
 		assert!(!data.exists());
+	}
+
+	#[test]
+	fn secrets_live_in_the_store_and_are_forgotten_with_the_data() {
+		secrets::install(Arc::new(secrets::MemoryStore::default()));
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let mut package = database_plugin("{}");
+		package.manifest.id = "secret-plugin".into();
+		package.manifest.capabilities = vec![Capability::Network];
+		package.manifest.network = vec!["https://api.example.org".into()];
+		package.manifest.secrets = vec![extensions::network::SecretSpec {
+			id: "api_key".into(),
+			label: "API key".into(),
+			origins: vec!["https://api.example.org".into()],
+		}];
+		package.wasm = wat::parse_str(
+			r#"(module (memory (export "memory") 1)
+			(func (export "serein_alloc") (param i32) (result i32) (i32.const 0))
+			(func (export "serein_invoke") (param i32 i32) (result i64) (i64.const 0)))"#,
+		)
+		.unwrap();
+		enable(
+			&root,
+			source(&profile, &package),
+			vec![Capability::Network],
+			Some("account"),
+			&gate(),
+		)
+		.unwrap();
+		let set = |secret: &str, value: Option<&str>| {
+			run(
+				&root,
+				Job::SetSecret {
+					id: "secret-plugin".into(),
+					account: Some("account".into()),
+					connection: false,
+					secret: secret.into(),
+					value: value.map(|value| zeroize::Zeroizing::new(value.into())),
+				},
+				&gate(),
+			)
+		};
+		let data = data_dir(&root, "secret-plugin", Some("account")).unwrap();
+		let key = secret_key(&data, "api_key").unwrap();
+		let Ok(Event::DataUsage(usage)) = set("api_key", Some("value-1")) else {
+			panic!("secret not saved")
+		};
+		assert_eq!(usage[0].secrets, ["api_key"]);
+		assert_eq!(
+			secrets::store()
+				.unwrap()
+				.load(&key)
+				.unwrap()
+				.as_deref()
+				.map(String::as_str),
+			Some("value-1")
+		);
+		// The value is never written to the data directory.
+		for file in fs::read_dir(&data).unwrap() {
+			let bytes = fs::read(file.unwrap().path()).unwrap();
+			assert!(!String::from_utf8_lossy(&bytes).contains("value-1"));
+		}
+		assert!(set("undeclared", Some("x")).is_err());
+		assert!(
+			validate_job(&Job::SetSecret {
+				id: "secret-plugin".into(),
+				account: None,
+				connection: false,
+				secret: "api_key".into(),
+				value: Some(zeroize::Zeroizing::new("line\nbreak".into())),
+			})
+			.is_err()
+		);
+		// Keeping the data keeps the secret; deleting the data forgets it.
+		for delete_data in [false, true] {
+			run(
+				&root,
+				Job::Disable {
+					id: "secret-plugin".into(),
+					kind: ExtensionKind::Plugin,
+					account: Some("account".into()),
+					delete_data,
+				},
+				&gate(),
+			)
+			.unwrap();
+			assert_eq!(
+				secrets::store().unwrap().load(&key).unwrap().is_some(),
+				!delete_data
+			);
+			if !delete_data {
+				enable(
+					&root,
+					source(&profile, &package),
+					vec![Capability::Network],
+					Some("account"),
+					&gate(),
+				)
+				.unwrap();
+			}
+		}
 	}
 
 	#[test]
@@ -2670,6 +2883,7 @@ mod tests {
 				source: "https://github.com/example/plugin".into(),
 				kind: ExtensionKind::Plugin,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: vec![Capability::MessageJournal],
 				actions: vec![extensions::Action {
 					id: "journal".into(),

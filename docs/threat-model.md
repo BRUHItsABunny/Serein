@@ -8,7 +8,9 @@ expose host pointers. With `network` (preview) a plugin reaches only the exact H
 origins it declares and the user approved, through public, pinned addresses without
 cookies, proxies or Serein credentials; anything the same plugin can read, including
 the `message_journal`, can therefore leave the device to those origins, and the consent
-dialog says so. Only explicitly granted, user-selected context crosses that boundary.
+dialog says so. Plugin secrets never enter Wasm: the host fills `{{secret.<id>}}`
+placeholders only for each secret's declared origins and redacts echoed values from
+responses, though a declared origin that is hostile receives the value by design. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

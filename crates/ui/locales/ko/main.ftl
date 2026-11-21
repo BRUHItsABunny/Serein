@@ -5110,6 +5110,14 @@ extensions-ui-details-modal-author = 제작자
 extensions-ui-details-modal-capabilities = 권한
 # Context: extensions_ui
 extensions-ui-details-modal-disable = 확장 비활성화
+extensions-ui-secrets-section = 비밀 값
+extensions-ui-secret-set = 설정됨
+extensions-ui-secret-not-set = 설정 안 됨
+extensions-ui-secret-edit = 값 입력
+extensions-ui-secret-save = 저장
+extensions-ui-secret-remove = 제거
+extensions-ui-secret-hint = 시스템 자격 증명 저장소에 보관됩니다. 확장 기능은 이 값을 볼 수 없으며, Serein은 { $origins }(으)로만 보냅니다.
+extensions-ui-consent-secrets = 활성화한 후 다음을 입력하라고 요청합니다: { $labels }.
 extensions-ui-data-disable-title = { $name }을(를) 제거할까요?
 extensions-ui-data-disable-body = 이 플러그인은 이 기기에 { $size }의 데이터를 보관하고 있습니다. 플러그인을 다시 설치할 때 이어서 사용하려면 보관하고, 아니면 지금 삭제하세요.
 extensions-ui-data-keep = 데이터 보관

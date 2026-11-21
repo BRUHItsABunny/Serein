@@ -115,6 +115,7 @@ fn test_manifest(capabilities: Vec<Capability>) -> Manifest {
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
 		network: Vec::new(),
+		secrets: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: "run".into(),

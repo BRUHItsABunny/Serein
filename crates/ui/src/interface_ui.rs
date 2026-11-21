@@ -710,6 +710,7 @@ mod tests {
 				source: "https://example.org/source".into(),
 				kind: extensions::ExtensionKind::Plugin,
 				network: Vec::new(),
+				secrets: Vec::new(),
 				capabilities: vec![Capability::InterfaceUi],
 				actions: vec![
 					extensions::Action {

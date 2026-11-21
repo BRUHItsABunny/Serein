@@ -626,6 +626,10 @@ pub mod journal {
 /// to declared origins (others come back as the 3xx response), sends no cookies and does not
 /// decompress bodies. An invocation may make 32 requests within 30 seconds; one request
 /// takes at most 15 seconds, sends at most 192 KiB and receives at most 160 KiB.
+///
+/// Secrets the manifest declares are written as `{{secret.<id>}}` in the URL, a header
+/// value or a text body; the host fills in the user's value for the secret's origins and
+/// replaces any echo of it in the response with `[secret]`, so the plugin never reads it.
 pub mod https {
 	use super::HostError;
 	use serde::{Deserialize, Serialize};

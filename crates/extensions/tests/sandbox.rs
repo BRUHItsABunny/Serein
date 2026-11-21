@@ -12,6 +12,7 @@ fn plugin(wasm: &str) -> Package {
 			source: "https://github.com/example/plugin".into(),
 			kind: ExtensionKind::Plugin,
 			network: Vec::new(),
+			secrets: Vec::new(),
 			capabilities: vec![Capability::Composer],
 			actions: vec![Action {
 				id: "run".into(),
