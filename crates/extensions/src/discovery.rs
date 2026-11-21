@@ -8,6 +8,15 @@ pub struct HostInfo {
 	pub capabilities: &'static [Capability],
 	pub app_events: &'static [AppEventKind],
 	pub interface_tweaks: &'static [InterfaceTweak],
+	/// Host functions a module may import from `serein`, each still gated by its capability.
+	#[serde(serialize_with = "import_names")]
+	pub host_imports: &'static [crate::imports::HostImport],
+}
+fn import_names<S: serde::Serializer>(
+	imports: &&'static [crate::imports::HostImport],
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	serializer.collect_seq(imports.iter().map(|import| import.name))
 }
 impl HostInfo {
 	pub fn current() -> Self {
@@ -73,6 +82,8 @@ impl HostInfo {
 				Capability::InterfaceTweaks,
 				Capability::InterfaceUi,
 				Capability::StartScreen,
+				Capability::Clock,
+				Capability::Random,
 			],
 			app_events: &[
 				AppEventKind::Ready,
@@ -98,6 +109,7 @@ impl HostInfo {
 				AppEventKind::Polls,
 			],
 			interface_tweaks: InterfaceTweak::ALL,
+			host_imports: crate::imports::HOST_IMPORTS,
 		}
 	}
 }

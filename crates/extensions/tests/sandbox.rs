@@ -675,3 +675,145 @@ fn custom_rpc_package_preserves_drafts_and_controls_presence() {
 	let invalid = invoke(&package, &input).expect("invalid field stays a valid editor panel");
 	assert!(invalid.rich_presence.is_none() && invalid.storage.is_none());
 }
+
+/// Fixed services so import tests are deterministic.
+struct Fixed;
+impl HostImports for Fixed {
+	fn now_ms(&mut self) -> Option<i64> {
+		Some(1234)
+	}
+	fn fill_random(&mut self, out: &mut [u8]) -> bool {
+		out.fill(0xab);
+		true
+	}
+}
+
+/// A composer plugin with `capabilities` whose handler runs `body` (leaving an i32 on the
+/// stack) and replaces the draft with "ok" when it is non-zero, else "no".
+fn importing(imports: &str, capabilities: &[Capability], body: &str) -> Package {
+	let ok = r#"{"replacement":"ok"}"#;
+	let no = r#"{"replacement":"no"}"#;
+	let mut package = plugin(&format!(
+		r#"(module {imports} (memory (export "memory") 1)
+		(data (i32.const 1024) "{ok}") (data (i32.const 2048) "{no}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 4096))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(if (result i64) {body}
+				(then (i64.const {}))
+				(else (i64.const {})))))"#,
+		(1024_u64 << 32) | ok.len() as u64,
+		(2048_u64 << 32) | no.len() as u64,
+		ok = ok.replace('"', "\\\""),
+		no = no.replace('"', "\\\""),
+	));
+	package
+		.manifest
+		.capabilities
+		.extend_from_slice(capabilities);
+	package
+}
+
+const CLOCK: &str = r#"(import "serein" "clock_now_ms" (func $now (result i64)))"#;
+const RANDOM: &str = r#"(import "serein" "random_fill" (func $fill (param i32 i32) (result i32)))"#;
+
+fn run(package: &Package, grants: &[Capability]) -> Result<Option<String>, Error> {
+	invoke_with(package, &input(), grants, Box::new(Fixed)).map(|output| output.replacement)
+}
+
+#[test]
+fn host_imports_require_known_signatures_and_declared_capabilities() {
+	for imports in [
+		r#"(import "env" "clock_now_ms" (func (result i64)))"#,
+		r#"(import "serein" "open_file" (func (result i64)))"#,
+		r#"(import "serein" "clock_now_ms" (func (result i32)))"#,
+		r#"(import "serein" "clock_now_ms" (memory 1))"#,
+	] {
+		let package = importing(imports, &[Capability::Clock], "(i32.const 1)");
+		assert!(
+			matches!(package.validate(), Err(Error::Module)),
+			"{imports}"
+		);
+	}
+	let undeclared = importing(CLOCK, &[], "(i32.const 1)");
+	assert!(matches!(undeclared.validate(), Err(Error::Capability)));
+	let declared = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(i64.eq (call $now) (i64.const 1234))",
+	);
+	declared.validate().unwrap();
+	// Declared but not granted: nothing runs, with or without services.
+	assert!(matches!(
+		invoke(&declared, &input()),
+		Err(Error::Capability)
+	));
+	assert!(matches!(
+		run(&declared, &[Capability::Composer]),
+		Err(Error::Capability)
+	));
+	// A grant the manifest never declared does not unlock an import either.
+	let mut stripped = declared.clone();
+	stripped
+		.manifest
+		.capabilities
+		.retain(|c| *c != Capability::Clock);
+	assert!(matches!(
+		run(&stripped, &[Capability::Clock]),
+		Err(Error::Capability)
+	));
+	let grants = [Capability::Composer, Capability::Clock];
+	assert_eq!(run(&declared, &grants).unwrap().as_deref(), Some("ok"));
+	let unavailable = invoke_with(&declared, &input(), &grants, Box::new(NoHostImports));
+	assert_eq!(unavailable.unwrap().replacement.as_deref(), Some("no"));
+}
+
+#[test]
+fn random_fill_writes_only_bounded_in_range_memory() {
+	let grants = [Capability::Composer, Capability::Random];
+	let filled = importing(
+		RANDOM,
+		&[Capability::Random],
+		"(i32.and (i32.eqz (call $fill (i32.const 8192) (i32.const 4))) (i32.eq (i32.load (i32.const 8192)) (i32.const 0xabababab)))",
+	);
+	assert_eq!(run(&filled, &grants).unwrap().as_deref(), Some("ok"));
+	// Oversized and negative lengths are refused without writing.
+	for length in ["4097", "-1"] {
+		let refused = importing(
+			RANDOM,
+			&[Capability::Random],
+			&format!(
+				"(i32.and (i32.eq (call $fill (i32.const 8192) (i32.const {length})) (i32.const -1)) (i32.eqz (i32.load (i32.const 8192))))"
+			),
+		);
+		assert_eq!(
+			run(&refused, &grants).unwrap().as_deref(),
+			Some("ok"),
+			"{length}"
+		);
+	}
+	// Writing past the end of linear memory traps instead of touching host memory.
+	let out_of_bounds = importing(
+		RANDOM,
+		&[Capability::Random],
+		"(i32.eqz (call $fill (i32.const 65534) (i32.const 4)))",
+	);
+	assert!(matches!(run(&out_of_bounds, &grants), Err(Error::Trap)));
+}
+
+#[test]
+fn host_calls_are_budgeted_per_invocation() {
+	let spin = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(loop $again (drop (call $now)) (br $again)) (i32.const 1)",
+	);
+	let grants = [Capability::Composer, Capability::Clock];
+	assert!(matches!(run(&spin, &grants), Err(Error::Fuel)));
+	// The budget belongs to one invocation: the next one starts fresh.
+	let once = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(i64.eq (call $now) (i64.const 1234))",
+	);
+	assert_eq!(run(&once, &grants).unwrap().as_deref(), Some("ok"));
+}

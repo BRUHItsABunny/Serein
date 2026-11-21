@@ -16,6 +16,7 @@ pub use serde_json;
 use std::{collections::BTreeMap, fmt, io, str::FromStr};
 mod discovery;
 pub use discovery::*;
+pub mod host;
 mod rich_presence;
 pub use rich_presence::*;
 mod conversation_activity;

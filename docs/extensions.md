@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 58 capabilities, with at most 64 distinct declarations per manifest.
+supports 60 capabilities, with at most 64 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -176,6 +176,8 @@ supports 58 capabilities, with at most 64 distinct declarations per manifest.
 | `interface_tweaks` | Switch on host-defined interface tweaks such as still typing dots, plain profiles, always-expanded roles, hidden request counts, one alert per direct conversation until read, hidden messages from blocked users, hidden profile notes, a larger stream preview or double-click to reply or edit | Activation and panel results only; a tweak stays on while any enabled plugin requests it and switches off when that plugin is disabled, fails or the account logs out |
 | `interface_ui` | Replace the client's main panes with a bounded declarative row tree (indent, generic icon, tint, badge, emphasis, selected) whose rows may also carry a native voice join; row clicks invoke the plugin's declared `interface_click` panel action (the one reserved action id allowed to contain `_`) with the row id and a double-click flag, which Enter on a focused row or dock item also sets as the primary open action (Space is a single click), and `window` shows one native window beside the tree: the active call's stage or an accessible channel's conversation view; `dock` adds small server tiles at the left of the tree pane's bottom control row (the loaded server's icon via `guild_id`, or the label's initials when unknown, with hover labels, a selected ring and row-like click routing), and `add_server` appends the client's own native add-a-server button after them; `controls` picks the native buttons at the right of that row, left to right, from `disconnect` (only during a call), `mute`, `deafen` and `settings`, and the host always appends `settings` when missing so the plugin can still be turned off; a `native` join row shows the loaded voice channel's real name and, with `voice_connect`, its double click or Enter joins through the client's own join path (current mute and deafen, call-switch confirmation) with no Apply step, since the double-clicked host-labelled row is the confirmation (an unknown, non-voice or hidden channel leaves the row inert with the plugin's text); `size` asks for a window size while the layout shows | Activation, panel and event results restate the tree; `None` restores the normal layout; at most 512 rows, 256-byte labels, 32-byte badges, unique 64-byte row ids (unique across rows and dock items), indent at most 8, at most 64 dock items with 1-256-byte labels and snowflake `guild_id`s, no repeated controls, snowflake native channel ids, `size` 200-1600 by 200-1200 logical pixels (centered and clamped to the monitor, the previous placement restored afterwards, never saved); the host renders the window, dock icons, the add-server button, the controls and native join labels itself, so no message content reaches Wasm; other row-click effects still wait for Apply |
 | `start_screen` | Replace the start screen's logo and copy with the plugin's own pre-rendered images and plain text | Preview; activation and panel results only; one bounded device-level file, shown on the connecting screen before any account loads and without running Wasm; the host draws nothing of its own design: up to four 2-bit palette cell images, each still or looping at up to 30 frames per second, stack top to bottom, then an optional title and subtitle in the normal font, scaled down only to fit (see the [image format](extension-sdk-actions.md#start-screen-preview)); an optional `window` size of 240-1,600 × 240-1,200 logical pixels is clamped to the monitor and centered while the screen shows, never saved as the window size, and the previous size, position and maximized state return afterwards; when several plugins set one, the lowest plugin id wins; disabling, removing or failing the plugin, revoking its grant, ending its account session or returning `start_screen: null` restores the default; the progress bar and **Use a different account** always stay |
+| `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
+| `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -483,7 +485,8 @@ proves live Discord compatibility. No lifecycle tests are implied by these diagn
 ## Resource and privacy limits
 
 Wasm executes on an on-demand background worker with fuel, stack and memory
-limits and no WASI or host imports. Each invocation gets a new runtime; it is
+limits, no WASI, and only the capability-gated [host imports](#host-imports-preview).
+Each invocation gets a new runtime; it is
 dropped when the call completes. Plugin execution never happens in a render or
 audio callback. The application bounds package sizes, installed plugin count,
 invocation input/output, panel complexity, queues and plugin storage.
@@ -496,7 +499,8 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 58 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 64 distinct | Only the 60 supported capability names are currently accepted. |
+| Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
 | App snapshot | 64 KiB | Individual lists have smaller budgets; see the [data reference](extension-sdk-reference.md#app-data). |
@@ -523,6 +527,27 @@ a separate bounded temporary `serein-extension-demo` profile; it can import loca
 fixtures and browse the embedded starter catalog/previews but cannot download a
 catalog, preview or package. `Ctrl+Shift+F12` resets a
 community theme if its colors make controls difficult to read.
+
+## Host imports (preview)
+
+A plugin module may import functions from the Wasm module `serein`; nothing else
+can be imported. Each function needs its capability declared in the manifest and
+granted by the user:
+
+| Import | Signature | Capability | Result |
+| --- | --- | --- | --- |
+| `clock_now_ms` | `() -> i64` | `clock` | Unix time in milliseconds, or `-1` when unavailable |
+| `random_fill` | `(ptr: i32, len: i32) -> i32` | `random` | Writes `len` (0-4,096) secure random bytes at `ptr`; `0` success, `-1` invalid length, `-2` unavailable |
+
+Installation rejects a module that imports an unknown name, uses a different
+signature or module name, or imports a function whose capability the manifest
+does not declare. An invocation fails with the capability error before any Wasm
+runs when an imported function's capability is not granted. Host functions copy
+bytes into the module's own memory and never expose host pointers; a write past
+linear memory traps. Calls count toward the invocation's fuel and its host-call
+budget (see [limits](#resource-and-privacy-limits)). Rust authors use
+`serein_extension_sdk::host`; only functions a plugin calls become imports.
+`HostInfo.host_imports` lists the names a host provides.
 
 ## API proxy plugin (preview)
 

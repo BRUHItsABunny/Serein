@@ -366,6 +366,20 @@ pub enum Event {
 	LoggedOut,
 }
 
+/// Host services behind the `serein` Wasm imports, backed by the operating system.
+pub struct SystemImports;
+impl extensions::HostImports for SystemImports {
+	fn now_ms(&mut self) -> Option<i64> {
+		let elapsed = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.ok()?;
+		i64::try_from(elapsed.as_millis()).ok()
+	}
+	fn fill_random(&mut self, out: &mut [u8]) -> bool {
+		getrandom::fill(out).is_ok()
+	}
+}
+
 /// Called from the worker thread after a job finishes so the front end polls its result,
 /// for example by requesting a repaint.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -534,13 +548,15 @@ impl Stored {
 		let mut result = activation.map_or(Ok(extensions::Output::default()), |action| {
 			validate_grants(&self.package.manifest, &self.grants)?;
 			gate.check()?;
-			let output = extensions::invoke(
+			let output = extensions::invoke_with(
 				&self.package,
 				&Invocation {
 					action: action.id.clone(),
 					storage,
 					..Default::default()
 				},
+				&self.grants,
+				Box::new(SystemImports),
 			)
 			.map_err(|error| error.to_string())?;
 			gate.check()?;
@@ -909,8 +925,13 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Plugin input exceeds 256 KiB".into());
 			}
 			gate.check()?;
-			let mut output =
-				extensions::invoke(&stored.package, &invocation).map_err(|e| e.to_string())?;
+			let mut output = extensions::invoke_with(
+				&stored.package,
+				&invocation,
+				&stored.grants,
+				Box::new(SystemImports),
+			)
+			.map_err(|e| e.to_string())?;
 			gate.check()?;
 			if output.api_proxy.is_some() && !stored.grants.contains(&Capability::ApiProxy) {
 				return Err("API proxy access was not granted".into());

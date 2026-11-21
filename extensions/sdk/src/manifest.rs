@@ -89,6 +89,10 @@ pub enum Capability {
 	InterfaceTweaks,
 	InterfaceUi,
 	StartScreen,
+	/// Import [`crate::host::now_ms`].
+	Clock,
+	/// Import [`crate::host::fill_random`].
+	Random,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

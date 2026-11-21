@@ -1,7 +1,12 @@
-use crate::{Error, ExtensionKind, Invocation, MAX_IO_BYTES, MAX_MODULE_BYTES, Output, Package};
+use crate::imports::{self, HostImports, Kind, NoHostImports, status};
+use crate::{
+	Capability, Error, ExtensionKind, Invocation, MAX_IO_BYTES, MAX_MODULE_BYTES, Manifest, Output,
+	Package,
+};
+use std::collections::BTreeSet;
 use wasmi::{
-	Config, EnforcedLimits, Engine, ExternType, FuncType, Instance, Linker, Module, Store,
-	StoreLimits, StoreLimitsBuilder, TrapCode, ValType,
+	Caller, Config, EnforcedLimits, Engine, Extern, ExternType, FuncType, Instance, Linker, Module,
+	Store, StoreLimits, StoreLimitsBuilder, TrapCode, ValType,
 };
 
 const MEMORY_BYTES: usize = 16 * 1024 * 1024;
@@ -26,9 +31,6 @@ fn module(engine: &Engine, bytes: &[u8]) -> Result<Module, Error> {
 		return Err(Error::Limit);
 	}
 	let module = Module::new(engine, bytes).map_err(|_| Error::Module)?;
-	if module.imports().next().is_some() {
-		return Err(Error::Module);
-	}
 	if !matches!(module.get_export("memory"), Some(ExternType::Memory(_)))
 		|| !matches!(module.get_export("serein_alloc"), Some(ExternType::Func(ty)) if ty == FuncType::new([ValType::I32], [ValType::I32]))
 		|| !matches!(module.get_export("serein_invoke"), Some(ExternType::Func(ty)) if ty == FuncType::new([ValType::I32, ValType::I32], [ValType::I64]))
@@ -38,10 +40,36 @@ fn module(engine: &Engine, bytes: &[u8]) -> Result<Module, Error> {
 	Ok(module)
 }
 
-pub(crate) fn validate_module(bytes: &[u8]) -> Result<(), Error> {
+/// Capabilities the module's imports require. Every import must be a known `serein` host
+/// function with its exact signature; nothing else may be imported.
+fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error> {
+	let mut required = BTreeSet::new();
+	for import in module.imports() {
+		let host = imports::find(import.name())
+			.filter(|_| import.module() == imports::IMPORT_MODULE)
+			.ok_or(Error::Module)?;
+		let expected = match host.kind {
+			Kind::ClockNowMs => FuncType::new([], [ValType::I64]),
+			Kind::RandomFill => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+		};
+		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
+			return Err(Error::Module);
+		}
+		required.insert(host.capability);
+	}
+	Ok(required)
+}
+
+pub(crate) fn validate_module(bytes: &[u8], manifest: &Manifest) -> Result<(), Error> {
 	let engine = engine();
 	let module = module(&engine, bytes)?;
-	instantiate(&engine, &module).map(|_| ())
+	if !required_capabilities(&module)?
+		.iter()
+		.all(|capability| manifest.capabilities.contains(capability))
+	{
+		return Err(Error::Capability);
+	}
+	instantiate(&engine, &module, Box::new(NoHostImports)).map(|_| ())
 }
 
 // Classify only engine-owned codes: never surface Wasm-provided text or input/output bytes.
@@ -60,7 +88,81 @@ fn execution_error(error: wasmi::Error) -> Error {
 	}
 }
 
-fn instantiate(engine: &Engine, module: &Module) -> Result<(Store<StoreLimits>, Instance), Error> {
+struct HostState {
+	limits: StoreLimits,
+	services: Box<dyn HostImports>,
+	calls: u32,
+}
+
+/// Charges one host call plus `bytes` copied, trapping when the call budget or fuel runs out.
+fn charge(caller: &mut Caller<'_, HostState>, bytes: u64) -> Result<(), wasmi::Error> {
+	let state = caller.data_mut();
+	if state.calls >= imports::MAX_HOST_CALLS {
+		return Err(TrapCode::OutOfFuel.into());
+	}
+	state.calls += 1;
+	let cost = imports::CALL_FUEL.saturating_add(bytes.saturating_mul(imports::BYTE_FUEL));
+	let fuel = caller.get_fuel()?;
+	if fuel < cost {
+		caller.set_fuel(0)?;
+		return Err(TrapCode::OutOfFuel.into());
+	}
+	caller.set_fuel(fuel - cost)
+}
+
+fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
+	let mut linker = Linker::new(engine);
+	let module = imports::IMPORT_MODULE;
+	linker
+		.func_wrap(
+			module,
+			"clock_now_ms",
+			|mut caller: Caller<'_, HostState>| {
+				charge(&mut caller, 0)?;
+				Ok(caller
+					.data_mut()
+					.services
+					.now_ms()
+					.filter(|ms| *ms >= 0)
+					.unwrap_or(-1))
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"random_fill",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				let length = match u32::try_from(length) {
+					Ok(length) if length <= imports::MAX_RANDOM_BYTES => length,
+					_ => {
+						charge(&mut caller, 0)?;
+						return Ok(status::INVALID);
+					}
+				};
+				charge(&mut caller, u64::from(length))?;
+				let mut bytes = vec![0; length as usize];
+				if !caller.data_mut().services.fill_random(&mut bytes) {
+					return Ok(status::UNAVAILABLE);
+				}
+				let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
+					return Err(TrapCode::MemoryOutOfBounds.into());
+				};
+				memory
+					.write(&mut caller, pointer as u32 as usize, &bytes)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				Ok(status::OK)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	Ok(linker)
+}
+
+fn instantiate(
+	engine: &Engine,
+	module: &Module,
+	services: Box<dyn HostImports>,
+) -> Result<(Store<HostState>, Instance), Error> {
 	let limits = StoreLimitsBuilder::new()
 		.memory_size(MEMORY_BYTES)
 		.memories(1)
@@ -69,19 +171,39 @@ fn instantiate(engine: &Engine, module: &Module) -> Result<(Store<StoreLimits>, 
 		.instances(1)
 		.trap_on_grow_failure(true)
 		.build();
-	let mut store = Store::new(engine, limits);
-	store.limiter(|limits| limits);
+	let mut store = Store::new(
+		engine,
+		HostState {
+			limits,
+			services,
+			calls: 0,
+		},
+	);
+	store.limiter(|state| &mut state.limits);
 	store.set_fuel(FUEL).map_err(|_| Error::Execution)?;
-	let instance = Linker::new(engine)
+	let instance = linker(engine)?
 		.instantiate_and_start(&mut store, module)
 		.map_err(execution_error)?;
 	Ok((store, instance))
 }
 
+/// Execute once without host services; a module importing any host function fails with
+/// [`Error::Capability`]. See [`invoke_with`].
+pub fn invoke(package: &Package, input: &Invocation) -> Result<Output, Error> {
+	invoke_with(package, input, &[], Box::new(NoHostImports))
+}
+
 /// Execute once, on the host worker. All Wasm state is dropped before returning.
 /// ABI: `serein_alloc(i32) -> i32`, `serein_invoke(i32, i32) -> i64`.
 /// The result packs the output pointer in its high 32 bits and byte length in its low 32 bits.
-pub fn invoke(package: &Package, input: &Invocation) -> Result<Output, Error> {
+/// Each host function the module imports needs its capability in `grants`; `services`
+/// answers those calls for this invocation only.
+pub fn invoke_with(
+	package: &Package,
+	input: &Invocation,
+	grants: &[Capability],
+	services: Box<dyn HostImports>,
+) -> Result<Output, Error> {
 	if package.manifest.kind != ExtensionKind::Plugin || package.theme.is_some() {
 		return Err(Error::Invalid);
 	}
@@ -109,7 +231,12 @@ pub fn invoke(package: &Package, input: &Invocation) -> Result<Output, Error> {
 	}
 	let engine = engine();
 	let module = module(&engine, &package.wasm)?;
-	let (mut store, instance) = instantiate(&engine, &module)?;
+	if !required_capabilities(&module)?.iter().all(|capability| {
+		grants.contains(capability) && package.manifest.capabilities.contains(capability)
+	}) {
+		return Err(Error::Capability);
+	}
+	let (mut store, instance) = instantiate(&engine, &module, services)?;
 	let memory = instance.get_memory(&store, "memory").ok_or(Error::Module)?;
 	let alloc = instance
 		.get_typed_func::<i32, i32>(&store, "serein_alloc")

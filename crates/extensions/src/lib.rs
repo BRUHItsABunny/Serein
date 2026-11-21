@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod runtime;
-pub use runtime::invoke;
+pub use runtime::{invoke, invoke_with};
+pub mod imports;
+pub use imports::{HostImports, NoHostImports};
 mod rich_presence;
 pub use rich_presence::*;
 mod discovery;
@@ -157,6 +159,10 @@ pub enum Capability {
 	InterfaceUi,
 	/// Customize the start (connecting) screen shown before any account loads.
 	StartScreen,
+	/// Import `serein.clock_now_ms` to read the current time.
+	Clock,
+	/// Import `serein.random_fill` for secure random bytes.
+	Random,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -1135,7 +1141,7 @@ impl Package {
 				if self.wasm.len() > MAX_MODULE_BYTES {
 					return Err(Error::Limit);
 				}
-				runtime::validate_module(&self.wasm)
+				runtime::validate_module(&self.wasm, &self.manifest)
 			}
 			_ => Err(Error::Invalid),
 		}

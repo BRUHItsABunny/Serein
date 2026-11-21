@@ -3301,6 +3301,8 @@ fn badge(ui: &mut egui::Ui, text: &str, foreground: egui::Color32, background: e
 /// User-facing description of what granting a capability allows.
 fn capability_label(capability: Capability) -> &'static str {
 	match capability {
+		Capability::Clock => "Read the current date and time",
+		Capability::Random => "Generate random numbers, such as unique IDs",
 		Capability::ApiProxy => {
 			"Route the Discord REST API through a proxy across accounts (not calls or media)"
 		}
