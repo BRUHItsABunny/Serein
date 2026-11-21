@@ -1004,6 +1004,17 @@ extensions-ui-details-modal-author = Author
 extensions-ui-details-modal-capabilities = Capabilities
 # Context: details_modal
 extensions-ui-details-modal-disable = Disable extension
+extensions-ui-data-disable-title = Remove { $name }?
+extensions-ui-data-disable-body = This plugin keeps { $size } of data on this device. Keep it to continue where it left off if you install the plugin again, or delete it now.
+extensions-ui-data-keep = Keep data
+extensions-ui-data-delete = Delete data
+extensions-ui-data-delete-title = Delete the data of { $name }?
+extensions-ui-data-delete-body = { $size } will be removed from this device. This cannot be undone.
+extensions-ui-data-section = Data
+extensions-ui-data-size = Stored on this device: { $size }
+extensions-ui-data-quota = Database size limit
+extensions-ui-data-kept-title = Kept plugin data
+extensions-ui-data-kept-hint = Data from plugins that are no longer installed. Installing the same plugin again restores it.
 # Context: details_modal
 extensions-ui-details-modal-enable-to-use-tools = Enable this extension to use its settings and tools.
 # Context: details_modal

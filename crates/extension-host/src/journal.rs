@@ -253,6 +253,39 @@ pub fn capture_after(state: &State, event: &Event) -> Vec<Record> {
 	vec![Record::Seen(seen)]
 }
 
+/// Channel IDs one `access_lost` entry lists; more become further entries.
+const MAX_LOST_PER_ENTRY: usize = 1_000;
+
+/// `access_lost` entries for channels the account could read before an event and cannot
+/// after it, one per server (`None` for DMs), so an archive can mark them instead of
+/// guessing from `access_changed`.
+pub fn access_lost(lost: &[(Id, Option<Id>)]) -> Vec<Record> {
+	let mut by_guild: std::collections::BTreeMap<Option<u64>, Vec<String>> = Default::default();
+	for (channel, guild) in lost {
+		by_guild
+			.entry(guild.map(|guild| guild.0))
+			.or_default()
+			.push(channel.0.to_string());
+	}
+	by_guild
+		.into_iter()
+		.flat_map(|(guild, channels)| {
+			channels
+				.chunks(MAX_LOST_PER_ENTRY)
+				.map(|chunk| Record::Entry {
+					body: json!({
+						"kind": "access_lost",
+						"guild_id": guild.map(|guild| guild.to_string()),
+						"channel_ids": chunk,
+					})
+					.to_string(),
+					latest: None,
+				})
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
 /// Records for a recorder that just opened: the session the account is in, and where
 /// each channel stands, so `missed` reports what arrived while nobody listened.
 pub fn opened(state: &State) -> Vec<Record> {
@@ -973,6 +1006,32 @@ mod tests {
 				Record::Seen(_) => unreachable!(),
 			}
 		}
+	}
+
+	#[test]
+	fn lost_access_names_each_server_and_channel() {
+		let mut lost = vec![(Id(1), Some(Id(9))), (Id(2), None), (Id(3), Some(Id(9)))];
+		lost.extend((10..1_010).map(|id| (Id(id), Some(Id(8)))));
+		let entries: Vec<Value> = access_lost(&lost)
+			.iter()
+			.map(|record| serde_json::from_str(&record.clone_body()).unwrap())
+			.collect();
+		let summary: Vec<(Value, usize)> = entries
+			.iter()
+			.map(|entry| {
+				assert_eq!(entry["kind"], "access_lost");
+				(
+					entry["guild_id"].clone(),
+					entry["channel_ids"].as_array().unwrap().len(),
+				)
+			})
+			.collect();
+		assert_eq!(
+			summary,
+			[(Value::Null, 1), ("8".into(), 1_000), ("9".into(), 2)]
+		);
+		assert_eq!(entries[2]["channel_ids"], json!(["1", "3"]));
+		assert!(access_lost(&[]).is_empty());
 	}
 
 	#[test]

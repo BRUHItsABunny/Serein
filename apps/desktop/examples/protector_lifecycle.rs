@@ -126,7 +126,8 @@ fn main() {
 			host::Job::Disable {
 				id: "message-delete-protector".into(),
 				kind: extensions::ExtensionKind::Plugin,
-				account
+				account,
+				delete_data: true,
 			}
 		),
 		host::Event::Disabled(_)

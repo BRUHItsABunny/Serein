@@ -5586,6 +5586,27 @@ impl Desktop {
 			let journal_records = self.extensions.journal_capture(&self.state, &event);
 			let session_started = event.generation == self.state.generation
 				&& matches!(event.event, Event::Ready { .. } | Event::Resync);
+			// Readable channels this event may take away, with their server, for the journal.
+			let journal_access: Vec<(model::Id, Option<model::Id>)> =
+				if self.extensions.journal_active() && event.generation == self.state.generation {
+					let deleted = match &event.event {
+						Event::Unavailable(id) => Some(*id),
+						_ => None,
+					};
+					self.state
+						.channels
+						.iter()
+						.filter(|channel| {
+							(removed_channels.contains(&channel.id)
+								|| deleted.is_some_and(|id| {
+									channel.id == id || channel.parent_id == Some(id)
+								})) && self.state.can_read_history(channel.id)
+						})
+						.map(|channel| (channel.id, channel.guild))
+						.collect()
+				} else {
+					Vec::new()
+				};
 			let extension_events = if self.extensions.has_message_events(&self.state) {
 				extension_host::message_events::capture(&self.state, &event.event)
 			} else {
@@ -5607,8 +5628,12 @@ impl Desktop {
 					.push(ui::design::Level::Info, ui::i18n::translate(message));
 			}
 			self.extensions.data_changed(data_changes);
+			let lost: Vec<_> = journal_access
+				.into_iter()
+				.filter(|(channel, _)| !self.state.can_read_history(*channel))
+				.collect();
 			self.extensions
-				.journal_record(&self.state, journal_records, session_started);
+				.journal_record(&self.state, journal_records, session_started, &lost);
 			self.extensions.cancel_stale_message_events(&self.state);
 			for candidate in extension_events {
 				if let Some(event) = candidate.admit(&self.state) {

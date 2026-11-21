@@ -99,6 +99,25 @@ pub enum Job {
 		id: String,
 		kind: ExtensionKind,
 		account: Option<String>,
+		/// Also removes the plugin's data; otherwise it is kept for a later reinstall.
+		delete_data: bool,
+	},
+	/// Reports the size and database quota of each plugin's data in the account's scopes.
+	DataUsage {
+		account: Option<String>,
+	},
+	/// Removes a plugin's kept data. `connection` selects the device-wide connection scope.
+	DeleteData {
+		id: String,
+		account: Option<String>,
+		connection: bool,
+	},
+	/// Sets a plugin's database quota to one of [`database::QUOTAS`].
+	SetDatabaseQuota {
+		id: String,
+		account: Option<String>,
+		connection: bool,
+		bytes: u64,
 	},
 	Invoke {
 		id: String,
@@ -332,6 +351,16 @@ pub struct InstalledExtension {
 	pub start_screen: Option<Option<extensions::StartScreen>>,
 }
 
+/// One plugin's data directory: its size and database quota.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginData {
+	pub id: String,
+	/// Data of a connection plugin, which is device-wide rather than per account.
+	pub connection: bool,
+	pub bytes: u64,
+	pub database_quota: u64,
+}
+
 pub enum Event {
 	ThemeSelected {
 		id: Option<String>,
@@ -349,6 +378,7 @@ pub enum Event {
 		catalog: Option<Catalog>,
 		installed: Vec<InstalledExtension>,
 		starters: Vec<Starter>,
+		data: Vec<PluginData>,
 	},
 	Catalog(Catalog),
 	Preview {
@@ -366,6 +396,8 @@ pub enum Event {
 		id: String,
 		output: Output,
 	},
+	/// Plugin data in the account's scopes, installed or kept from a removed plugin.
+	DataUsage(Vec<PluginData>),
 	/// A `journal` action finished; `more` when entries remain for another delivery.
 	JournalDelivered {
 		id: String,
@@ -427,9 +459,10 @@ impl SystemImports {
 			.map(|directory| {
 				Arc::new(std::sync::Mutex::new(PluginDatabase::new(
 					directory.join(database::FILE_NAME),
+					database_quota(directory),
 				)))
 			});
-		// Only account plugins have a journal: it lives beside them in the account scope.
+		// Only account plugins have a journal: it lives beside their data in the account scope.
 		let journal = directory
 			.filter(|_| {
 				stored.grants.contains(&Capability::MessageJournal)
@@ -533,9 +566,9 @@ impl ExtensionHost {
 		Ok(token)
 	}
 
-	/// The message journal shared by `account`'s plugins.
+	/// The message journal shared by `account`'s plugins, kept with their data.
 	pub fn journal_path(&self, account: &str) -> Result<PathBuf, String> {
-		Ok(scope(&self.root, ExtensionKind::Plugin, Some(account))?.join(journal::FILE_NAME))
+		Ok(data_scope(&self.root, Some(account))?.join(journal::FILE_NAME))
 	}
 
 	pub fn busy(&self) -> bool {
@@ -832,8 +865,15 @@ fn validate_job(job: &Job) -> Result<(), String> {
 			valid_id(id)?;
 			preview.validate().map_err(|e| e.to_string())?;
 		}
-		Job::SelectTheme { id: Some(id) } | Job::Disable { id, .. } | Job::EditTheme { id, .. } => {
-			valid_id(id)?
+		Job::SelectTheme { id: Some(id) }
+		| Job::Disable { id, .. }
+		| Job::EditTheme { id, .. }
+		| Job::DeleteData { id, .. } => valid_id(id)?,
+		Job::SetDatabaseQuota { id, bytes, .. } => {
+			valid_id(id)?;
+			if !database::QUOTAS.contains(bytes) {
+				return Err("Choose one of the offered database sizes".into());
+			}
 		}
 		Job::SaveTheme { package } | Job::ExportTheme { package, .. } => {
 			if package.manifest.kind != ExtensionKind::Theme {
@@ -956,6 +996,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				.and_then(|bytes| extensions::parse_catalog(&bytes).ok()),
 			starters: starters()?,
 			installed: load(root, account.as_deref(), gate)?,
+			data: data_usage(root, account.as_deref())?,
 		}),
 		Job::RefreshCatalog => {
 			let bytes = download(CATALOG_URL, MAX_CATALOG, gate, Duration::from_secs(15))?;
@@ -984,10 +1025,50 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			grants,
 			account,
 		} => enable(root, *source, grants, account.as_deref(), gate).map(Event::Enabled),
-		Job::Disable { id, kind, account } => {
-			let scope = scope(root, kind, account.as_deref())?;
-			disable(&scope, &id, gate)?;
+		Job::Disable {
+			id,
+			kind,
+			account,
+			delete_data,
+		} => {
+			let parent = scope(root, kind, account.as_deref())?;
+			disable(&parent, &id, gate)?;
+			if delete_data && kind == ExtensionKind::Plugin {
+				remove_owned_directory(&data_dir(root, &id, account.as_deref())?)?;
+			}
 			Ok(Event::Disabled(id))
+		}
+		Job::DataUsage { account } => data_usage(root, account.as_deref()).map(Event::DataUsage),
+		Job::DeleteData {
+			id,
+			account,
+			connection,
+		} => {
+			let account = if connection { None } else { account };
+			if account.is_none() && !connection {
+				return Err("Sign in to manage this account's plugin data".into());
+			}
+			remove_owned_directory(&data_dir(root, &id, account.as_deref())?)?;
+			data_usage(root, account.as_deref()).map(Event::DataUsage)
+		}
+		Job::SetDatabaseQuota {
+			id,
+			account,
+			connection,
+			bytes,
+		} => {
+			let account = if connection { None } else { account };
+			if account.is_none() && !connection {
+				return Err("Sign in to manage this account's plugin data".into());
+			}
+			let directory = data_dir(root, &id, account.as_deref())?;
+			fs::create_dir_all(&directory).map_err(|_| "Cannot create plugin data directory")?;
+			let settings = serde_json::to_vec(&DataSettings {
+				database_bytes: Some(bytes),
+			})
+			.map_err(|_| "Cannot encode plugin data settings")?;
+			atomic_write(&directory.join(SETTINGS_FILE), &settings, gate)?;
+			data_usage(root, account.as_deref()).map(Event::DataUsage)
 		}
 		Job::Invoke {
 			id,
@@ -1009,6 +1090,8 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			{
 				return Err("Installed plugin identity changed".into());
 			}
+			let data = data_dir(root, &id, (!account.is_empty()).then_some(account.as_str()))?;
+			migrate_data(&directory, &data)?;
 			if is_proxy(&stored.package.manifest) != account.is_empty() {
 				return Err("Plugin connection scope changed".into());
 			}
@@ -1028,16 +1111,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				granted.capabilities.clone_from(&stored.grants);
 				app.validate(&granted).map_err(|error| error.to_string())?;
 			}
-			invocation.storage = if stored.grants.contains(&Capability::Storage)
-				&& directory.join("data.json").exists()
-			{
-				Some(
-					String::from_utf8(read_bounded(&directory.join("data.json"), MAX_STORAGE)?)
-						.map_err(|_| "Plugin data is invalid")?,
-				)
-			} else {
-				None
-			};
+			invocation.storage = activation_storage(&stored, &data)?;
 			if !trim_extended_input(&mut invocation, extensions::MAX_IO_BYTES) {
 				return Err("Plugin input exceeds 256 KiB".into());
 			}
@@ -1049,7 +1123,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			if journal_action && !stored.grants.contains(&Capability::MessageJournal) {
 				return Err("Plugin access was not granted".into());
 			}
-			let (services, pending) = SystemImports::for_plugin(&stored, Some(&directory));
+			let (services, pending) = SystemImports::for_plugin(&stored, Some(&data));
 			let mut output =
 				extensions::invoke_with(&stored.package, &invocation, &stored.grants, services)
 					.map_err(|e| e.to_string())?;
@@ -1072,8 +1146,8 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			if output.start_screen.is_some() && !stored.grants.contains(&Capability::StartScreen) {
 				return Err("Start screen customization was not granted".into());
 			}
-			let data = output.storage.take();
-			if data.as_ref().is_some_and(|data| {
+			let saved = output.storage.take();
+			if saved.as_ref().is_some_and(|data| {
 				!stored.grants.contains(&Capability::Storage) || data.len() > MAX_STORAGE
 			}) {
 				return Err("Plugin data exceeds its granted storage budget".into());
@@ -1081,8 +1155,9 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			gate.check()?;
 			let more = pending.journal_more();
 			pending.commit()?;
-			if let Some(data) = data {
-				atomic_write(&directory.join("data.json"), data.as_bytes(), gate)?;
+			if let Some(saved) = saved {
+				fs::create_dir_all(&data).map_err(|_| "Cannot create plugin data directory")?;
+				atomic_write(&data.join("data.json"), saved.as_bytes(), gate)?;
 			}
 			if journal_action {
 				return Ok(Event::JournalDelivered { id, more });
@@ -1211,11 +1286,26 @@ fn install_stored(
 	let activate = !updating_theme
 		|| read_bounded(&parent.join("active.json"), 64)
 			.is_ok_and(|id| id == stored.package.manifest.id.as_bytes());
-	let existed = directory.exists();
+	let data = (stored.package.manifest.kind == ExtensionKind::Plugin)
+		.then(|| {
+			data_dir(
+				root,
+				&stored.package.manifest.id,
+				account.filter(|_| !is_proxy(&stored.package.manifest)),
+			)
+		})
+		.transpose()?;
+	if let Some(data) = &data {
+		migrate_data(&directory, data)?;
+	}
+	let existed = data.as_ref().is_some_and(|data| data.exists());
 	let mut summary = stored.summary(
 		gate,
-		activation_storage(&stored, &directory)?,
-		Some(&directory),
+		match &data {
+			Some(data) => activation_storage(&stored, data)?,
+			None => None,
+		},
+		data.as_deref(),
 		true,
 	);
 	summary.active_theme = stored.package.manifest.kind == ExtensionKind::Theme && activate;
@@ -1223,9 +1313,9 @@ fn install_stored(
 		summary.background_image = None;
 	}
 	if let Some(error) = &summary.error {
-		// A first activation may have created the directory for its database.
-		if !existed {
-			remove_owned_directory(&directory)?;
+		// A first activation may have created the data directory for its database.
+		if let Some(data) = data.as_ref().filter(|_| !existed) {
+			remove_owned_directory(data)?;
 		}
 		return Err(error.clone());
 	}
@@ -1245,6 +1335,93 @@ fn install_stored(
 		)?;
 	}
 	Ok(summary)
+}
+
+/// Plugin data lives apart from packages, so disabling, updating, reinstalling or logging
+/// out keeps it: `plugin-data/<account key | connection>/<id>`.
+const DATA_ROOT: &str = "plugin-data";
+/// Files a plugin's data consists of, moved out of package directories by older versions.
+const DATA_FILES: [&str; 3] = ["data.json", database::FILE_NAME, "data.sqlite-journal"];
+const SETTINGS_FILE: &str = "settings.json";
+/// Plugin data directories listed for one scope.
+const MAX_DATA_ENTRIES: usize = 256;
+
+#[derive(Default, Serialize, Deserialize)]
+struct DataSettings {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	database_bytes: Option<u64>,
+}
+
+fn data_scope(root: &Path, account: Option<&str>) -> Result<PathBuf, String> {
+	Ok(root.join(DATA_ROOT).join(match account {
+		Some(account) => account_key(account)?,
+		None => "connection".into(),
+	}))
+}
+
+/// A plugin's data directory; `account` is `None` for connection plugins.
+pub fn data_dir(root: &Path, id: &str, account: Option<&str>) -> Result<PathBuf, String> {
+	valid_id(id)?;
+	Ok(data_scope(root, account)?.join(id))
+}
+
+/// Moves data an older version kept inside the package directory to the data directory.
+fn migrate_data(package: &Path, data: &Path) -> Result<(), String> {
+	for name in DATA_FILES {
+		let old = package.join(name);
+		if old.exists() && !data.join(name).exists() {
+			fs::create_dir_all(data).map_err(|_| "Cannot create plugin data directory")?;
+			fs::rename(&old, data.join(name)).map_err(|_| "Cannot move plugin data")?;
+		}
+	}
+	Ok(())
+}
+
+fn database_quota(directory: &Path) -> u64 {
+	read_bounded(&directory.join(SETTINGS_FILE), 1024)
+		.ok()
+		.and_then(|bytes| serde_json::from_slice::<DataSettings>(&bytes).ok())
+		.and_then(|settings| settings.database_bytes)
+		.filter(|bytes| database::QUOTAS.contains(bytes))
+		.unwrap_or(database::DEFAULT_QUOTA)
+}
+
+fn directory_bytes(directory: &Path) -> u64 {
+	fs::read_dir(directory)
+		.into_iter()
+		.flatten()
+		.take(64)
+		.filter_map(|entry| entry.ok()?.metadata().ok())
+		.filter(|metadata| metadata.is_file())
+		.map(|metadata| metadata.len())
+		.sum()
+}
+
+fn data_usage(root: &Path, account: Option<&str>) -> Result<Vec<PluginData>, String> {
+	let mut scopes = vec![(data_scope(root, None)?, true)];
+	if let Some(account) = account {
+		scopes.push((data_scope(root, Some(account))?, false));
+	}
+	let mut usage = Vec::new();
+	for (scope, connection) in scopes {
+		let Ok(entries) = fs::read_dir(&scope) else {
+			continue;
+		};
+		for entry in entries.take(MAX_DATA_ENTRIES).flatten() {
+			let id = entry.file_name().to_string_lossy().into_owned();
+			if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || valid_id(&id).is_err() {
+				continue;
+			}
+			usage.push(PluginData {
+				bytes: directory_bytes(&entry.path()),
+				database_quota: database_quota(&entry.path()),
+				id,
+				connection,
+			});
+		}
+	}
+	usage.sort_by(|a, b| a.id.cmp(&b.id));
+	Ok(usage)
 }
 
 fn validate_grants(manifest: &Manifest, grants: &[Capability]) -> Result<(), String> {
@@ -1368,14 +1545,22 @@ fn load(
 					Ok(stored)
 				});
 				remove_file(&entry.path().join("package.partial"))?;
-				remove_file(&entry.path().join("data.partial"))?;
+				let data = data_dir(
+					root,
+					&id,
+					account.filter(|_| parent != root.join("proxy-plugins")),
+				)?;
+				if kind == ExtensionKind::Plugin {
+					migrate_data(&entry.path(), &data)?;
+					remove_file(&data.join("data.partial"))?;
+				}
 				installed.push(match stored {
-					Ok(stored) => match activation_storage(&stored, &entry.path()) {
+					Ok(stored) => match activation_storage(&stored, &data) {
 						Ok(storage) => {
 							let mut summary = stored.summary(
 								gate,
 								storage,
-								Some(&entry.path()),
+								Some(&data),
 								kind == ExtensionKind::Theme
 									&& active_theme.as_deref() == Some(id.as_str()),
 							);
@@ -1384,8 +1569,7 @@ fn load(
 							summary
 						}
 						Err(error) => {
-							let mut summary =
-								stored.summary(gate, None, Some(&entry.path()), false);
+							let mut summary = stored.summary(gate, None, Some(&data), false);
 							summary.theme = None;
 							summary.preserve_deleted_messages = false;
 							summary.image_sharing = false;
@@ -2073,6 +2257,7 @@ mod tests {
 				id: "api-proxy".into(),
 				kind: ExtensionKind::Plugin,
 				account: None,
+				delete_data: true,
 			},
 			&gate(),
 		)
@@ -2176,13 +2361,14 @@ mod tests {
 			.unwrap()
 			.join(&package.manifest.id);
 		let package_path = directory.join("package.json");
+		let data_path = data_dir(&root, &package.manifest.id, Some("account")).unwrap();
 		let mut stored = read_stored(&package_path).unwrap();
 		stored
 			.grants
 			.retain(|grant| *grant != Capability::MessageEvents);
 		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
 		assert!(run(&root, message_event_job(), &gate()).is_err());
-		assert!(!directory.join("data.json").exists());
+		assert!(!data_path.join("data.json").exists());
 		stored.grants.push(Capability::MessageEvents);
 		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
@@ -2213,7 +2399,7 @@ mod tests {
 			std::thread::sleep(Duration::from_millis(1));
 		}
 		assert_eq!(completed, [first, second]);
-		let data = fs::read(directory.join("data.json")).unwrap();
+		let data = fs::read(data_path.join("data.json")).unwrap();
 		assert_eq!(
 			serde_json::from_slice::<serde_json::Value>(&data).unwrap(),
 			serde_json::json!({ "create": 2, "update": 0, "delete": 0 })
@@ -2221,8 +2407,8 @@ mod tests {
 		let cancelled = gate();
 		cancelled.generation.fetch_add(1, Ordering::Release);
 		assert!(run(&root, message_event_job(), &cancelled).is_err());
-		assert_eq!(fs::read(directory.join("data.json")).unwrap(), data);
-		assert!(!directory.join("data.partial").exists());
+		assert_eq!(fs::read(data_path.join("data.json")).unwrap(), data);
+		assert!(!data_path.join("data.partial").exists());
 	}
 
 	/// A panel plugin that creates a table, inserts a row and returns `output`.
@@ -2276,7 +2462,7 @@ mod tests {
 	}
 
 	#[test]
-	fn plugin_database_commits_accepted_invocations_and_is_removed_with_the_plugin() {
+	fn plugin_data_commits_accepted_invocations_and_outlives_disable_and_logout_unless_deleted() {
 		let profile = Profile::new();
 		let root = profile.0.join("extensions");
 		let package = database_plugin("{}");
@@ -2306,9 +2492,12 @@ mod tests {
 		let directory = scope(&root, ExtensionKind::Plugin, Some("account"))
 			.unwrap()
 			.join("database-plugin");
+		let data = data_dir(&root, "database-plugin", Some("account")).unwrap();
 		let rows = || {
-			let mut database =
-				crate::database::PluginDatabase::new(directory.join(crate::database::FILE_NAME));
+			let mut database = crate::database::PluginDatabase::new(
+				data.join(crate::database::FILE_NAME),
+				crate::database::DEFAULT_QUOTA,
+			);
 			match database.execute(br#"{"sql":"SELECT count(*) FROM hits"}"#) {
 				extensions::Reply::Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
 					.unwrap()["rows"][0][0]
@@ -2324,7 +2513,7 @@ mod tests {
 		stored.grants.clear();
 		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
 		assert!(invoke().is_err());
-		assert!(!directory.join(crate::database::FILE_NAME).exists());
+		assert!(!data.join(crate::database::FILE_NAME).exists());
 		install(&package, vec![Capability::Database]).unwrap();
 		invoke().unwrap();
 		invoke().unwrap();
@@ -2334,20 +2523,108 @@ mod tests {
 		install(&rejected, vec![Capability::Database]).unwrap();
 		assert!(invoke().is_err());
 		assert_eq!(rows(), 2);
-		// Updating keeps the data; disabling removes it with the plugin directory.
+		// Updating, disabling with "keep data", logging out and reinstalling all keep it.
 		install(&package, vec![Capability::Database]).unwrap();
 		assert_eq!(rows(), 2);
+		let disable = |delete_data| {
+			run(
+				&root,
+				Job::Disable {
+					id: "database-plugin".into(),
+					kind: ExtensionKind::Plugin,
+					account: Some("account".into()),
+					delete_data,
+				},
+				&gate(),
+			)
+			.unwrap();
+		};
+		disable(false);
+		assert!(!directory.exists());
+		let Event::DataUsage(usage) = run(
+			&root,
+			Job::DataUsage {
+				account: Some("account".into()),
+			},
+			&gate(),
+		)
+		.unwrap() else {
+			panic!("expected data usage")
+		};
+		assert!(
+			matches!(&usage[..], [PluginData { id, connection: false, bytes, database_quota }]
+			if id == "database-plugin" && *bytes > 0 && *database_quota == crate::database::DEFAULT_QUOTA)
+		);
+		install(&package, vec![Capability::Database]).unwrap();
 		run(
 			&root,
-			Job::Disable {
-				id: "database-plugin".into(),
-				kind: ExtensionKind::Plugin,
-				account: Some("account".into()),
+			Job::Logout {
+				account: "account".into(),
 			},
 			&gate(),
 		)
 		.unwrap();
 		assert!(!directory.exists());
+		install(&package, vec![Capability::Database]).unwrap();
+		invoke().unwrap();
+		assert_eq!(rows(), 3);
+		// A chosen quota persists with the data; only offered sizes are accepted.
+		let quota = |bytes| {
+			run(
+				&root,
+				Job::SetDatabaseQuota {
+					id: "database-plugin".into(),
+					account: Some("account".into()),
+					connection: false,
+					bytes,
+				},
+				&gate(),
+			)
+		};
+		let gib = 1024 * 1024 * 1024;
+		assert!(
+			matches!(quota(gib), Ok(Event::DataUsage(usage)) if usage[0].database_quota == gib)
+		);
+		assert!(
+			validate_job(&Job::SetDatabaseQuota {
+				id: "database-plugin".into(),
+				account: None,
+				connection: false,
+				bytes: 5,
+			})
+			.is_err()
+		);
+		// Deleting on disable removes the data too.
+		disable(true);
+		assert!(!data.exists());
+	}
+
+	#[test]
+	fn data_kept_inside_a_package_directory_moves_to_the_data_directory() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let package = database_plugin("{}");
+		enable(
+			&root,
+			source(&profile, &package),
+			vec![Capability::Database],
+			Some("account"),
+			&gate(),
+		)
+		.unwrap();
+		let directory = scope(&root, ExtensionKind::Plugin, Some("account"))
+			.unwrap()
+			.join("database-plugin");
+		let data = data_dir(&root, "database-plugin", Some("account")).unwrap();
+		// The layout of earlier versions: data beside package.json.
+		fs::write(directory.join("data.json"), b"saved").unwrap();
+		load(&root, Some("account"), &gate()).unwrap();
+		assert!(!directory.join("data.json").exists());
+		assert_eq!(fs::read(data.join("data.json")).unwrap(), b"saved");
+		// An existing new copy is never overwritten by a stale old one.
+		fs::write(directory.join("data.json"), b"stale").unwrap();
+		load(&root, Some("account"), &gate()).unwrap();
+		assert_eq!(fs::read(data.join("data.json")).unwrap(), b"saved");
 	}
 
 	/// A journal plugin that reads one entry per delivery and returns `output`.
@@ -2404,7 +2681,7 @@ mod tests {
 			.unwrap()
 		};
 		install(&journal_plugin("{}"));
-		let path = scope(&root, ExtensionKind::Plugin, Some("account"))
+		let path = data_scope(&root, Some("account"))
 			.unwrap()
 			.join(journal::FILE_NAME);
 		let recorder =
@@ -2460,7 +2737,9 @@ mod tests {
 		));
 		assert_eq!(unread(), 0);
 		// Without the grant, the journal action does not run.
-		let package_path = path.with_file_name("journal-plugin").join("package.json");
+		let package_path = scope(&root, ExtensionKind::Plugin, Some("account"))
+			.unwrap()
+			.join("journal-plugin/package.json");
 		let mut stored = read_stored(&package_path).unwrap();
 		stored.grants.clear();
 		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();

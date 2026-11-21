@@ -637,8 +637,9 @@ account-isolated; declarative themes are device preferences. Up to eight install
 themes remain available in Colour preset; switching only changes the bounded
 64-byte active theme identifier and retains the packages. Installation,
 validation, invocation storage and removal run on a bounded background worker.
-Disabling removes Serein's package and extension data, and failed cleanup is
-reported and retried. Logout removes the account's plugin data. Imported
+Disabling removes Serein's package and, when the user chooses, the plugin's data;
+failed cleanup is reported and retried. Logout removes the account's plugin packages
+and grants; plugin data is kept (see "Plugin data lifecycle" below). Imported
 original files and source repositories are never deleted. No credentials belong
 in plugin storage; it is not encrypted. Only bounded metadata may remain after
 successful disable. Shop descriptions and optional preview URLs/hashes belong to
@@ -1922,8 +1923,8 @@ Only a plugin granted `api_proxy` (and optionally `storage`) uses the global
 `extensions/proxy-plugins` directory. These plugins have no account snapshot,
 message, file or networking grants and may run before authentication. Account
 plugins retain their existing account isolation; account logout does not erase a
-connection plugin. Explicit disable removes its package/data using the existing
-bounded cleanup path and restores the remaining selected route or Direct.
+connection plugin. Explicit disable removes its package, and its data when the user
+chooses, using the existing bounded cleanup path and restores the remaining selected route or Direct.
 
 One validated mode and at most 2,048 UTF-8 bytes of credential-free endpoint
 configuration are coalesced in a watch channel. The API task caches the current
@@ -2128,14 +2129,14 @@ or logging.
 
 A plugin granted `database` gets one SQLite file, `data.sqlite`, in its existing
 per-account (or, for connection plugins, global) extension directory. SQLite caps
-the file at 64 MiB through its page count, and Serein uses the default rollback journal
+the file at its quota through the page count (64 MiB unless the user picks 256 MiB,
+1 GiB, 4 GiB or 16 GiB), and Serein uses the default rollback journal
 beside it during a write. Every invocation opens the file on first use with a 2 MiB
 page cache and closes it when the invocation ends. Its writes form one transaction
 that is committed only after the output is accepted. Temporary tables are refused,
 and sort spill files are SQLite's own short-lived temporary files. Requests and
 replies are each at most 256 KiB, so one pending reply is held in RAM at a time.
-Disabling the plugin or logging out removes the file together with the directory.
-Updating the plugin keeps it. The file is not encrypted and must not hold
+The file lives in the plugin's data directory; see "Plugin data lifecycle". The file is not encrypted and must not hold
 credentials. A failed open, a full file or an exhausted SQLite budget is reported to
 the plugin, and the invocation's changes are discarded.
 
@@ -2152,5 +2153,19 @@ was loaded in memory. Each entry is at most 64 KiB, and the journal at most 100,
 unread entries / 64 MiB, pruning the oldest into a gap.
 Entries every consuming plugin has read are deleted at the next write; a channel table
 keeps the latest journaled message ID for at most 10,000 channels to report `missed`
-entries. Nothing is recorded without a consumer. Disabling a plugin drops its cursor,
-and logout removes the file with the account's extension directory. Not encrypted.
+entries. Nothing is recorded without a consumer. Disabling a plugin drops its cursor.
+The file lives with the account's plugin data, so logout keeps it. Not encrypted.
+
+## Plugin data lifecycle (preview, November 21, 2026)
+
+Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`
+(`connection/<id>/` for connection plugins): `data.json`, `data.sqlite` with its rollback
+journal, and a `settings.json` of at most 1 KiB holding the chosen database quota. Older
+layouts are moved on first load or invocation; an existing new copy is never overwritten.
+The account's `journal.sqlite` lives in the same account directory. Updating, logging out
+and reinstalling keep this data; logout still removes the account's packages and grants.
+Disabling asks the user to keep or delete the data. Settings > Extensions lists data
+directories of plugins that are not installed (at most 256 per scope, sizes summed over at
+most 64 files each) with a delete action. Kept data per plugin is bounded by the existing
+1 MiB storage and the chosen database quota (at most 16 GiB). The number of kept plugins
+and logged-out accounts is not capped; the user deletes them from that list. Not encrypted.

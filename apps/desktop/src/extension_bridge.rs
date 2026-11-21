@@ -593,17 +593,24 @@ impl Bridge {
 		}
 		extension_host::journal::capture(state, &event.event)
 	}
-	/// Queues captured records, plus a new session's channel positions once the reducer
-	/// applied it.
+	pub fn journal_active(&self) -> bool {
+		self.journal.is_some()
+	}
+	/// Queues captured records, `access_lost` entries for channels the event made unreadable,
+	/// and a new session's channel positions once the reducer applied it.
 	pub fn journal_record(
 		&mut self,
 		state: &State,
 		mut records: Vec<extension_host::journal::Record>,
 		session_started: bool,
+		lost: &[(model::Id, Option<model::Id>)],
 	) {
 		let Some(journal) = &self.journal else {
 			return;
 		};
+		if self.scope_current(state) {
+			records.extend(extension_host::journal::access_lost(lost));
+		}
 		if session_started && self.scope_current(state) {
 			records.extend(extension_host::journal::capture_after(
 				state,
@@ -742,6 +749,24 @@ impl Bridge {
 			}
 			Err(error) => messaging.extensions.report_error(error),
 		}
+	}
+	/// Re-reads plugin data sizes after something added or removed a plugin.
+	fn refresh_data_usage(
+		&mut self,
+		account: &Option<String>,
+		generation: u64,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		self.submit(
+			Job::DataUsage {
+				account: account.clone(),
+			},
+			None,
+			generation,
+			ctx,
+			messaging,
+		);
 	}
 	pub fn cleanup_pending(&self) -> bool {
 		// Start-screen writes are waited out too, so closing cannot cut one short.
@@ -1003,11 +1028,14 @@ impl Bridge {
 						);
 					}
 				}
+				Ok(Event::DataUsage(data)) => messaging.extensions.plugin_data = data,
 				Ok(Event::Loaded {
 					catalog,
 					installed,
 					starters,
+					data,
 				}) => {
+					messaging.extensions.plugin_data = data;
 					if let Some(catalog) = catalog {
 						self.catalog = catalog
 							.entries
@@ -1116,6 +1144,7 @@ impl Bridge {
 					self.apply_theme(ctx);
 					self.entries(messaging);
 					messaging.extensions.status = "Extension enabled.".into();
+					self.refresh_data_usage(&account, state.generation, ctx, messaging);
 				}
 				Ok(Event::Disabled(id)) => {
 					self.ticks.remove(&id);
@@ -1125,6 +1154,7 @@ impl Bridge {
 					});
 					self.installed.retain(|entry| entry.manifest.id != id);
 					self.disabled.remove(&id);
+					self.refresh_data_usage(&account, state.generation, ctx, messaging);
 					self.refresh_api_proxy();
 					self.refresh_start_screen();
 					messaging.extensions.remove_runtime(&id);
@@ -1431,7 +1461,38 @@ impl Bridge {
 							"Refresh the catalog or import this package again.".into();
 					}
 				}
-				ExtensionRequest::Disable { id } => {
+				ExtensionRequest::DeleteData { id, connection } => {
+					self.submit(
+						Job::DeleteData {
+							id,
+							account: account.clone(),
+							connection,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::SetDatabaseQuota {
+					id,
+					connection,
+					bytes,
+				} => {
+					self.submit(
+						Job::SetDatabaseQuota {
+							id,
+							account: account.clone(),
+							connection,
+							bytes,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::Disable { id, delete_data } => {
 					self.message_events.retain(|event| event.id != id);
 					if let Some(entry) = self.installed.iter().find(|e| e.manifest.id == id) {
 						let kind = entry.manifest.kind;
@@ -1453,6 +1514,7 @@ impl Bridge {
 								} else {
 									account.clone()
 								},
+								delete_data,
 							},
 							None,
 							state.generation,

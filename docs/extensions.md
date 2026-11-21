@@ -178,7 +178,7 @@ supports 62 capabilities, with at most 64 distinct declarations per manifest.
 | `start_screen` | Replace the start screen's logo and copy with the plugin's own pre-rendered images and plain text | Preview; activation and panel results only; one bounded device-level file, shown on the connecting screen before any account loads and without running Wasm; the host draws nothing of its own design: up to four 2-bit palette cell images, each still or looping at up to 30 frames per second, stack top to bottom, then an optional title and subtitle in the normal font, scaled down only to fit (see the [image format](extension-sdk-actions.md#start-screen-preview)); an optional `window` size of 240-1,600 × 240-1,200 logical pixels is clamped to the monitor and centered while the screen shows, never saved as the window size, and the previous size, position and maximized state return afterwards; when several plugins set one, the lowest plugin id wins; disabling, removing or failing the plugin, revoking its grant, ending its account session or returning `start_screen: null` restores the default; the progress bar and **Use a different account** always stay |
 | `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
 | `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
-| `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB file |
+| `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB by default, up to 16 GiB by user choice |
 | `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
@@ -505,7 +505,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
-| Plugin database | 64 MiB file; 256 KiB per request and reply; about 100 million SQLite instructions per invocation | See [plugin database](#plugin-database-preview). |
+| Plugin database | 64 MiB file by default (user-selectable 64 MiB-16 GiB); 256 KiB per request and reply; about 100 million SQLite instructions per invocation | See [plugin database](#plugin-database-preview). |
 | App snapshot | 64 KiB | Individual lists have smaller budgets; see the [data reference](extension-sdk-reference.md#app-data). |
 | Host proposals | 1 / 8 KiB serialized | A foreground action proposes one operation for Apply. |
 | Reactive queue / rate | 32 pending calls / 64 KiB / 10 starts per second | Shared message/app events are best effort; excess work is dropped. |
@@ -514,8 +514,9 @@ Invalid output or exhausted Wasm budgets produce an execution error and can
 disable the failing plugin. Snapshot collectors may instead return explicitly
 partial lists, and reactive overload may drop events; handle both in your code.
 
-Disabled plugins have no retained instance, worker, package or plugin data once
-cleanup succeeds. Shared host code and bounded catalog metadata still cost some
+Disabled plugins have no retained instance, worker or package once cleanup succeeds;
+their data is kept or deleted as the user chose (see [plugin data](#plugin-data-preview)).
+ Shared host code and bounded catalog metadata still cost some
 application space. Freed allocations may remain in the process allocator; an
 unchanged RSS reading alone does not mean an instance remains active.
 
@@ -561,10 +562,10 @@ reply is charged as copied bytes when it is produced.
 
 ## Plugin database (preview)
 
-A plugin granted `database` has one SQLite file, `data.sqlite`, in its own
-extension directory. Like `storage`, it is per account and per plugin, survives
-updates and restarts, and is removed when the plugin is disabled or its account
-logs out. Rust authors call `serein_extension_sdk::host::db::execute(sql, params)`.
+A plugin granted `database` has one SQLite file, `data.sqlite`, in its
+[data directory](#plugin-data-preview). Like `storage`, it is per account and per
+plugin and outlives updates, disabling, logout and reinstalling unless the user deletes
+it. Rust authors call `serein_extension_sdk::host::db::execute(sql, params)`.
 
 Each `db_execute` request is JSON, `{"sql": "...", "params": [...]}`, with one
 statement and `?` parameters. Values are `null`, booleans (stored as integers),
@@ -581,7 +582,7 @@ cannot run `BEGIN`, `COMMIT` or `ROLLBACK`, but `SAVEPOINT`, `RELEASE` and
 
 | Rule | Limit |
 | --- | --- |
-| File size | 64 MiB; a write past it fails and discards the invocation's database work |
+| File size | 64 MiB unless the user picks 256 MiB, 1 GiB, 4 GiB or 16 GiB in the plugin's details; a write past it fails and discards the invocation's database work. Lowering the limit below the current size keeps existing data but refuses growth. |
 | Request / reply | 256 KiB each; a larger result fails instead of truncating |
 | SQLite work | About 100 million virtual-machine instructions per invocation. Exhausting it fails that statement and every later one, and the invocation's database work is discarded. |
 | Statement | 100,000 bytes of SQL, 256 parameters, 256 columns, expression depth 100, values up to 1 MiB |
@@ -615,6 +616,7 @@ entries again, so entries should be stored idempotently (by `seq` or message ID)
 | `session_started` | none | A new gateway session began; anything while disconnected or closed is not journaled |
 | `missed` | `channel_id`, `after_message_id`, `latest_message_id` | At a new session, a channel's latest message is newer than the last one journaled |
 | `channel_changed` | `channel_id` | A channel was created or its details changed |
+| `access_lost` | `guild_id` (`null` for DMs), `channel_ids` (at most 1,000 per entry) | These channels were readable before an event and are not after it: a kick or leave, a deleted channel, a permission change, or a server becoming unavailable (an outage looks the same) |
 | `access_changed` | none | Which conversations the account can read may have changed |
 
 Every entry also has `seq` (increasing, never reused) and `at_ms` (when the host
@@ -634,7 +636,26 @@ Bounds: the journal keeps at most 100,000 unread entries or 64 MiB, pruning the 
 into a `pruned` gap; up to 1,024 records wait for the writer before an `overflow` gap.
 Entries every consumer has read are deleted. Nothing is recorded while no enabled
 plugin consumes the journal, and a plugin enabled later starts with new entries.
-Disabling a plugin removes its position; logging out removes the account's journal.
+Disabling a plugin removes its position. The journal lives with the account's plugin
+data, so logging out keeps it; with no consumer installed nothing new is recorded.
+
+## Plugin data (preview)
+
+Plugin data lives apart from packages in `extensions/plugin-data/<account>/<plugin id>/`
+(`connection/` for connection plugins): `data.json` (`storage`), `data.sqlite`
+(`database`) and `settings.json` (the chosen database size). The account's message
+journal sits beside them. Data from older versions inside package directories moves
+there on first use.
+
+- **Updating** a plugin keeps its data.
+- **Disabling** a plugin that has data asks whether to keep or delete it.
+- **Logging out** removes the account's plugin packages and grants but keeps their data.
+- **Reinstalling** the same plugin ID in the same account picks up its kept data.
+- Settings > Extensions lists **kept plugin data** of plugins that are not installed, with
+  its size and a delete action; a plugin's details show its data size and, for `database`
+  plugins, the database size limit.
+
+Kept data is ordinary local data, not encrypted by Serein, and is never uploaded.
 
 ## API proxy plugin (preview)
 

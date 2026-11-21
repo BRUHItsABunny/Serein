@@ -5109,6 +5109,17 @@ extensions-ui-details-modal-author = 제작자
 extensions-ui-details-modal-capabilities = 권한
 # Context: extensions_ui
 extensions-ui-details-modal-disable = 확장 비활성화
+extensions-ui-data-disable-title = { $name }을(를) 제거할까요?
+extensions-ui-data-disable-body = 이 플러그인은 이 기기에 { $size }의 데이터를 보관하고 있습니다. 플러그인을 다시 설치할 때 이어서 사용하려면 보관하고, 아니면 지금 삭제하세요.
+extensions-ui-data-keep = 데이터 보관
+extensions-ui-data-delete = 데이터 삭제
+extensions-ui-data-delete-title = { $name }의 데이터를 삭제할까요?
+extensions-ui-data-delete-body = 이 기기에서 { $size }가 삭제됩니다. 이 작업은 되돌릴 수 없습니다.
+extensions-ui-data-section = 데이터
+extensions-ui-data-size = 이 기기에 저장됨: { $size }
+extensions-ui-data-quota = 데이터베이스 크기 제한
+extensions-ui-data-kept-title = 보관된 플러그인 데이터
+extensions-ui-data-kept-hint = 더 이상 설치되어 있지 않은 플러그인의 데이터입니다. 같은 플러그인을 다시 설치하면 복원됩니다.
 # Context: extensions_ui
 extensions-ui-details-modal-enable-to-use-tools = 이 확장의 설정과 도구를 사용하려면 활성화하세요.
 # Context: extensions_ui

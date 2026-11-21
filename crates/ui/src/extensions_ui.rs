@@ -106,6 +106,19 @@ pub enum ExtensionRequest {
 	},
 	Disable {
 		id: String,
+		/// Also delete the plugin's data instead of keeping it for a reinstall.
+		delete_data: bool,
+	},
+	/// Delete the data a removed plugin left behind.
+	DeleteData {
+		id: String,
+		connection: bool,
+	},
+	/// Change how large a plugin's database may grow.
+	SetDatabaseQuota {
+		id: String,
+		connection: bool,
+		bytes: u64,
 	},
 	Invoke {
 		id: String,
@@ -287,6 +300,28 @@ pub struct ExtensionUi {
 	theme_editor: Option<crate::theme_editor::ThemeEditor>,
 	theme_editor_visible: bool,
 	gallery_preview: Option<String>,
+	/// Size and quota of each plugin's data in the current scopes, installed or kept.
+	pub plugin_data: Vec<extension_host::store::PluginData>,
+	/// A plugin waiting for the user to keep or delete its data before it is disabled.
+	confirm_disable: Option<String>,
+	/// Kept data waiting for the user to confirm deletion: plugin ID and connection scope.
+	confirm_delete_data: Option<(String, bool)>,
+}
+
+/// "1.5 MiB"-style size for data shown to the user.
+fn data_size(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let mut value = bytes as f64;
+	let mut unit = 0;
+	while value >= 1024.0 && unit + 1 < UNITS.len() {
+		value /= 1024.0;
+		unit += 1;
+	}
+	if unit == 0 {
+		format!("{bytes} B")
+	} else {
+		format!("{value:.1} {}", UNITS[unit])
+	}
 }
 impl ExtensionUi {
 	pub fn editing_theme(&self) -> bool {
@@ -1710,19 +1745,183 @@ impl ExtensionUi {
 					});
 				});
 		}
+		if !self.themes {
+			self.kept_data(ui, &colors);
+		}
 		self.preview_modal(ui.ctx());
 		self.details_modal(ui.ctx(), &mut enable, &mut disable, &mut invoke);
 		if let Some(entry) = enable {
 			self.offer_import(entry);
 		}
 		if let Some(id) = disable {
-			self.remove_runtime(&id);
-			self.queue(ui.ctx(), ExtensionRequest::Disable { id });
+			self.request_disable(ui.ctx(), id);
 		}
+		self.data_modals(ui.ctx());
 		if let Some((id, action)) = invoke {
 			self.invoke_panel(ui.ctx(), state, id, action);
 		}
 		self.consent_modal(ui.ctx(), &colors);
+	}
+	/// The data a plugin keeps on this device, if any.
+	fn data_of(&self, id: &str) -> Option<&extension_host::store::PluginData> {
+		let connection = self.entries.iter().any(|entry| {
+			entry.manifest.id == id && entry.manifest.capabilities.contains(&Capability::ApiProxy)
+		});
+		self.plugin_data
+			.iter()
+			.find(|data| data.id == id && data.connection == connection)
+	}
+	/// Disables a plugin, first asking whether to keep its data when it has any.
+	fn request_disable(&mut self, ctx: &egui::Context, id: String) {
+		let plugin = self
+			.entries
+			.iter()
+			.any(|entry| entry.manifest.id == id && entry.manifest.kind == ExtensionKind::Plugin);
+		if plugin && self.data_of(&id).is_some() {
+			self.confirm_disable = Some(id);
+			return;
+		}
+		self.remove_runtime(&id);
+		self.queue(
+			ctx,
+			ExtensionRequest::Disable {
+				id,
+				delete_data: false,
+			},
+		);
+	}
+	fn name_of(&self, id: &str) -> String {
+		self.entries
+			.iter()
+			.find(|entry| entry.manifest.id == id)
+			.map_or_else(|| id.to_owned(), |entry| entry.manifest.name.clone())
+	}
+	/// The keep-or-delete choice when disabling, and confirmation of deleting kept data.
+	fn data_modals(&mut self, ctx: &egui::Context) {
+		if let Some(id) = self.confirm_disable.clone() {
+			let size = self.data_of(&id).map_or(0, |data| data.bytes);
+			let name = self.name_of(&id);
+			let mut choice = None;
+			let response = crate::dialog::Dialog::new(
+				"extension-disable-data",
+				crate::i18n::translate_args("extensions-ui-data-disable-title", &[("name", &name)]),
+			)
+			.width(440.0)
+			.show(ctx, |d| {
+				d.content(|ui| {
+					ui.add(
+						egui::Label::new(crate::i18n::translate_args(
+							"extensions-ui-data-disable-body",
+							&[("size", &data_size(size))],
+						))
+						.wrap(),
+					);
+				});
+				d.footer(|ui| {
+					if crate::dialog::action(
+						ui,
+						"extensions-ui-data-keep",
+						crate::dialog::Action::Primary,
+					)
+					.clicked()
+					{
+						choice = Some(false);
+					}
+					if crate::dialog::action(
+						ui,
+						"extensions-ui-data-delete",
+						crate::dialog::Action::Danger,
+					)
+					.clicked()
+					{
+						choice = Some(true);
+					}
+					if crate::dialog::action(
+						ui,
+						"dialog-module-cancel",
+						crate::dialog::Action::Neutral,
+					)
+					.clicked()
+					{
+						self.confirm_disable = None;
+					}
+				});
+			});
+			if response.close {
+				self.confirm_disable = None;
+			}
+			if let Some(delete_data) = choice {
+				self.confirm_disable = None;
+				self.remove_runtime(&id);
+				self.queue(ctx, ExtensionRequest::Disable { id, delete_data });
+			}
+		}
+		if let Some((id, connection)) = self.confirm_delete_data.clone() {
+			let size = self
+				.plugin_data
+				.iter()
+				.find(|data| data.id == id && data.connection == connection)
+				.map_or(0, |data| data.bytes);
+			match crate::dialog::Confirm::new(
+				"extension-delete-data",
+				crate::i18n::translate_args("extensions-ui-data-delete-title", &[("name", &id)]),
+				crate::i18n::translate_args(
+					"extensions-ui-data-delete-body",
+					&[("size", &data_size(size))],
+				),
+			)
+			.confirm_label("extensions-ui-data-delete")
+			.danger()
+			.show(ctx)
+			{
+				Some(crate::dialog::Choice::Confirmed) => {
+					self.confirm_delete_data = None;
+					self.queue(ctx, ExtensionRequest::DeleteData { id, connection });
+				}
+				Some(crate::dialog::Choice::Cancelled) => self.confirm_delete_data = None,
+				None => {}
+			}
+		}
+	}
+	/// Data left by plugins that are no longer installed, each with a delete action.
+	fn kept_data(&mut self, ui: &mut egui::Ui, colors: &design::Palette) {
+		let installed: std::collections::BTreeSet<&str> = self
+			.entries
+			.iter()
+			.filter(|entry| entry.enabled || entry.cleanup_pending)
+			.map(|entry| entry.manifest.id.as_str())
+			.collect();
+		let kept: Vec<_> = self
+			.plugin_data
+			.iter()
+			.filter(|data| !installed.contains(data.id.as_str()))
+			.cloned()
+			.collect();
+		if kept.is_empty() {
+			return;
+		}
+		ui.add_space(16.0);
+		ui.label(design::eyebrow(
+			ui,
+			crate::i18n::translate("extensions-ui-data-kept-title"),
+			colors.muted,
+		));
+		crate::dialog::hint(ui, "extensions-ui-data-kept-hint");
+		for data in kept {
+			ui.horizontal(|ui| {
+				ui.label(egui::RichText::new(&data.id).color(colors.text));
+				ui.label(egui::RichText::new(data_size(data.bytes)).color(colors.muted));
+				if ui
+					.add_enabled(
+						!self.busy,
+						egui::Button::new(crate::i18n::translate("extensions-ui-data-delete")),
+					)
+					.clicked()
+				{
+					self.confirm_delete_data = Some((data.id.clone(), data.connection));
+				}
+			});
+		}
 	}
 	fn details_modal(
 		&mut self,
@@ -1752,6 +1951,9 @@ impl ExtensionUi {
 			.cloned()
 			.collect();
 		let usable = entry.enabled && !entry.cleanup_pending && !self.busy;
+		let data = self.data_of(&id).cloned();
+		let quota_editable = usable && entry.manifest.capabilities.contains(&Capability::Database);
+		let mut quota = None;
 		let mut close = false;
 		let response = crate::dialog::Dialog::new("extension-details", &entry.manifest.name)
 			.subtitle(crate::i18n::translate(
@@ -1856,6 +2058,46 @@ impl ExtensionUi {
 							ui.add(egui::Label::new(capability_label(*capability)).wrap());
 						}
 					}
+					if data.is_some() || quota_editable {
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-data-section"),
+							colors.muted,
+						));
+						ui.label(crate::i18n::translate_args(
+							"extensions-ui-data-size",
+							&[(
+								"size",
+								&data_size(data.as_ref().map_or(0, |data| data.bytes)),
+							)],
+						));
+						if quota_editable {
+							let current = data
+								.as_ref()
+								.map_or(extension_host::database::DEFAULT_QUOTA, |data| {
+									data.database_quota
+								});
+							ui.horizontal(|ui| {
+								ui.label(crate::i18n::translate("extensions-ui-data-quota"));
+								egui::ComboBox::from_id_salt(("extension-quota", &id))
+									.selected_text(data_size(current))
+									.show_ui(ui, |ui| {
+										for bytes in extension_host::database::QUOTAS {
+											if ui
+												.selectable_label(
+													bytes == current,
+													data_size(bytes),
+												)
+												.clicked() && bytes != current
+											{
+												quota = Some(bytes);
+											}
+										}
+									});
+							});
+						}
+					}
 					ui.separator();
 					ui.label(design::eyebrow(
 						ui,
@@ -1926,6 +2168,17 @@ impl ExtensionUi {
 					}
 				});
 			});
+		if let Some(bytes) = quota {
+			let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
+			self.queue(
+				ctx,
+				ExtensionRequest::SetDatabaseQuota {
+					id: id.clone(),
+					connection,
+					bytes,
+				},
+			);
+		}
 		if close || response.close || enable.is_some() || disable.is_some() || invoke.is_some() {
 			self.details = None;
 		}
@@ -2636,7 +2889,13 @@ impl ExtensionUi {
 			self.queue(ctx, ExtensionRequest::SelectTheme { id: None });
 		}
 		for id in disable {
-			self.queue(ctx, ExtensionRequest::Disable { id });
+			self.queue(
+				ctx,
+				ExtensionRequest::Disable {
+					id,
+					delete_data: false,
+				},
+			);
 		}
 	}
 	/// Shows the result window of the last foreground plugin action: its panel, proposed draft
@@ -2861,7 +3120,10 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			ExtensionRequest::Enable {
 				id, sha256, grants, ..
 			} => id.len() + sha256.len() + grants.len() * std::mem::size_of::<Capability>(),
-			ExtensionRequest::Disable { id } | ExtensionRequest::Preview { id } => id.len(),
+			ExtensionRequest::Disable { id, .. }
+			| ExtensionRequest::DeleteData { id, .. }
+			| ExtensionRequest::SetDatabaseQuota { id, .. }
+			| ExtensionRequest::Preview { id } => id.len(),
 			ExtensionRequest::Invoke {
 				id,
 				invocation,
@@ -3782,12 +4044,66 @@ mod tests {
 		);
 		assert!(matches!(
 			shop.requests.as_slice(),
-			[ExtensionRequest::Disable { id }] if id == "synthetic.words"
+			[ExtensionRequest::Disable { id, .. }] if id == "synthetic.words"
 		));
 		assert!(shop.details.is_none(), "disable closes its details");
 		shop.open_details(&plugin.manifest.id);
 		shop.set_entries(vec![]);
 		assert!(shop.details.is_none(), "removed plugin closes its details");
+	}
+
+	#[test]
+	fn disabling_a_plugin_with_data_asks_whether_to_keep_it() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut plugin = entry();
+		plugin.enabled = true;
+		shop.set_entries(vec![plugin.clone()]);
+		shop.plugin_data = vec![extension_host::store::PluginData {
+			id: plugin.manifest.id.clone(),
+			connection: false,
+			bytes: 3 * 1024 * 1024,
+			database_quota: extension_host::database::DEFAULT_QUOTA,
+		}];
+		let ask = |shop: &mut ExtensionUi| {
+			shop.open_details(&plugin.manifest.id);
+			frame(&ctx, shop, 320.0, vec![]);
+			let labels = frame(&ctx, shop, 320.0, vec![]);
+			click(
+				&ctx,
+				shop,
+				320.0,
+				&labels,
+				&crate::i18n::translate("extensions-ui-details-modal-disable"),
+			);
+			// Nothing is disabled until the user chooses what happens to the data.
+			assert!(shop.requests.is_empty());
+			frame(&ctx, shop, 320.0, vec![]);
+			frame(&ctx, shop, 320.0, vec![])
+		};
+		for (choice, delete) in [
+			("extensions-ui-data-keep", false),
+			("extensions-ui-data-delete", true),
+		] {
+			let labels = ask(&mut shop);
+			click(
+				&ctx,
+				&mut shop,
+				320.0,
+				&labels,
+				&crate::i18n::translate(choice),
+			);
+			assert!(matches!(
+				shop.requests.as_slice(),
+				[ExtensionRequest::Disable { id, delete_data }] if id == "synthetic.words" && *delete_data == delete
+			));
+			shop.requests.clear();
+		}
+		// Once the plugin is gone, its kept data is listed for deletion.
+		shop.set_entries(vec![]);
+		let labels = frame(&ctx, &mut shop, 320.0, vec![]);
+		assert!(labels.iter().any(|(text, _)| text == "synthetic.words"));
+		assert!(labels.iter().any(|(text, _)| text == "3.0 MiB"));
 	}
 
 	/// Runs one frame that publishes context actions and draws `target`'s plugin entries, and

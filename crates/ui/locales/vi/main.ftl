@@ -1004,6 +1004,17 @@ extensions-ui-details-modal-author = tác giả
 extensions-ui-details-modal-capabilities = Khả năng
 # Context: details_modal
 extensions-ui-details-modal-disable = Tắt tiện ích mở rộng
+extensions-ui-data-disable-title = Gỡ { $name }?
+extensions-ui-data-disable-body = Plugin này lưu { $size } dữ liệu trên thiết bị này. Giữ lại để tiếp tục khi bạn cài lại plugin, hoặc xóa ngay bây giờ.
+extensions-ui-data-keep = Giữ dữ liệu
+extensions-ui-data-delete = Xóa dữ liệu
+extensions-ui-data-delete-title = Xóa dữ liệu của { $name }?
+extensions-ui-data-delete-body = { $size } sẽ bị xóa khỏi thiết bị này. Không thể hoàn tác.
+extensions-ui-data-section = Dữ liệu
+extensions-ui-data-size = Lưu trên thiết bị này: { $size }
+extensions-ui-data-quota = Giới hạn dung lượng cơ sở dữ liệu
+extensions-ui-data-kept-title = Dữ liệu plugin được giữ lại
+extensions-ui-data-kept-hint = Dữ liệu từ các plugin không còn được cài đặt. Cài lại cùng plugin sẽ khôi phục dữ liệu.
 # Context: details_modal
 extensions-ui-details-modal-enable-to-use-tools = Kích hoạt tiện ích mở rộng này để sử dụng các cài đặt và công cụ của nó.
 # Context: details_modal

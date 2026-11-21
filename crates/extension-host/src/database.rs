@@ -24,8 +24,11 @@ use std::path::PathBuf;
 
 /// File name inside the plugin's extension directory.
 pub const FILE_NAME: &str = "data.sqlite";
-/// Largest database file, enforced through SQLite's page count.
-pub const MAX_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
+/// Database size a plugin gets until the user picks another of [`QUOTAS`].
+pub const DEFAULT_QUOTA: u64 = 64 * MIB;
+/// Database sizes the user can choose per plugin, enforced through SQLite's page count.
+pub const QUOTAS: [u64; 5] = [64 * MIB, 256 * MIB, 1024 * MIB, 4096 * MIB, 16384 * MIB];
+const MIB: u64 = 1024 * 1024;
 /// SQLite virtual-machine instructions between progress checks.
 const PROGRESS_INTERVAL: i32 = 1_000;
 /// Progress checks one invocation may use: about 100 million instructions.
@@ -61,15 +64,18 @@ struct Request {
 /// One invocation's connection. Dropping it without [`PluginDatabase::commit`] rolls back.
 pub struct PluginDatabase {
 	path: PathBuf,
+	quota: u64,
 	connection: Option<Connection>,
 	/// Set once the session can no longer commit, such as after an exhausted budget.
 	broken: Option<&'static str>,
 }
 
 impl PluginDatabase {
-	pub fn new(path: PathBuf) -> Self {
+	/// A session for the file at `path`, which may grow to `quota` bytes.
+	pub fn new(path: PathBuf, quota: u64) -> Self {
 		Self {
 			path,
+			quota,
 			connection: None,
 			broken: None,
 		}
@@ -99,7 +105,7 @@ impl PluginDatabase {
 			return Reply::Failed(reason.into());
 		}
 		if self.connection.is_none() {
-			match open(&self.path) {
+			match open(&self.path, self.quota) {
 				Ok(connection) => self.connection = Some(connection),
 				Err(reason) => {
 					self.broken = Some(reason);
@@ -153,7 +159,7 @@ impl From<rusqlite::Error> for Failure {
 	}
 }
 
-fn open(path: &std::path::Path) -> Result<Connection, &'static str> {
+fn open(path: &std::path::Path, quota: u64) -> Result<Connection, &'static str> {
 	const UNAVAILABLE: &str = "Plugin database is unavailable";
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).map_err(|_| UNAVAILABLE)?;
@@ -167,11 +173,11 @@ fn open(path: &std::path::Path) -> Result<Connection, &'static str> {
 			| OpenFlags::SQLITE_OPEN_NOFOLLOW,
 	)
 	.map_err(|_| UNAVAILABLE)?;
-	configure(&mut connection).map_err(|_| UNAVAILABLE)?;
+	configure(&mut connection, quota).map_err(|_| UNAVAILABLE)?;
 	Ok(connection)
 }
 
-fn configure(connection: &mut Connection) -> rusqlite::Result<()> {
+fn configure(connection: &mut Connection, quota: u64) -> rusqlite::Result<()> {
 	connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
 	connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
 	for (limit, value) in [
@@ -193,7 +199,7 @@ fn configure(connection: &mut Connection) -> rusqlite::Result<()> {
 	connection.execute_batch(&format!(
 		"PRAGMA max_page_count = {}; PRAGMA cache_size = -2048; PRAGMA foreign_keys = ON;
 		 BEGIN IMMEDIATE",
-		MAX_DATABASE_BYTES / page_size.max(512) as u64
+		quota / page_size.max(512) as u64
 	))?;
 	let mut checks = 0_u32;
 	connection.progress_handler(
@@ -322,7 +328,7 @@ fn sql_message(error: &rusqlite::Error) -> String {
 			"Database work exceeded this invocation's budget".into()
 		}
 		rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::DiskFull => {
-			"Plugin database is full (64 MiB)".into()
+			"Plugin database is full; the user can raise its size limit in Extensions".into()
 		}
 		rusqlite::Error::SqliteFailure(_, Some(message)) => message.clone(),
 		rusqlite::Error::MultipleStatement => "Send one statement per request".into(),
@@ -349,7 +355,7 @@ mod tests {
 			Self(path)
 		}
 		fn database(&self) -> PluginDatabase {
-			PluginDatabase::new(self.0.join("plugin").join(FILE_NAME))
+			PluginDatabase::new(self.0.join("plugin").join(FILE_NAME), DEFAULT_QUOTA)
 		}
 	}
 	impl Drop for Directory {
