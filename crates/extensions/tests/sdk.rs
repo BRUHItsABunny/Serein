@@ -14,6 +14,7 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		Surface::MessageEvent => capabilities.push(Capability::MessageEvents),
 		Surface::AppEvent => capabilities.push(Capability::AppEvents),
 		Surface::Tick => capabilities.push(Capability::Appearance),
+		Surface::Journal => capabilities.push(Capability::MessageJournal),
 		Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
 			capabilities.push(Capability::ContextMenus)
 		}

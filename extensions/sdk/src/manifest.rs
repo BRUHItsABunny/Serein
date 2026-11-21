@@ -95,6 +95,8 @@ pub enum Capability {
 	Random,
 	/// Use [`crate::host::db`], a private SQLite database.
 	Database,
+	/// Use [`crate::host::journal`] in a [`Surface::Journal`] action.
+	MessageJournal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,8 @@ pub enum Surface {
 	Channel,
 	Server,
 	Role,
+	/// Host-scheduled message journal delivery; read entries with [`crate::host::journal::read`].
+	Journal,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.

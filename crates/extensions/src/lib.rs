@@ -165,6 +165,9 @@ pub enum Capability {
 	Random,
 	/// Import `serein.db_execute` for a private SQLite database on this device.
 	Database,
+	/// Receive every message create, edit and delete the account sees, with earlier text
+	/// where the host has it, through `serein.journal_read` on a `journal` action.
+	MessageJournal,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -230,6 +233,9 @@ pub enum Surface {
 	Server,
 	/// An entry in a role's context menu; the invocation names the role and its server.
 	Role,
+	/// Host-scheduled delivery of the message journal; the plugin pulls entries with
+	/// `serein.journal_read`. Requires `message_journal`.
+	Journal,
 }
 
 impl Surface {
@@ -925,6 +931,7 @@ impl Manifest {
 			Surface::MessageEvent,
 			Surface::AppEvent,
 			Surface::Tick,
+			Surface::Journal,
 		] {
 			if self
 				.actions
@@ -957,6 +964,7 @@ impl Manifest {
 				Surface::MessageEvent => Some(Capability::MessageEvents),
 				Surface::AppEvent => Some(Capability::AppEvents),
 				Surface::Tick => Some(Capability::Appearance),
+				Surface::Journal => Some(Capability::MessageJournal),
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1311,7 +1319,7 @@ impl Invocation {
 		{
 			return Err(Error::Capability);
 		}
-		if action.surface == Surface::Tick
+		if matches!(action.surface, Surface::Tick | Surface::Journal)
 			&& (!self.values.is_empty()
 				|| self.message_event.is_some()
 				|| self.app.is_some()
@@ -1380,6 +1388,22 @@ impl Output {
 			if let Some(screen) = start {
 				screen.validate().map_err(|_| Error::Invalid)?;
 			}
+		}
+		// A journal delivery may only save storage; its database writes go through imports.
+		if surface == Surface::Journal
+			&& (self.rich_presence.is_some()
+				|| self.api_proxy.is_some()
+				|| self.image_sharing
+				|| self.preserve_deleted_messages
+				|| self.appearance.is_some()
+				|| self.replacement.is_some()
+				|| !self.panel.is_empty()
+				|| !self.effects.is_empty()
+				|| self.interface_tweaks.is_some()
+				|| self.interface_ui.is_some()
+				|| self.start_screen.is_some())
+		{
+			return Err(Error::Capability);
 		}
 		if surface == Surface::Tick
 			&& (self.rich_presence.is_some()

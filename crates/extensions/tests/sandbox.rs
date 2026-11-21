@@ -695,6 +695,9 @@ impl HostImports for Fixed {
 			_ => Reply::Ok(request.to_vec()),
 		}
 	}
+	fn journal_read(&mut self, max_entries: u32) -> Reply {
+		Reply::Ok(format!(r#"{{"entries":[],"max":{max_entries}}}"#).into_bytes())
+	}
 }
 
 /// A composer plugin with `capabilities` whose handler runs `body` (leaving an i32 on the
@@ -888,4 +891,62 @@ fn variable_replies_stay_pending_until_read_into_a_large_enough_buffer() {
 		"(i32.eqz (call $db (i32.const 65530) (i32.const 20)))",
 	);
 	assert!(matches!(run(&out_of_bounds, &grants), Err(Error::Trap)));
+}
+
+#[test]
+fn journal_actions_need_their_capability_and_return_only_storage() {
+	let read = r#"(import "serein" "journal_read" (func $journal (param i32) (result i32)))"#;
+	assert!(matches!(
+		importing(read, &[], "(i32.const 1)").validate(),
+		Err(Error::Capability)
+	));
+	let grants = [Capability::Composer, Capability::MessageJournal];
+	// 1 to 256 entries per call; other counts are refused.
+	let bounds = importing(
+		read,
+		&[Capability::MessageJournal],
+		"(i32.and (i32.and (i32.gt_s (call $journal (i32.const 256)) (i32.const 0))
+			(i32.eq (call $journal (i32.const 0)) (i32.const -1)))
+			(i32.eq (call $journal (i32.const 257)) (i32.const -1)))",
+	);
+	assert_eq!(run(&bounds, &grants).unwrap().as_deref(), Some("ok"));
+
+	let mut manifest = plugin("(module)").manifest;
+	let journal = Action {
+		id: "journal".into(),
+		label: "Journal".into(),
+		surface: Surface::Journal,
+	};
+	manifest.actions = vec![journal.clone()];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.capabilities.push(Capability::MessageJournal);
+	manifest.validate().unwrap();
+	let mut twice = manifest.clone();
+	twice.actions.push(Action {
+		id: "again".into(),
+		..journal
+	});
+	assert!(matches!(twice.validate(), Err(Error::Invalid)));
+
+	let input = Invocation {
+		action: "journal".into(),
+		..Default::default()
+	};
+	input.validate(&manifest).unwrap();
+	let mut with_values = input.clone();
+	with_values.values.insert("x".into(), "1".into());
+	assert!(with_values.validate(&manifest).is_err());
+	manifest.capabilities.push(Capability::Storage);
+	let storage: Output = serde_json::from_str(r#"{"storage":"saved"}"#).unwrap();
+	storage.validate(&manifest, &input).unwrap();
+	for output in [
+		r#"{"replacement":"x"}"#,
+		r#"{"panel":[{"type":"text","text":"x"}]}"#,
+	] {
+		let output: Output = serde_json::from_str(output).unwrap();
+		assert!(
+			matches!(output.validate(&manifest, &input), Err(Error::Capability)),
+			"{output:?}"
+		);
+	}
 }

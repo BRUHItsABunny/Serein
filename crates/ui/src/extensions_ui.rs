@@ -3304,6 +3304,9 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::Clock => "Read the current date and time",
 		Capability::Random => "Generate random numbers, such as unique IDs",
 		Capability::Database => "Keep a private database on this device (up to 64 MiB)",
+		Capability::MessageJournal => {
+			"Receive every message, edit and deletion in all your conversations, including earlier text of edited and deleted messages"
+		}
 		Capability::ApiProxy => {
 			"Route the Discord REST API through a proxy across accounts (not calls or media)"
 		}

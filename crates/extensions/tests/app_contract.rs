@@ -923,9 +923,10 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 	assert!(host.supports("api_proxy"));
 	assert!(host.supports_import("clock_now_ms") && host.supports_import("random_fill"));
 	assert!(host.supports_import("db_execute") && host.supports_import("result_read"));
-	assert_eq!(caps.len(), 61);
+	assert!(host.supports_import("journal_read"));
+	assert_eq!(caps.len(), 62);
 	assert_eq!(HostInfo::current().app_events.len(), 21);
-	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 61);
+	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 62);
 }
 
 #[test]

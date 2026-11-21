@@ -25,6 +25,7 @@ mod raw {
 		pub fn random_fill(pointer: *mut u8, length: i32) -> i32;
 		pub fn db_execute(pointer: *const u8, length: i32) -> i32;
 		pub fn result_read(pointer: *mut u8, capacity: i32) -> i32;
+		pub fn journal_read(max: i32) -> i32;
 	}
 }
 
@@ -362,6 +363,256 @@ pub mod db {
 				execute("SELECT 1", &[]),
 				Err(DbError::Host(HostError::Unavailable))
 			);
+		}
+	}
+}
+
+/// The account's message journal. Requires the `message_journal` capability and runs in a
+/// `journal` action, which the host schedules whenever entries are waiting.
+///
+/// Each [`read`] returns entries after this plugin's position. The position moves only when
+/// the invocation succeeds and its output is accepted, right after the plugin database
+/// commits, so storing entries with [`super::db`] in the same invocation never loses one:
+/// a failed invocation sees the same entries again. Entries are therefore delivered at least
+/// once; deduplicate by `seq` or by message ID.
+pub mod journal {
+	use super::HostError;
+	use serde::Deserialize;
+	use serde_json::Value;
+
+	/// Most entries one [`read`] returns.
+	pub const MAX_ENTRIES: u32 = 256;
+
+	/// One batch of entries, in sequence order.
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Batch {
+		pub entries: Vec<Entry>,
+		/// Entries remain after this batch; the host schedules another delivery.
+		#[serde(default)]
+		pub more: bool,
+	}
+
+	/// A journal entry: its position, when the host recorded it, and what happened.
+	#[derive(Clone, Debug, Deserialize, PartialEq)]
+	pub struct Entry {
+		pub seq: i64,
+		pub at_ms: i64,
+		#[serde(flatten)]
+		pub kind: EntryKind,
+	}
+
+	/// What a journal entry records. Unknown kinds from newer hosts are kept as [`EntryKind::Other`].
+	#[derive(Clone, Debug, Deserialize, PartialEq)]
+	#[serde(tag = "kind", rename_all = "snake_case")]
+	pub enum EntryKind {
+		/// A new message.
+		Create {
+			channel_id: String,
+			#[serde(default)]
+			guild_id: Option<String>,
+			message: Message,
+		},
+		/// An edit. Changed fields are present; `previous` is the version the host held,
+		/// when it held one.
+		Update {
+			channel_id: String,
+			#[serde(default)]
+			guild_id: Option<String>,
+			message_id: String,
+			#[serde(default)]
+			content: Option<String>,
+			#[serde(default)]
+			edited_at_ms: Option<i64>,
+			#[serde(default)]
+			attachments: Option<Vec<Attachment>>,
+			#[serde(default)]
+			previous: Option<Message>,
+		},
+		/// A deletion; `bulk` for moderator purges. `previous` as for updates.
+		Delete {
+			channel_id: String,
+			#[serde(default)]
+			guild_id: Option<String>,
+			message_id: String,
+			#[serde(default)]
+			bulk: bool,
+			#[serde(default)]
+			previous: Option<Message>,
+		},
+		/// Entries were lost: `overflow` (the host could not keep up; `dropped` records) or
+		/// `pruned` (the journal's bounds removed `from_seq..=to_seq` before this plugin read them).
+		Gap {
+			reason: String,
+			#[serde(default)]
+			dropped: Option<u64>,
+			#[serde(default)]
+			from_seq: Option<i64>,
+			#[serde(default)]
+			to_seq: Option<i64>,
+		},
+		/// A new gateway session began; events while disconnected or closed are not in the journal.
+		SessionStarted,
+		/// The channel's latest message moved past the last one journaled while nobody listened.
+		Missed {
+			channel_id: String,
+			after_message_id: String,
+			latest_message_id: String,
+		},
+		/// A channel was created or its details changed.
+		ChannelChanged { channel_id: String },
+		/// Which conversations the account can read may have changed.
+		AccessChanged,
+		#[serde(other)]
+		Other,
+	}
+
+	/// The archived form of a message.
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Message {
+		pub id: String,
+		pub author: Author,
+		pub content: String,
+		pub created_at_ms: i64,
+		#[serde(default)]
+		pub edited_at_ms: Option<i64>,
+		/// Discord message type.
+		#[serde(default, rename = "type")]
+		pub kind: u8,
+		#[serde(default)]
+		pub flags: u64,
+		#[serde(default)]
+		pub reply_to: Option<String>,
+		#[serde(default)]
+		pub forwarded: bool,
+		/// Number of embeds; their contents are not journaled.
+		#[serde(default)]
+		pub embeds: u32,
+		#[serde(default)]
+		pub stickers: u32,
+		/// Absent when `truncated`: the message was too large to journal its attachments.
+		#[serde(default)]
+		pub attachments: Option<Vec<Attachment>>,
+		#[serde(default)]
+		pub truncated: bool,
+	}
+
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Author {
+		pub id: String,
+		pub name: String,
+		#[serde(default)]
+		pub nick: Option<String>,
+		#[serde(default)]
+		pub bot: bool,
+		#[serde(default)]
+		pub webhook: bool,
+	}
+
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Attachment {
+		pub id: String,
+		pub filename: String,
+		#[serde(default)]
+		pub content_type: Option<String>,
+		#[serde(default)]
+		pub size: u64,
+		#[serde(default)]
+		pub url: Option<String>,
+		#[serde(default)]
+		pub proxy_url: Option<String>,
+	}
+
+	/// Why a journal read failed.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub enum JournalError {
+		Host(HostError),
+		/// The host could not read the journal right now.
+		Failed(String),
+		/// The host's reply could not be decoded.
+		Reply,
+	}
+
+	/// Reads up to `max` (1 to [`MAX_ENTRIES`]) entries after this plugin's position.
+	pub fn read(max: u32) -> Result<Batch, JournalError> {
+		if !(1..=MAX_ENTRIES).contains(&max) {
+			return Err(JournalError::Host(HostError::Invalid));
+		}
+		parse(&call(max)?)
+	}
+
+	fn parse(reply: &[u8]) -> Result<Batch, JournalError> {
+		serde_json::from_slice(reply).map_err(|_| JournalError::Reply)
+	}
+
+	/// Decodes an entry's raw JSON, for tools that read entries outside a plugin.
+	pub fn decode(value: Value) -> Option<Entry> {
+		serde_json::from_value(value).ok()
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn call(max: u32) -> Result<Vec<u8>, JournalError> {
+		// SAFETY: a host call with no pointer arguments.
+		let code = unsafe { super::raw::journal_read(max as i32) };
+		let (capacity, failed) = match code {
+			0.. => (code as usize, false),
+			-3 => (1024, true),
+			-1 => return Err(JournalError::Host(HostError::Invalid)),
+			_ => return Err(JournalError::Host(HostError::Unavailable)),
+		};
+		let mut reply = vec![0_u8; capacity];
+		// SAFETY: the host writes at most `capacity` bytes into this exclusive buffer.
+		let read = unsafe { super::raw::result_read(reply.as_mut_ptr(), capacity as i32) };
+		if read < 0 {
+			return Err(JournalError::Reply);
+		}
+		reply.truncate(read as usize);
+		if failed {
+			Err(JournalError::Failed(
+				String::from_utf8_lossy(&reply).into_owned(),
+			))
+		} else {
+			Ok(reply)
+		}
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn call(_: u32) -> Result<Vec<u8>, JournalError> {
+		Err(JournalError::Host(HostError::Unavailable))
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn host_entries_decode_including_unknown_kinds() {
+			let batch = parse(
+				br#"{"entries":[
+				{"seq":1,"at_ms":5,"kind":"create","channel_id":"2","guild_id":null,"message":{"id":"3","author":{"id":"4","name":"a","nick":null,"bot":false,"webhook":false},"content":"hi","created_at_ms":9,"edited_at_ms":null,"type":0,"flags":0,"reply_to":null,"forwarded":false,"embeds":0,"stickers":0,"attachments":[]}},
+				{"seq":2,"at_ms":6,"kind":"delete","channel_id":"2","guild_id":"7","message_id":"3","bulk":false,"previous":null},
+				{"seq":3,"at_ms":6,"kind":"gap","reason":"pruned","from_seq":3,"to_seq":3},
+				{"seq":4,"at_ms":7,"kind":"from_a_newer_host","x":1}
+			],"more":true}"#,
+			)
+			.unwrap();
+			assert!(batch.more);
+			assert!(
+				matches!(&batch.entries[0].kind, EntryKind::Create { message, .. } if message.content == "hi")
+			);
+			assert!(matches!(
+				&batch.entries[1].kind,
+				EntryKind::Delete { previous: None, .. }
+			));
+			assert!(matches!(
+				&batch.entries[2].kind,
+				EntryKind::Gap {
+					to_seq: Some(3),
+					..
+				}
+			));
+			assert_eq!(batch.entries[3].kind, EntryKind::Other);
+			assert_eq!(read(0), Err(JournalError::Host(HostError::Invalid)));
+			assert_eq!(read(1), Err(JournalError::Host(HostError::Unavailable)));
 		}
 	}
 }

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::database::{self, PluginDatabase};
+use crate::journal::{self, JournalSession};
 
 /// Generated from `extensions/` and pinned to a merged commit by the catalog workflow.
 const CATALOG_URL: &str =
@@ -365,6 +366,11 @@ pub enum Event {
 		id: String,
 		output: Output,
 	},
+	/// A `journal` action finished; `more` when entries remain for another delivery.
+	JournalDelivered {
+		id: String,
+		more: bool,
+	},
 	LoggedOut,
 }
 
@@ -372,17 +378,50 @@ pub enum Event {
 /// the `database` grant, the plugin's own SQLite file.
 pub struct SystemImports {
 	database: Option<SharedDatabase>,
+	journal: Option<SharedJournal>,
 }
 
 type SharedDatabase = Arc<std::sync::Mutex<PluginDatabase>>;
+type SharedJournal = Arc<std::sync::Mutex<JournalSession>>;
+
+/// Work an invocation's host services did that the host keeps only once it accepts the
+/// output: the plugin's database first, then its journal position, so a crash in between
+/// redelivers entries instead of losing them.
+#[derive(Default)]
+struct Pending {
+	database: Option<SharedDatabase>,
+	journal: Option<SharedJournal>,
+}
+
+impl Pending {
+	fn commit(self) -> Result<(), String> {
+		if let Some(database) = self.database {
+			database
+				.lock()
+				.map_err(|_| "Plugin database is unavailable".to_string())?
+				.commit()?;
+		}
+		if let Some(journal) = self.journal {
+			journal
+				.lock()
+				.map_err(|_| "Message journal is unavailable".to_string())?
+				.commit()?;
+		}
+		Ok(())
+	}
+
+	fn journal_more(&self) -> bool {
+		self.journal
+			.as_ref()
+			.and_then(|journal| journal.lock().ok().map(|journal| journal.more()))
+			.unwrap_or(false)
+	}
+}
 
 impl SystemImports {
 	/// Services for one invocation of `stored`, installed in `directory`, plus the database
 	/// session the caller commits once the invocation's output has been accepted.
-	fn for_plugin(
-		stored: &Stored,
-		directory: Option<&Path>,
-	) -> (Box<Self>, Option<SharedDatabase>) {
+	fn for_plugin(stored: &Stored, directory: Option<&Path>) -> (Box<Self>, Pending) {
 		let database = directory
 			.filter(|_| stored.grants.contains(&Capability::Database))
 			.map(|directory| {
@@ -390,22 +429,26 @@ impl SystemImports {
 					directory.join(database::FILE_NAME),
 				)))
 			});
+		// Only account plugins have a journal: it lives beside them in the account scope.
+		let journal = directory
+			.filter(|_| {
+				stored.grants.contains(&Capability::MessageJournal)
+					&& !is_proxy(&stored.package.manifest)
+			})
+			.and_then(Path::parent)
+			.map(|scope| {
+				Arc::new(std::sync::Mutex::new(JournalSession::new(
+					scope.join(journal::FILE_NAME),
+					stored.package.manifest.id.clone(),
+				)))
+			});
 		(
 			Box::new(Self {
 				database: database.clone(),
+				journal: journal.clone(),
 			}),
-			database,
+			Pending { database, journal },
 		)
-	}
-}
-
-fn commit(database: Option<SharedDatabase>) -> Result<(), String> {
-	match database {
-		Some(database) => database
-			.lock()
-			.map_err(|_| "Plugin database is unavailable".to_string())?
-			.commit(),
-		None => Ok(()),
 	}
 }
 
@@ -423,6 +466,15 @@ impl extensions::HostImports for SystemImports {
 		match &self.database {
 			Some(database) => match database.lock() {
 				Ok(mut database) => database.execute(request),
+				Err(_) => extensions::Reply::Unavailable,
+			},
+			None => extensions::Reply::Unavailable,
+		}
+	}
+	fn journal_read(&mut self, max_entries: u32) -> extensions::Reply {
+		match &self.journal {
+			Some(journal) => match journal.lock() {
+				Ok(mut journal) => journal.read(max_entries),
 				Err(_) => extensions::Reply::Unavailable,
 			},
 			None => extensions::Reply::Unavailable,
@@ -479,6 +531,11 @@ impl ExtensionHost {
 		self.queue.push_back((token, job));
 		self.start_next();
 		Ok(token)
+	}
+
+	/// The message journal shared by `account`'s plugins.
+	pub fn journal_path(&self, account: &str) -> Result<PathBuf, String> {
+		Ok(scope(&self.root, ExtensionKind::Plugin, Some(account))?.join(journal::FILE_NAME))
 	}
 
 	pub fn busy(&self) -> bool {
@@ -605,7 +662,7 @@ impl Stored {
 		let mut result = activation.map_or(Ok(extensions::Output::default()), |action| {
 			validate_grants(&self.package.manifest, &self.grants)?;
 			gate.check()?;
-			let (services, database) = SystemImports::for_plugin(self, directory);
+			let (services, pending) = SystemImports::for_plugin(self, directory);
 			let output = extensions::invoke_with(
 				&self.package,
 				&Invocation {
@@ -638,7 +695,7 @@ impl Stored {
 				return Err("Start screen customization was not granted".into());
 			}
 			gate.check()?;
-			commit(database)?;
+			pending.commit()?;
 			Ok(output)
 		});
 		let background_image = if active {
@@ -985,7 +1042,14 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Plugin input exceeds 256 KiB".into());
 			}
 			gate.check()?;
-			let (services, database) = SystemImports::for_plugin(&stored, Some(&directory));
+			let journal_action =
+				stored.package.manifest.actions.iter().any(|action| {
+					action.id == invocation.action && action.surface == Surface::Journal
+				});
+			if journal_action && !stored.grants.contains(&Capability::MessageJournal) {
+				return Err("Plugin access was not granted".into());
+			}
+			let (services, pending) = SystemImports::for_plugin(&stored, Some(&directory));
 			let mut output =
 				extensions::invoke_with(&stored.package, &invocation, &stored.grants, services)
 					.map_err(|e| e.to_string())?;
@@ -1015,9 +1079,13 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Plugin data exceeds its granted storage budget".into());
 			}
 			gate.check()?;
-			commit(database)?;
+			let more = pending.journal_more();
+			pending.commit()?;
 			if let Some(data) = data {
 				atomic_write(&directory.join("data.json"), data.as_bytes(), gate)?;
+			}
+			if journal_action {
+				return Ok(Event::JournalDelivered { id, more });
 			}
 			Ok(Event::Invoked { id, output })
 		}
@@ -2280,6 +2348,123 @@ mod tests {
 		)
 		.unwrap();
 		assert!(!directory.exists());
+	}
+
+	/// A journal plugin that reads one entry per delivery and returns `output`.
+	fn journal_plugin(output: &str) -> Package {
+		let escaped: String = output.bytes().map(|b| format!("\\{b:02x}")).collect();
+		let wasm = wat::parse_str(format!(
+			r#"(module
+			(import "serein" "journal_read" (func $read (param i32) (result i32)))
+			(memory (export "memory") 1)
+			(data (i32.const 4096) "{escaped}")
+			(func (export "serein_alloc") (param i32) (result i32) (i32.const 8192))
+			(func (export "serein_invoke") (param i32 i32) (result i64)
+				(drop (call $read (i32.const 1)))
+				(i64.const {})))"#,
+			(4096_u64 << 32) | output.len() as u64,
+		))
+		.unwrap();
+		Package {
+			manifest: Manifest {
+				api_version: extensions::API_VERSION,
+				id: "journal-plugin".into(),
+				name: "Journal plugin".into(),
+				version: "1.0.0".into(),
+				author: "Synthetic test".into(),
+				license: "MIT".into(),
+				source: "https://github.com/example/plugin".into(),
+				kind: ExtensionKind::Plugin,
+				capabilities: vec![Capability::MessageJournal],
+				actions: vec![extensions::Action {
+					id: "journal".into(),
+					label: "Journal".into(),
+					surface: Surface::Journal,
+				}],
+			},
+			theme: None,
+			background_image: Vec::new(),
+			cover_image: Vec::new(),
+			wasm,
+		}
+	}
+
+	#[test]
+	fn journal_cursor_moves_only_for_accepted_deliveries() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let install = |package: &Package| {
+			enable(
+				&root,
+				source(&profile, package),
+				vec![Capability::MessageJournal],
+				Some("account"),
+				&gate(),
+			)
+			.unwrap()
+		};
+		install(&journal_plugin("{}"));
+		let path = scope(&root, ExtensionKind::Plugin, Some("account"))
+			.unwrap()
+			.join(journal::FILE_NAME);
+		let recorder =
+			journal::Recorder::open(path.clone(), vec!["journal-plugin".into()], Arc::new(|| {}));
+		recorder.record(
+			["one", "two"]
+				.map(|text| journal::Record::Entry {
+					body: serde_json::json!({ "kind": "create", "text": text }).to_string(),
+					latest: None,
+				})
+				.into(),
+		);
+		drop(recorder);
+		let deliver = || {
+			run(
+				&root,
+				Job::Invoke {
+					id: "journal-plugin".into(),
+					account: "account".into(),
+					invocation: Invocation {
+						action: "journal".into(),
+						..Default::default()
+					},
+				},
+				&gate(),
+			)
+		};
+		let unread = || {
+			let mut session = JournalSession::new(path.clone(), "journal-plugin".into());
+			match session.read(256) {
+				extensions::Reply::Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+					.unwrap()["entries"]
+					.as_array()
+					.unwrap()
+					.len(),
+				_ => panic!("journal read failed"),
+			}
+		};
+		assert_eq!(unread(), 2);
+		// Output the host rejects (storage without its grant) leaves the cursor in place.
+		install(&journal_plugin(r#"{"storage":"x"}"#));
+		assert!(deliver().is_err());
+		assert_eq!(unread(), 2);
+		install(&journal_plugin("{}"));
+		assert!(matches!(
+			deliver(),
+			Ok(Event::JournalDelivered { more: true, .. })
+		));
+		assert_eq!(unread(), 1);
+		assert!(matches!(
+			deliver(),
+			Ok(Event::JournalDelivered { more: false, .. })
+		));
+		assert_eq!(unread(), 0);
+		// Without the grant, the journal action does not run.
+		let package_path = path.with_file_name("journal-plugin").join("package.json");
+		let mut stored = read_stored(&package_path).unwrap();
+		stored.grants.clear();
+		fs::write(&package_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+		assert!(deliver().is_err());
 	}
 
 	#[test]

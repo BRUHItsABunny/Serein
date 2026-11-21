@@ -53,6 +53,7 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			Kind::RandomFill | Kind::DbExecute | Kind::ResultRead => {
 				FuncType::new([ValType::I32, ValType::I32], [ValType::I32])
 			}
+			Kind::JournalRead => FuncType::new([ValType::I32], [ValType::I32]),
 		};
 		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
 			return Err(Error::Module);
@@ -128,6 +129,29 @@ fn charge(caller: &mut Caller<'_, HostState>, bytes: u64) -> Result<(), wasmi::E
 	caller.set_fuel(fuel - cost)
 }
 
+/// Keeps a variable-size reply pending for `result_read`, charging its bytes now so the read
+/// only charges a call; returns the reply length or a status code.
+fn hold(caller: &mut Caller<'_, HostState>, reply: Reply) -> Result<i32, wasmi::Error> {
+	let (code, bytes) = match reply {
+		Reply::Ok(bytes) if bytes.len() <= imports::MAX_REPLY_BYTES => (bytes.len() as i32, bytes),
+		Reply::Ok(_) => (
+			status::FAILED,
+			b"Result exceeds 256 KiB; select fewer rows or columns".to_vec(),
+		),
+		Reply::Failed(message) => {
+			let mut end = message.len().min(imports::MAX_ERROR_BYTES);
+			while !message.is_char_boundary(end) {
+				end -= 1;
+			}
+			(status::FAILED, message.as_bytes()[..end].to_vec())
+		}
+		Reply::Unavailable => return Ok(status::UNAVAILABLE),
+	};
+	charge(caller, bytes.len() as u64)?;
+	caller.data_mut().pending = Some(bytes);
+	Ok(code)
+}
+
 fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 	let mut linker = Linker::new(engine);
 	let module = imports::IMPORT_MODULE;
@@ -185,27 +209,27 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 				exported_memory(&caller)?
 					.read(&caller, pointer, &mut request)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
-				let (code, reply) = match caller.data_mut().services.db_execute(&request) {
-					Reply::Ok(bytes) if bytes.len() <= imports::MAX_REPLY_BYTES => {
-						(bytes.len() as i32, bytes)
-					}
-					Reply::Ok(_) => (
-						status::FAILED,
-						b"Result exceeds 256 KiB; select fewer rows or columns".to_vec(),
-					),
-					Reply::Failed(message) => {
-						let mut end = message.len().min(imports::MAX_ERROR_BYTES);
-						while !message.is_char_boundary(end) {
-							end -= 1;
-						}
-						(status::FAILED, message.as_bytes()[..end].to_vec())
-					}
-					Reply::Unavailable => return Ok(status::UNAVAILABLE),
+				let reply = caller.data_mut().services.db_execute(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"journal_read",
+			|mut caller: Caller<'_, HostState>, max: i32| {
+				caller.data_mut().pending = None;
+				let Some(max) = u32::try_from(max)
+					.ok()
+					.filter(|max| (1..=imports::MAX_JOURNAL_ENTRIES).contains(max))
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
 				};
-				// The reply is charged here, so `result_read` only charges a call.
-				charge(&mut caller, reply.len() as u64)?;
-				caller.data_mut().pending = Some(reply);
-				Ok(code)
+				charge(&mut caller, 0)?;
+				let reply = caller.data_mut().services.journal_read(max);
+				hold(&mut caller, reply)
 			},
 		)
 		.map_err(|_| Error::Execution)?;

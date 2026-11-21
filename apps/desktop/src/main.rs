@@ -5583,6 +5583,9 @@ impl Desktop {
 				self.notifications.dismiss();
 			}
 			let data_changes = extension_host::data_events::Changes::capture(&self.state, &event);
+			let journal_records = self.extensions.journal_capture(&self.state, &event);
+			let session_started = event.generation == self.state.generation
+				&& matches!(event.event, Event::Ready { .. } | Event::Resync);
 			let extension_events = if self.extensions.has_message_events(&self.state) {
 				extension_host::message_events::capture(&self.state, &event.event)
 			} else {
@@ -5604,6 +5607,8 @@ impl Desktop {
 					.push(ui::design::Level::Info, ui::i18n::translate(message));
 			}
 			self.extensions.data_changed(data_changes);
+			self.extensions
+				.journal_record(&self.state, journal_records, session_started);
 			self.extensions.cancel_stale_message_events(&self.state);
 			for candidate in extension_events {
 				if let Some(event) = candidate.admit(&self.state) {

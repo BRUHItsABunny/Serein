@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 61 capabilities, with at most 64 distinct declarations per manifest.
+supports 62 capabilities, with at most 64 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -179,6 +179,7 @@ supports 61 capabilities, with at most 64 distinct declarations per manifest.
 | `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
 | `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
 | `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB file |
+| `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -500,7 +501,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 61 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 64 distinct | Only the 62 supported capability names are currently accepted. |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
@@ -541,6 +542,7 @@ granted by the user:
 | `clock_now_ms` | `() -> i64` | `clock` | Unix time in milliseconds, or `-1` when unavailable |
 | `random_fill` | `(ptr: i32, len: i32) -> i32` | `random` | Writes `len` (0-4,096) secure random bytes at `ptr`; `0` success, `-1` invalid length, `-2` unavailable |
 | `db_execute` | `(ptr: i32, len: i32) -> i32` | `database` | Runs one JSON request of at most 256 KiB; the pending reply's length, `-3` with a pending error message of at most 1 KiB, `-1` invalid length, `-2` unavailable |
+| `journal_read` | `(max: i32) -> i32` | `message_journal` | Reads 1-256 entries after the plugin's journal position; the pending reply's length, `-3` with a pending error, `-1` invalid count, `-2` unavailable |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -589,6 +591,50 @@ cannot run `BEGIN`, `COMMIT` or `ROLLBACK`, but `SAVEPOINT`, `RELEASE` and
 Foreign keys are enforced. Serein's bundled SQLite has no full-text search or
 R-tree modules. SQL errors are returned to the plugin as text; they never contain
 host paths.
+
+## Message journal (preview)
+
+A plugin granted `message_journal` declares one action with `surface: "journal"`.
+Serein then records every message create, edit and delete the account receives from
+the gateway, in every conversation it can read including DMs, to a journal shared by
+the account's journal plugins. The host invokes the `journal` action whenever entries
+are waiting; the action reads them with `serein.journal_read`
+(`serein_extension_sdk::host::journal::read`) and may return only `storage`.
+
+Delivery is at least once. Each plugin has a position in the journal that moves only
+when the invocation succeeds and its output is accepted, immediately after the
+plugin's database commits. A failed, cancelled or rejected invocation sees the same
+entries again, so entries should be stored idempotently (by `seq` or message ID).
+
+| Entry `kind` | Fields | Meaning |
+| --- | --- | --- |
+| `create` | `channel_id`, `guild_id`, `message` | A new message |
+| `update` | `channel_id`, `guild_id`, `message_id`, changed `content` / `edited_at_ms` / `attachments`, `previous` | An edit. Embed refreshes and reactions are not journaled. |
+| `delete` | `channel_id`, `guild_id`, `message_id`, `bulk`, `previous` | A deletion, one entry per ID of a bulk delete |
+| `gap` | `reason`: `overflow` with `dropped`, or `pruned` with `from_seq` / `to_seq` | Entries were lost: the host fell behind, or the journal's bounds removed entries before this plugin read them |
+| `session_started` | none | A new gateway session began; anything while disconnected or closed is not journaled |
+| `missed` | `channel_id`, `after_message_id`, `latest_message_id` | At a new session, a channel's latest message is newer than the last one journaled |
+| `channel_changed` | `channel_id` | A channel was created or its details changed |
+| `access_changed` | none | Which conversations the account can read may have changed |
+
+Every entry also has `seq` (increasing, never reused) and `at_ms` (when the host
+recorded it). Newer hosts may add kinds; ignore unknown ones.
+
+A `message` holds `id`, `author` (`id`, `name`, `nick`, `bot`, `webhook`), `content`,
+`created_at_ms`, `edited_at_ms`, `type`, `flags`, `reply_to`, `forwarded`, embed and
+sticker counts, and `attachments` (`id`, `filename`, `content_type`, `size`, `url`,
+`proxy_url`). An entry over 64 KiB drops attachment details and sets `truncated`.
+
+`previous` is the version Serein held in memory: the open conversation's loaded
+messages. For other conversations it is `null`; a plugin that stores each `create`
+already has the earlier text. History pages, search results and messages sent before
+the plugin was enabled are not journaled.
+
+Bounds: the journal keeps at most 100,000 unread entries or 64 MiB, pruning the oldest
+into a `pruned` gap; up to 1,024 records wait for the writer before an `overflow` gap.
+Entries every consumer has read are deleted. Nothing is recorded while no enabled
+plugin consumes the journal, and a plugin enabled later starts with new entries.
+Disabling a plugin removes its position; logging out removes the account's journal.
 
 ## API proxy plugin (preview)
 

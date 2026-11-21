@@ -26,6 +26,8 @@ pub const MAX_DB_REQUEST_BYTES: u32 = 256 * 1024;
 pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 /// Largest error message a failed call leaves pending.
 pub const MAX_ERROR_BYTES: usize = 1024;
+/// Most entries one `journal_read` call returns.
+pub const MAX_JOURNAL_ENTRIES: u32 = 256;
 
 /// Status codes host functions return as `i32`. Zero or more is success.
 pub mod status {
@@ -51,6 +53,9 @@ pub(crate) enum Kind {
 	/// `(ptr: i32, cap: i32) -> i32`: copies the pending reply when it fits in `cap` bytes and
 	/// clears it; the copied length, or [`status::INVALID`].
 	ResultRead,
+	/// `(max: i32) -> i32`: reads up to `max` journal entries after the plugin's cursor; the
+	/// pending reply's length, or a [`status`] code.
+	JournalRead,
 }
 
 /// One importable host function.
@@ -85,6 +90,11 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		capability: None,
 		kind: Kind::ResultRead,
 	},
+	HostImport {
+		name: "journal_read",
+		capability: Some(Capability::MessageJournal),
+		kind: Kind::JournalRead,
+	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
@@ -112,6 +122,12 @@ pub trait HostImports: Send {
 	/// Runs one database request, `{"sql": "...", "params": [...]}` as JSON, against the
 	/// plugin's own database.
 	fn db_execute(&mut self, _request: &[u8]) -> Reply {
+		Reply::Unavailable
+	}
+	/// Reads up to `max_entries` message journal entries after the plugin's cursor, as
+	/// `{"entries": [...], "more": bool}` JSON. The cursor advances only when the host
+	/// accepts the invocation.
+	fn journal_read(&mut self, _max_entries: u32) -> Reply {
 		Reply::Unavailable
 	}
 }

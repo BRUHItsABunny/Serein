@@ -143,9 +143,10 @@ as `con` and `nul` are reserved. Themes declare no actions or capabilities.
 | `message_event` | Accepted live message change | `message_events`; receives one typed event. |
 | `app_event` | Supported app change | `app_events`; receives the reason and separately granted snapshots. |
 | `tick` | Host schedule while enabled and signed in | `appearance`; receives `tick_ms` through `TickInvocation`. |
+| `journal` | Message journal entries are waiting (preview) | `message_journal`; reads them with `host::journal::read` and may return only `storage`. |
 
 At most one action of **each** automatic surface is allowed: `activation`,
-`message_event`, `app_event` and `tick`. A capability alone does not register a handler;
+`message_event`, `app_event`, `tick` and `journal`. A capability alone does not register a handler;
 declare its action too.
 
 ### Scheduled appearance ticks

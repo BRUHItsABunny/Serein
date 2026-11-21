@@ -31,6 +31,8 @@ struct Pending {
 	preview: Option<(String, String)>,
 	invocation: Option<(String, Invocation, ExtensionContext)>,
 	tick: Option<String>,
+	/// The plugin a `journal` delivery runs for.
+	journal: Option<String>,
 }
 impl Pending {
 	fn reactive(&self) -> bool {
@@ -118,6 +120,8 @@ fn parse_rgb_hex(text: &str) -> Option<[u8; 3]> {
 const MAX_MESSAGE_EVENTS: usize = 32;
 const MAX_MESSAGE_EVENT_BYTES: usize = 64 * 1024;
 const MESSAGE_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+/// Shortest pause between two message journal deliveries.
+const JOURNAL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// `interface` is the plugin's last restated interface; with the invocation it picks the
 /// channel directory's focus server.
@@ -216,6 +220,13 @@ pub struct Bridge {
 	/// The interface last handed to the UI, so an unchanged tree is not re-published
 	/// (deep-copied) every frame.
 	published_interface: Option<ui::PluginInterface>,
+	/// The account's message journal writer, open while an installed plugin consumes it.
+	journal: Option<extension_host::journal::Recorder>,
+	/// Installed journal consumers, each with a cursor in the journal.
+	journal_consumers: Vec<String>,
+	/// Consumers with entries to deliver.
+	journal_due: BTreeSet<String>,
+	journal_at: Option<Instant>,
 }
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
@@ -566,13 +577,186 @@ impl Bridge {
 			host.cancel();
 		}
 	}
+	/// Journal records for `event`, captured before the reducer applies it so edits and
+	/// deletes can carry the version the timeline holds. Empty unless a plugin consumes the
+	/// journal in the current account.
+	pub fn journal_capture(
+		&self,
+		state: &State,
+		event: &client_core::Envelope,
+	) -> Vec<extension_host::journal::Record> {
+		if self.journal.is_none()
+			|| event.generation != state.generation
+			|| !self.scope_current(state)
+		{
+			return Vec::new();
+		}
+		extension_host::journal::capture(state, &event.event)
+	}
+	/// Queues captured records, plus a new session's channel positions once the reducer
+	/// applied it.
+	pub fn journal_record(
+		&mut self,
+		state: &State,
+		mut records: Vec<extension_host::journal::Record>,
+		session_started: bool,
+	) {
+		let Some(journal) = &self.journal else {
+			return;
+		};
+		if session_started && self.scope_current(state) {
+			records.extend(extension_host::journal::capture_after(
+				state,
+				&client_core::Event::Resync,
+			));
+		}
+		if !records.is_empty() {
+			journal.record(records);
+		}
+	}
+	fn journal_action(entry: &InstalledExtension) -> Option<&str> {
+		if !entry
+			.manifest
+			.capabilities
+			.contains(&Capability::MessageJournal)
+		{
+			return None;
+		}
+		entry
+			.manifest
+			.actions
+			.iter()
+			.find(|action| action.surface == Surface::Journal)
+			.map(|action| action.id.as_str())
+	}
+	/// Keeps the journal writer and its consumer cursors in step with the installed plugins,
+	/// and starts one delivery when entries are due.
+	fn journal(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let generation = state.generation;
+		let consumers: Vec<String> = if account.is_some() && self.start_screen_loaded {
+			self.installed
+				.iter()
+				.filter(|entry| Self::journal_action(entry).is_some())
+				.map(|entry| entry.manifest.id.clone())
+				.collect()
+		} else {
+			Vec::new()
+		};
+		if consumers != self.journal_consumers {
+			if consumers.is_empty() {
+				self.journal = None;
+			} else if let Some(account) = account {
+				match &self.journal {
+					Some(journal) => journal.set_consumers(consumers.clone()),
+					None => match self.host.as_ref().unwrap().journal_path(account) {
+						Ok(path) => {
+							let recorder = extension_host::journal::Recorder::open(
+								path,
+								consumers.clone(),
+								repaint(ctx),
+							);
+							// The session's Ready usually arrived before the plugins loaded.
+							recorder.record(extension_host::journal::opened(state));
+							self.journal = Some(recorder);
+						}
+						Err(error) => messaging.extensions.report_error(error),
+					},
+				}
+			}
+			self.journal_due = consumers.iter().cloned().collect();
+			self.journal_consumers = consumers;
+		}
+		let Some(journal) = &self.journal else {
+			self.journal_due.clear();
+			return;
+		};
+		if journal.take_appended() {
+			self.journal_due
+				.extend(self.journal_consumers.iter().cloned());
+		}
+		let Some(account) = account else {
+			return;
+		};
+		let wait = self.journal_at.map_or(Duration::ZERO, |at| {
+			JOURNAL_INTERVAL.saturating_sub(at.elapsed())
+		});
+		if self.journal_due.is_empty()
+			|| self.host.as_ref().unwrap().busy()
+			|| !self.message_events.is_empty()
+			|| self
+				.pending
+				.values()
+				.any(|pending| pending.journal.is_some())
+		{
+			return;
+		}
+		if !wait.is_zero() {
+			ctx.request_repaint_after(wait);
+			return;
+		}
+		let disabled = &self.disabled;
+		let Some((id, action)) = self.journal_due.iter().find_map(|id| {
+			self.installed
+				.iter()
+				.find(|entry| {
+					entry.manifest.id == *id && entry.error.is_none() && !disabled.contains(id)
+				})
+				.and_then(|entry| Some((id.clone(), Self::journal_action(entry)?.to_owned())))
+		}) else {
+			// Due consumers that cannot run now keep their cursor and wait for new entries.
+			self.journal_due.clear();
+			return;
+		};
+		self.journal_due.remove(&id);
+		self.journal_at = Some(Instant::now());
+		let job = Job::Invoke {
+			id: id.clone(),
+			account: account.clone(),
+			invocation: Invocation {
+				action,
+				..Default::default()
+			},
+		};
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
+			Ok(token) => {
+				self.pending.insert(
+					token,
+					Pending {
+						catalog: false,
+						theme_save: false,
+						generation,
+						cleanup: false,
+						reconcile: false,
+						preview: None,
+						invocation: None,
+						tick: None,
+						journal: Some(id),
+					},
+				);
+			}
+			Err(error) => messaging.extensions.report_error(error),
+		}
+	}
 	pub fn cleanup_pending(&self) -> bool {
 		// Start-screen writes are waited out too, so closing cannot cut one short.
 		self.pending.values().any(|pending| pending.cleanup) || self.start_screen.pending()
 	}
+	/// Stops the journal writer after it wrote what was queued; the next scope reopens it.
+	fn close_journal(&mut self) {
+		self.journal = None;
+		self.journal_consumers.clear();
+		self.journal_due.clear();
+	}
 	/// Drops account-scoped plugin state, including queued events, presence and interface tweaks,
 	/// and logs the plugin host out of the account's data.
 	pub fn logout(&mut self, ctx: &egui::Context) -> Result<(), String> {
+		self.close_journal();
 		self.message_events.clear();
 		self.app_key = None;
 		self.app_context_changed = false;
@@ -618,6 +802,7 @@ impl Bridge {
 						preview: None,
 						invocation: None,
 						tick: None,
+						journal: None,
 					},
 				);
 			}
@@ -657,6 +842,7 @@ impl Bridge {
 		}
 		let scope = (state.generation, account.clone());
 		if self.scope.as_ref() != Some(&scope) {
+			self.close_journal();
 			self.message_events.clear();
 			self.app_key = None;
 			self.app_context_changed = false;
@@ -756,6 +942,17 @@ impl Bridge {
 				continue;
 			}
 			match outcome {
+				Err(error) if pending.as_ref().is_some_and(|p| p.journal.is_some()) => {
+					// The cursor did not move; the entries are delivered again with the next ones.
+					let id = pending.and_then(|p| p.journal).unwrap_or_default();
+					messaging.extensions.status =
+						format!("{id} could not process the message journal. {error}");
+				}
+				Ok(Event::JournalDelivered { id, more }) => {
+					if more {
+						self.journal_due.insert(id);
+					}
+				}
 				Err(error) => {
 					if let Some(id) = pending.as_ref().and_then(|pending| pending.tick.as_ref()) {
 						if let Some(schedule) = self.ticks.get_mut(id) {
@@ -1498,6 +1695,7 @@ impl Bridge {
 			}
 		}
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
+		self.journal(&account, state, ctx, messaging);
 	}
 	fn schedule_ticks(
 		&mut self,
@@ -1583,6 +1781,7 @@ impl Bridge {
 								preview: None,
 								invocation: None,
 								tick: Some(id),
+								journal: None,
 							},
 						);
 					}
@@ -1668,6 +1867,7 @@ impl Bridge {
 						generation,
 						invocation,
 						tick: None,
+						journal: None,
 					},
 				);
 			}
@@ -1982,6 +2182,7 @@ mod tests {
 				preview: None,
 				invocation: None,
 				tick: Some("rainbow".into()),
+				journal: None,
 			},
 		);
 		assert!(bridge.tick_pending(7, "rainbow"));

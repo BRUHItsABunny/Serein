@@ -2138,3 +2138,19 @@ Disabling the plugin or logging out removes the file together with the directory
 Updating the plugin keeps it. The file is not encrypted and must not hold
 credentials. A failed open, a full file or an exhausted SQLite budget is reported to
 the plugin, and the invocation's changes are discarded.
+
+## Message journal (preview, November 21, 2026)
+
+While an enabled plugin in the current account holds `message_journal`, Serein records
+live gateway message creates, edits and deletes for every readable conversation, plus
+session, gap and channel hints, to `journal.sqlite` in the account's extension
+directory (WAL mode). Records are built on the UI thread without I/O and passed to one
+writer thread through a 1,024-record queue. A full queue or a failed write becomes an
+`overflow` gap instead of blocking. Entries hold message text, author IDs and names, and
+attachment names and URLs. Edits and deletes carry the earlier version only when it
+was loaded in memory. Each entry is at most 64 KiB, and the journal at most 100,000
+unread entries / 64 MiB, pruning the oldest into a gap.
+Entries every consuming plugin has read are deleted at the next write; a channel table
+keeps the latest journaled message ID for at most 10,000 channels to report `missed`
+entries. Nothing is recorded without a consumer. Disabling a plugin drops its cursor,
+and logout removes the file with the account's extension directory. Not encrypted.
