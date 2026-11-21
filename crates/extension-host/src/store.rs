@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::database::{self, PluginDatabase};
 use crate::journal::{self, JournalSession};
+use crate::network::PluginNetwork;
 
 /// Generated from `extensions/` and pinned to a merged commit by the catalog workflow.
 const CATALOG_URL: &str =
@@ -411,6 +412,7 @@ pub enum Event {
 pub struct SystemImports {
 	database: Option<SharedDatabase>,
 	journal: Option<SharedJournal>,
+	network: Option<PluginNetwork>,
 }
 
 type SharedDatabase = Arc<std::sync::Mutex<PluginDatabase>>;
@@ -453,7 +455,7 @@ impl Pending {
 impl SystemImports {
 	/// Services for one invocation of `stored`, installed in `directory`, plus the database
 	/// session the caller commits once the invocation's output has been accepted.
-	fn for_plugin(stored: &Stored, directory: Option<&Path>) -> (Box<Self>, Pending) {
+	fn for_plugin(stored: &Stored, directory: Option<&Path>, gate: &Gate) -> (Box<Self>, Pending) {
 		let database = directory
 			.filter(|_| stored.grants.contains(&Capability::Database))
 			.map(|directory| {
@@ -479,6 +481,10 @@ impl SystemImports {
 			Box::new(Self {
 				database: database.clone(),
 				journal: journal.clone(),
+				network: stored
+					.grants
+					.contains(&Capability::Network)
+					.then(|| PluginNetwork::new(&stored.package.manifest.network, gate.clone())),
 			}),
 			Pending { database, journal },
 		)
@@ -501,6 +507,12 @@ impl extensions::HostImports for SystemImports {
 				Ok(mut database) => database.execute(request),
 				Err(_) => extensions::Reply::Unavailable,
 			},
+			None => extensions::Reply::Unavailable,
+		}
+	}
+	fn https_request(&mut self, request: &[u8]) -> extensions::Reply {
+		match &mut self.network {
+			Some(network) => network.request(request),
 			None => extensions::Reply::Unavailable,
 		}
 	}
@@ -640,21 +652,23 @@ impl Drop for ExtensionHost {
 	}
 }
 
-struct Gate {
+/// The job's cancellation state: it fails once the host's generation moves on.
+#[derive(Clone)]
+pub(crate) struct Gate {
 	epoch: u64,
 	generation: Arc<AtomicU64>,
-	wake_cancel: Arc<tokio::sync::Notify>,
+	pub(crate) wake_cancel: Arc<tokio::sync::Notify>,
 }
 impl Gate {
 	/// A gate no job cancellation reaches, for device files written outside the job queue.
-	fn detached() -> Self {
+	pub(crate) fn detached() -> Self {
 		Self {
 			epoch: 0,
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::new(tokio::sync::Notify::new()),
 		}
 	}
-	fn check(&self) -> Result<(), String> {
+	pub(crate) fn check(&self) -> Result<(), String> {
 		if self.epoch == self.generation.load(Ordering::Acquire) {
 			Ok(())
 		} else {
@@ -695,7 +709,7 @@ impl Stored {
 		let mut result = activation.map_or(Ok(extensions::Output::default()), |action| {
 			validate_grants(&self.package.manifest, &self.grants)?;
 			gate.check()?;
-			let (services, pending) = SystemImports::for_plugin(self, directory);
+			let (services, pending) = SystemImports::for_plugin(self, directory, gate);
 			let output = extensions::invoke_with(
 				&self.package,
 				&Invocation {
@@ -1123,7 +1137,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			if journal_action && !stored.grants.contains(&Capability::MessageJournal) {
 				return Err("Plugin access was not granted".into());
 			}
-			let (services, pending) = SystemImports::for_plugin(&stored, Some(&data));
+			let (services, pending) = SystemImports::for_plugin(&stored, Some(&data), gate);
 			let mut output =
 				extensions::invoke_with(&stored.package, &invocation, &stored.grants, services)
 					.map_err(|e| e.to_string())?;
@@ -1601,6 +1615,7 @@ fn load(
 								Vec::new()
 							},
 							actions: Vec::new(),
+							network: Vec::new(),
 						},
 						theme: None,
 						reviewed: false,
@@ -2077,7 +2092,7 @@ async fn download_https(raw: &str, limit: usize, gate: &Gate) -> Result<Vec<u8>,
 	Err("Too many extension download redirects".into())
 }
 
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
 	match ip {
 		IpAddr::V4(ip) => {
 			let [a, b, _, _] = ip.octets();
@@ -2155,6 +2170,7 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://github.com/ViceVerse-cz/rustcord".into(),
 				kind: ExtensionKind::Theme,
+				network: Vec::new(),
 				capabilities: Vec::new(),
 				actions: Vec::new(),
 			},
@@ -2447,6 +2463,7 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://github.com/example/plugin".into(),
 				kind: ExtensionKind::Plugin,
+				network: Vec::new(),
 				capabilities: vec![Capability::Database],
 				actions: vec![extensions::Action {
 					id: "run".into(),
@@ -2652,6 +2669,7 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://github.com/example/plugin".into(),
 				kind: ExtensionKind::Plugin,
+				network: Vec::new(),
 				capabilities: vec![Capability::MessageJournal],
 				actions: vec![extensions::Action {
 					id: "journal".into(),

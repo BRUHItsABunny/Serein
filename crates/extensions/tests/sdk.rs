@@ -28,6 +28,7 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: action.into(),

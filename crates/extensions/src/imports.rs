@@ -26,6 +26,8 @@ pub const MAX_DB_REQUEST_BYTES: u32 = 256 * 1024;
 pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 /// Largest error message a failed call leaves pending.
 pub const MAX_ERROR_BYTES: usize = 1024;
+/// Largest request one `https_request` call may describe.
+pub const MAX_HTTPS_REQUEST_BYTES: u32 = 256 * 1024;
 /// Most entries one `journal_read` call returns.
 pub const MAX_JOURNAL_ENTRIES: u32 = 256;
 
@@ -56,6 +58,9 @@ pub(crate) enum Kind {
 	/// `(max: i32) -> i32`: reads up to `max` journal entries after the plugin's cursor; the
 	/// pending reply's length, or a [`status`] code.
 	JournalRead,
+	/// `(ptr: i32, len: i32) -> i32`: performs one JSON-described HTTPS request to a declared
+	/// origin; the pending response's length, or a [`status`] code.
+	HttpsRequest,
 }
 
 /// One importable host function.
@@ -95,6 +100,11 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		capability: Some(Capability::MessageJournal),
 		kind: Kind::JournalRead,
 	},
+	HostImport {
+		name: "https_request",
+		capability: Some(Capability::Network),
+		kind: Kind::HttpsRequest,
+	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
@@ -128,6 +138,12 @@ pub trait HostImports: Send {
 	/// `{"entries": [...], "more": bool}` JSON. The cursor advances only when the host
 	/// accepts the invocation.
 	fn journal_read(&mut self, _max_entries: u32) -> Reply {
+		Reply::Unavailable
+	}
+	/// Performs one HTTPS request described by JSON to an origin the manifest declares, and
+	/// replies with the response as JSON. Blocks this invocation until it completes or the
+	/// host's time limit ends it.
+	fn https_request(&mut self, _request: &[u8]) -> Reply {
 		Reply::Unavailable
 	}
 }

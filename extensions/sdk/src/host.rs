@@ -26,6 +26,7 @@ mod raw {
 		pub fn db_execute(pointer: *const u8, length: i32) -> i32;
 		pub fn result_read(pointer: *mut u8, capacity: i32) -> i32;
 		pub fn journal_read(max: i32) -> i32;
+		pub fn https_request(pointer: *const u8, length: i32) -> i32;
 	}
 }
 
@@ -613,6 +614,171 @@ pub mod journal {
 			assert_eq!(batch.entries[3].kind, EntryKind::Other);
 			assert_eq!(read(0), Err(JournalError::Host(HostError::Invalid)));
 			assert_eq!(read(1), Err(JournalError::Host(HostError::Unavailable)));
+		}
+	}
+}
+
+/// HTTPS requests to the origins in the manifest's `network` list. Requires the `network`
+/// capability.
+///
+/// Each [`send`] is one request and one complete response; the invocation waits for it.
+/// The host resolves names itself and refuses non-public addresses, follows redirects only
+/// to declared origins (others come back as the 3xx response), sends no cookies and does not
+/// decompress bodies. An invocation may make 32 requests within 30 seconds; one request
+/// takes at most 15 seconds, sends at most 192 KiB and receives at most 160 KiB.
+pub mod https {
+	use super::HostError;
+	use serde::{Deserialize, Serialize};
+
+	/// One request. `body` and `body_base64` are exclusive.
+	#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+	pub struct Request {
+		pub method: String,
+		pub url: String,
+		#[serde(skip_serializing_if = "Vec::is_empty")]
+		pub headers: Vec<(String, String)>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub body: Option<String>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub body_base64: Option<String>,
+		/// At most 15,000; the host's default is 10,000.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub timeout_ms: Option<u64>,
+	}
+
+	impl Request {
+		pub fn get(url: impl Into<String>) -> Self {
+			Self {
+				method: "GET".into(),
+				url: url.into(),
+				..Default::default()
+			}
+		}
+		/// A POST with a JSON body and `Content-Type: application/json`.
+		pub fn post_json(url: impl Into<String>, body: &impl Serialize) -> Self {
+			Self {
+				method: "POST".into(),
+				url: url.into(),
+				headers: vec![("Content-Type".into(), "application/json".into())],
+				body: serde_json::to_string(body).ok(),
+				..Default::default()
+			}
+		}
+		pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+			self.headers.push((name.into(), value.into()));
+			self
+		}
+	}
+
+	/// A complete response. Text bodies arrive in `body`, others in `body_base64`.
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+	pub struct Response {
+		pub status: u16,
+		/// The URL that answered, after declared redirects.
+		pub url: String,
+		#[serde(default)]
+		pub redirected: bool,
+		#[serde(default)]
+		pub headers: Vec<(String, String)>,
+		#[serde(default)]
+		pub body: Option<String>,
+		#[serde(default)]
+		pub body_base64: Option<String>,
+	}
+
+	impl Response {
+		/// The first header with this name, ignoring case.
+		pub fn header(&self, name: &str) -> Option<&str> {
+			self.headers
+				.iter()
+				.find(|(key, _)| key.eq_ignore_ascii_case(name))
+				.map(|(_, value)| value.as_str())
+		}
+		/// Parses a text body as JSON.
+		pub fn json<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+			serde_json::from_str(self.body.as_deref()?).ok()
+		}
+	}
+
+	/// Why a request did not produce a response.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub enum HttpsError {
+		Host(HostError),
+		/// The host refused or could not complete the request: an undeclared origin, a
+		/// private address, a timeout, a limit or a connection failure. At most 1 KiB.
+		Failed(String),
+		/// The host's reply could not be decoded.
+		Reply,
+	}
+
+	/// Sends `request` and waits for its response.
+	pub fn send(request: &Request) -> Result<Response, HttpsError> {
+		let bytes = serde_json::to_vec(request).map_err(|_| HttpsError::Reply)?;
+		if bytes.len() > 256 * 1024 {
+			return Err(HttpsError::Host(HostError::Invalid));
+		}
+		serde_json::from_slice(&call(&bytes)?).map_err(|_| HttpsError::Reply)
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn call(request: &[u8]) -> Result<Vec<u8>, HttpsError> {
+		// SAFETY: the host reads `request.len()` bytes from this live buffer.
+		let code = unsafe { super::raw::https_request(request.as_ptr(), request.len() as i32) };
+		let (capacity, failed) = match code {
+			0.. => (code as usize, false),
+			-3 => (1024, true),
+			-1 => return Err(HttpsError::Host(HostError::Invalid)),
+			_ => return Err(HttpsError::Host(HostError::Unavailable)),
+		};
+		let mut reply = vec![0_u8; capacity];
+		// SAFETY: the host writes at most `capacity` bytes into this exclusive buffer.
+		let read = unsafe { super::raw::result_read(reply.as_mut_ptr(), capacity as i32) };
+		if read < 0 {
+			return Err(HttpsError::Reply);
+		}
+		reply.truncate(read as usize);
+		if failed {
+			Err(HttpsError::Failed(
+				String::from_utf8_lossy(&reply).into_owned(),
+			))
+		} else {
+			Ok(reply)
+		}
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn call(_: &[u8]) -> Result<Vec<u8>, HttpsError> {
+		Err(HttpsError::Host(HostError::Unavailable))
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn requests_and_responses_match_the_host_wire() {
+			let request =
+				Request::post_json("https://api.example.org/v1", &serde_json::json!({ "q": 1 }))
+					.header("Authorization", "Bearer x");
+			assert_eq!(
+				serde_json::to_value(&request).unwrap(),
+				serde_json::json!({
+					"method": "POST",
+					"url": "https://api.example.org/v1",
+					"headers": [["Content-Type", "application/json"], ["Authorization", "Bearer x"]],
+					"body": "{\"q\":1}",
+				})
+			);
+			let response: Response = serde_json::from_str(
+				r#"{"status":200,"url":"https://api.example.org/v1","redirected":false,"headers":[["content-type","application/json"]],"body":"{\"ok\":true}"}"#,
+			)
+			.unwrap();
+			assert_eq!(response.header("Content-Type"), Some("application/json"));
+			assert_eq!(response.json::<serde_json::Value>().unwrap()["ok"], true);
+			assert_eq!(
+				send(&Request::get("https://api.example.org")),
+				Err(HttpsError::Host(HostError::Unavailable))
+			);
 		}
 	}
 }

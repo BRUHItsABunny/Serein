@@ -2503,6 +2503,7 @@ mod tests {
 			license: "MIT".into(),
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
+			network: Vec::new(),
 			capabilities: vec![
 				Capability::InterfaceUi,
 				Capability::AppEvents,
@@ -2614,6 +2615,7 @@ mod tests {
 			license: "MIT".into(),
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
+			network: Vec::new(),
 			capabilities: vec![Capability::InterfaceUi, Capability::StartScreen],
 			actions: vec![
 				extensions::Action {

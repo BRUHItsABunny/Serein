@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod runtime;
 pub use runtime::{invoke, invoke_with};
 pub mod imports;
+pub mod network;
 pub use imports::{HostImports, NoHostImports, Reply};
 mod rich_presence;
 pub use rich_presence::*;
@@ -168,6 +169,9 @@ pub enum Capability {
 	/// Receive every message create, edit and delete the account sees, with earlier text
 	/// where the host has it, through `serein.journal_read` on a `journal` action.
 	MessageJournal,
+	/// Make HTTPS requests with `serein.https_request` to the origins in the manifest's
+	/// `network` list.
+	Network,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -268,6 +272,9 @@ pub struct Manifest {
 	pub capabilities: Vec<Capability>,
 	#[serde(default)]
 	pub actions: Vec<Action>,
+	/// HTTPS origins `serein.https_request` may reach; requires the `network` capability.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub network: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,6 +909,19 @@ impl Manifest {
 		let mut capabilities = BTreeSet::new();
 		if self.capabilities.iter().any(|c| !capabilities.insert(*c)) {
 			return Err(Error::Invalid);
+		}
+		if self.network.len() > network::MAX_ORIGINS {
+			return Err(Error::Limit);
+		}
+		let mut origins = BTreeSet::new();
+		if self.network.iter().any(|origin| {
+			network::Origin::parse(origin).is_none_or(|origin| !origins.insert(origin))
+		}) {
+			return Err(Error::Invalid);
+		}
+		// Hosts only mean something with the capability, and the capability needs hosts.
+		if capabilities.contains(&Capability::Network) == self.network.is_empty() {
+			return Err(Error::Capability);
 		}
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)

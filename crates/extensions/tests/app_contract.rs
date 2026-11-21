@@ -114,6 +114,7 @@ fn test_manifest(capabilities: Vec<Capability>) -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: "run".into(),
@@ -918,15 +919,17 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 		label: "Events".into(),
 		surface: Surface::AppEvent,
 	});
+	// The network capability is declared for specific origins.
+	supported.network = vec!["https://api.example.org".into()];
 	supported.validate().unwrap();
 	assert!(host.supports("rich_presence"));
 	assert!(host.supports("api_proxy"));
 	assert!(host.supports_import("clock_now_ms") && host.supports_import("random_fill"));
 	assert!(host.supports_import("db_execute") && host.supports_import("result_read"));
-	assert!(host.supports_import("journal_read"));
-	assert_eq!(caps.len(), 62);
+	assert!(host.supports_import("journal_read") && host.supports_import("https_request"));
+	assert_eq!(caps.len(), 63);
 	assert_eq!(HostInfo::current().app_events.len(), 21);
-	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 62);
+	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 63);
 }
 
 #[test]

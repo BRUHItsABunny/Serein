@@ -977,7 +977,8 @@ extensions-ui-consent-modal-by = 제작자
 # Context: consent_modal
 extensions-ui-consent-modal-cancel = 취소
 # Context: consent_modal
-extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = 비활성화하면 확장 기능과 로컬 데이터가 제거됩니다. 다시 활성화하면 새로 시작합니다.
+extensions-ui-consent-network-warning = 이 확장 기능이 읽을 수 있는 모든 내용이 { $hosts }(으)로 전송될 수 있습니다.
+extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = 비활성화하면 확장 기능이 제거되며, 나중에 다시 설치할 수 있도록 데이터를 보관할지 묻습니다.
 # Context: consent_modal
 extensions-ui-consent-modal-enable = 활성화
 # Context: consent_modal

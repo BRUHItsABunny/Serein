@@ -2057,6 +2057,14 @@ impl ExtensionUi {
 						for capability in &entry.manifest.capabilities {
 							ui.add(egui::Label::new(capability_label(*capability)).wrap());
 						}
+						for origin in &entry.manifest.network {
+							ui.add(
+								egui::Label::new(
+									egui::RichText::new(format!("• {origin}")).color(colors.muted),
+								)
+								.wrap(),
+							);
+						}
 					}
 					if data.is_some() || quota_editable {
 						ui.separator();
@@ -2789,11 +2797,19 @@ impl ExtensionUi {
 						colors.muted,
 					));
 					ui.spacing_mut().item_spacing.y = 8.0;
+					let hosts = consent.entry.manifest.network.join(", ");
 					for capability in &consent.entry.manifest.capabilities {
 						let mut granted = consent.grants.contains(capability);
-						let changed =
-							design::switch(ui, capability_label(*capability), None, &mut granted)
-								.changed();
+						// The user approves the network capability for these exact servers.
+						let description =
+							(*capability == Capability::Network).then_some(hosts.as_str());
+						let changed = design::switch(
+							ui,
+							capability_label(*capability),
+							description,
+							&mut granted,
+						)
+						.changed();
 						if changed {
 							if granted {
 								consent.grants.push(*capability);
@@ -2802,6 +2818,16 @@ impl ExtensionUi {
 							}
 						}
 					}
+				}
+				if !consent.entry.manifest.network.is_empty() {
+					design::notice(
+						ui,
+						design::Level::Warning,
+						&crate::i18n::translate_args(
+							"extensions-ui-consent-network-warning",
+							&[("hosts", &consent.entry.manifest.network.join(", "))],
+						),
+					);
 				}
 				ui.label(
 					egui::RichText::new(crate::i18n::translate(
@@ -3566,6 +3592,7 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::Clock => "Read the current date and time",
 		Capability::Random => "Generate random numbers, such as unique IDs",
 		Capability::Database => "Keep a private database on this device (up to 64 MiB)",
+		Capability::Network => "Connect to the internet servers listed below",
 		Capability::MessageJournal => {
 			"Receive every message, edit and deletion in all your conversations, including earlier text of edited and deleted messages"
 		}
@@ -3914,6 +3941,7 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://example.com/source".into(),
 				kind: ExtensionKind::Plugin,
+				network: Vec::new(),
 				capabilities: vec![Capability::Composer],
 				actions: vec![],
 			},
@@ -4816,6 +4844,32 @@ mod tests {
 			);
 		}
 	}
+	#[test]
+	fn network_consent_names_the_servers_and_warns_about_data_leaving() {
+		let ctx = egui::Context::default();
+		let mut extensions = ExtensionUi::default();
+		let mut networked = entry();
+		networked.manifest.capabilities.push(Capability::Network);
+		networked.manifest.network = vec!["https://api.example.org".into()];
+		extensions.set_entries(vec![networked.clone()]);
+		extensions.offer_import(networked);
+		frame(&ctx, &mut extensions, 900.0, vec![]);
+		let labels = frame(&ctx, &mut extensions, 900.0, vec![]);
+		let text: String = labels
+			.iter()
+			.map(|(text, _)| text.as_str())
+			.collect::<Vec<_>>()
+			.join(
+				"
+",
+			);
+		assert!(text.contains(capability_label(Capability::Network)));
+		assert!(text.contains(&crate::i18n::translate_args(
+			"extensions-ui-consent-network-warning",
+			&[("hosts", "https://api.example.org")]
+		)));
+	}
+
 	#[test]
 	fn consent_requires_explicit_grant_and_cleanup_stays_available() {
 		for width in [320.0, 900.0] {

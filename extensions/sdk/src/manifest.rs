@@ -17,6 +17,10 @@ pub struct Manifest {
 	pub capabilities: Vec<Capability>,
 	#[serde(default)]
 	pub actions: Vec<Action>,
+	/// HTTPS origins [`crate::host::https`] may reach, such as `https://api.example.org`;
+	/// requires the `network` capability.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub network: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +101,8 @@ pub enum Capability {
 	Database,
 	/// Use [`crate::host::journal`] in a [`Surface::Journal`] action.
 	MessageJournal,
+	/// Use [`crate::host::https`] for the manifest's `network` origins.
+	Network,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

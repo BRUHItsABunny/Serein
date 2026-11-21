@@ -50,7 +50,7 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			.ok_or(Error::Module)?;
 		let expected = match host.kind {
 			Kind::ClockNowMs => FuncType::new([], [ValType::I64]),
-			Kind::RandomFill | Kind::DbExecute | Kind::ResultRead => {
+			Kind::RandomFill | Kind::DbExecute | Kind::ResultRead | Kind::HttpsRequest => {
 				FuncType::new([ValType::I32, ValType::I32], [ValType::I32])
 			}
 			Kind::JournalRead => FuncType::new([ValType::I32], [ValType::I32]),
@@ -210,6 +210,28 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					.read(&caller, pointer, &mut request)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
 				let reply = caller.data_mut().services.db_execute(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"https_request",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				caller.data_mut().pending = None;
+				let Some((pointer, length)) =
+					span(pointer, length, imports::MAX_HTTPS_REQUEST_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let mut request = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut request)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let reply = caller.data_mut().services.https_request(&request);
 				hold(&mut caller, reply)
 			},
 		)

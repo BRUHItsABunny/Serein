@@ -709,6 +709,7 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://example.org/source".into(),
 				kind: extensions::ExtensionKind::Plugin,
+				network: Vec::new(),
 				capabilities: vec![Capability::InterfaceUi],
 				actions: vec![
 					extensions::Action {

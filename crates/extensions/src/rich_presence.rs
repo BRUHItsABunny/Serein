@@ -281,6 +281,7 @@ mod tests {
 			license: "MIT".into(),
 			source: "https://example.com".into(),
 			kind: ExtensionKind::Plugin,
+			network: Vec::new(),
 			capabilities: vec![Capability::RichPresence],
 			actions: vec![Action {
 				id: "apply".into(),

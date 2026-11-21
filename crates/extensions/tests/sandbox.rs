@@ -11,6 +11,7 @@ fn plugin(wasm: &str) -> Package {
 			license: "MIT".into(),
 			source: "https://github.com/example/plugin".into(),
 			kind: ExtensionKind::Plugin,
+			network: Vec::new(),
 			capabilities: vec![Capability::Composer],
 			actions: vec![Action {
 				id: "run".into(),
@@ -949,4 +950,36 @@ fn journal_actions_need_their_capability_and_return_only_storage() {
 			"{output:?}"
 		);
 	}
+}
+
+#[test]
+fn network_origins_and_capability_come_together() {
+	let request = r#"(import "serein" "https_request" (func $fetch (param i32 i32) (result i32)))"#;
+	let mut package = importing(request, &[Capability::Network], "(i32.const 1)");
+	// The capability without origins, or origins without the capability, is refused.
+	assert!(matches!(package.validate(), Err(Error::Capability)));
+	package.manifest.network = vec!["https://api.example.org".into()];
+	package.validate().unwrap();
+	package
+		.manifest
+		.capabilities
+		.retain(|c| *c != Capability::Network);
+	assert!(package.validate().is_err());
+	package.manifest.capabilities.push(Capability::Network);
+	for origins in [
+		vec!["http://api.example.org"],
+		vec!["https://api.example.org/path"],
+		vec!["https://10.0.0.1"],
+		vec!["https://api.example.org", "https://API.example.org/"],
+	] {
+		package.manifest.network = origins.iter().map(|o| o.to_string()).collect();
+		assert!(
+			matches!(package.validate(), Err(Error::Invalid)),
+			"{origins:?}"
+		);
+	}
+	package.manifest.network = (0..17)
+		.map(|i| format!("https://h{i}.example.org"))
+		.collect();
+	assert!(matches!(package.validate(), Err(Error::Limit)));
 }

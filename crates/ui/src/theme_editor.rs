@@ -143,6 +143,7 @@ impl ThemeEditor {
 					license: "CC0-1.0".into(),
 					source: String::new(),
 					kind: ExtensionKind::Theme,
+					network: Vec::new(),
 					capabilities: vec![],
 					actions: vec![],
 				},

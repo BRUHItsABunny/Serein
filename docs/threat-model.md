@@ -1,8 +1,14 @@
 # Threat model
 
-Community extensions add an untrusted-code boundary. Wasmi runs without imports,
-WASI or native handles, with compilation, fuel, stack, linear-memory and output
-limits. Only explicitly granted, user-selected context crosses that boundary.
+Community extensions add an untrusted-code boundary. Wasmi runs without WASI or
+native handles, with compilation, fuel, stack, linear-memory and output limits. The
+only imports are the capability-gated `serein` host functions (preview), each declared
+in the manifest and granted by the user, which copy bytes into plugin memory and never
+expose host pointers. With `network` (preview) a plugin reaches only the exact HTTPS
+origins it declares and the user approved, through public, pinned addresses without
+cookies, proxies or Serein credentials; anything the same plugin can read, including
+the `message_journal`, can therefore leave the device to those origins, and the consent
+dialog says so. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

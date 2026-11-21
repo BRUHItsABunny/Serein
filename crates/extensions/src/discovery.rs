@@ -86,6 +86,7 @@ impl HostInfo {
 				Capability::Random,
 				Capability::Database,
 				Capability::MessageJournal,
+				Capability::Network,
 			],
 			app_events: &[
 				AppEventKind::Ready,

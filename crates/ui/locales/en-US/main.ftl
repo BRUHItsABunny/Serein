@@ -979,7 +979,8 @@ extensions-ui-consent-modal-by = by
 # Context: consent_modal
 extensions-ui-consent-modal-cancel = Cancel
 # Context: consent_modal
-extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = Disabling removes the extension and its local data. Re-enabling starts fresh.
+extensions-ui-consent-network-warning = Anything this extension can read may be sent to { $hosts }.
+extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = Disabling removes the extension and asks whether to keep its data for a later reinstall.
 # Context: consent_modal
 extensions-ui-consent-modal-enable = Enable
 # Context: consent_modal

@@ -13,6 +13,7 @@ fn manifest(capabilities: Vec<Capability>) -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: "show".into(),

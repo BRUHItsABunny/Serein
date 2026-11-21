@@ -979,7 +979,8 @@ extensions-ui-consent-modal-by = bởi
 # Context: consent_modal
 extensions-ui-consent-modal-cancel = Hủy bỏ
 # Context: consent_modal
-extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = Việc tắt sẽ xóa tiện ích mở rộng và dữ liệu cục bộ của nó. Kích hoạt lại bắt đầu mới.
+extensions-ui-consent-network-warning = Mọi thứ tiện ích mở rộng này đọc được đều có thể được gửi đến { $hosts }.
+extensions-ui-consent-modal-disabling-removes-the-extension-and-its-local-data-re-enabling = Việc tắt sẽ gỡ tiện ích mở rộng và hỏi bạn có muốn giữ dữ liệu của nó để cài lại sau không.
 # Context: consent_modal
 extensions-ui-consent-modal-enable = Kích hoạt
 # Context: consent_modal

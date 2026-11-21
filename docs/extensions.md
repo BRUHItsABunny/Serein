@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 62 capabilities, with at most 64 distinct declarations per manifest.
+supports 63 capabilities, with at most 64 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -179,6 +179,7 @@ supports 62 capabilities, with at most 64 distinct declarations per manifest.
 | `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
 | `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
 | `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB by default, up to 16 GiB by user choice |
+| `network` | Make HTTPS requests to the exact origins in the manifest's `network` list | Preview; [network](#network-preview); the consent dialog lists the origins and warns that readable data may be sent there |
 | `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
@@ -501,7 +502,8 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 62 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 64 distinct | Only the 63 supported capability names are currently accepted. |
+| Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
@@ -544,6 +546,7 @@ granted by the user:
 | `random_fill` | `(ptr: i32, len: i32) -> i32` | `random` | Writes `len` (0-4,096) secure random bytes at `ptr`; `0` success, `-1` invalid length, `-2` unavailable |
 | `db_execute` | `(ptr: i32, len: i32) -> i32` | `database` | Runs one JSON request of at most 256 KiB; the pending reply's length, `-3` with a pending error message of at most 1 KiB, `-1` invalid length, `-2` unavailable |
 | `journal_read` | `(max: i32) -> i32` | `message_journal` | Reads 1-256 entries after the plugin's journal position; the pending reply's length, `-3` with a pending error, `-1` invalid count, `-2` unavailable |
+| `https_request` | `(ptr: i32, len: i32) -> i32` | `network` | Performs one JSON request to a declared origin; the pending response's length, `-3` with a pending error, `-1` invalid length, `-2` unavailable |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -638,6 +641,41 @@ Entries every consumer has read are deleted. Nothing is recorded while no enable
 plugin consumes the journal, and a plugin enabled later starts with new entries.
 Disabling a plugin removes its position. The journal lives with the account's plugin
 data, so logging out keeps it; with no consumer installed nothing new is recorded.
+
+## Network (preview)
+
+A plugin granted `network` lists the HTTPS origins it may reach in its manifest:
+
+```json
+"capabilities": ["network"],
+"network": ["https://api.example.org", "https://upload.example.org:8443"]
+```
+
+Origins are exact: `https`, a DNS name with at least one dot, an optional port and
+nothing else. No wildcards, paths, credentials, IP literals or `localhost` names; at
+most 16, no duplicates, and the capability and the list must come together. The consent
+dialog lists the origins and warns that anything the plugin can read may be sent there.
+
+Each `serein.https_request` (`serein_extension_sdk::host::https::send`) is one request,
+`{"method", "url", "headers": [[name, value]], "body" | "body_base64", "timeout_ms"}`,
+and one complete response, `{"status", "url", "redirected", "headers", "body" |
+"body_base64"}`. Text bodies arrive as `body`, others base64-encoded.
+
+- Methods: GET, HEAD, POST, PUT, PATCH, DELETE. GET and HEAD carry no body.
+- The host sets `Host`, `Content-Length`, framing and connection headers; `Proxy-*` is
+  refused. `User-Agent` defaults to `Serein plugin`, and `Accept-Encoding` to `identity`.
+  Bodies are never decompressed.
+- Each hop's name is resolved by the host; any non-public address (private, loopback,
+  link-local, carrier-grade NAT, documentation or multicast ranges) refuses the request,
+  and the connection is pinned to the checked addresses.
+- Redirects to declared origins are followed (up to five, each re-checked; 301-303 become
+  GET). A redirect elsewhere is returned as the 3xx response, unfollowed.
+- No cookies, system proxy, Discord session, token or Serein fingerprint is used.
+- Limits: 32 requests and 30 seconds of network time per invocation; per request
+  10 seconds by default and 15 at most, 192 KiB sent, 160 KiB received (a larger
+  response fails rather than truncating), 32 request and 64 response headers.
+- The invocation waits on the extension worker while a request runs; cancelling the
+  job, such as on navigation or logout, ends it at once.
 
 ## Plugin data (preview)
 

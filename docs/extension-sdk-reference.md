@@ -116,10 +116,10 @@ can be inspected without decoding a newer capability/event enum.
 | --- | --- | --- | --- |
 | `api_version` | `u32` / integer | Current buffer/JSON ABI version, `1`. | `host.api_version` |
 | `sdk_revision` | `u32` / integer | Current discovery schema revision, `1`; not a release or protocol compatibility claim. | `host.sdk_revision` |
-| `capabilities` | `Vec<String>` / array of strings | Host-supported capability names (62 currently), not this plugin's granted capabilities. | `host.supports("rich_presence")` |
+| `capabilities` | `Vec<String>` / array of strings | Host-supported capability names (63 currently), not this plugin's granted capabilities. | `host.supports("rich_presence")` |
 | `app_events` | `Vec<String>` / array of strings | Host-supported app-event names (21 currently), not an event subscription or delivery guarantee. | `host.supports_event("typing")` |
 | `interface_tweaks` | `Vec<String>` / array of strings, empty on older hosts | Interface tweak names this host honors: `static_typing_indicator`, `plain_profiles`, `expanded_roles`, `hidden_request_counts`, `one_ping_per_direct_message`, `hidden_blocked_messages`, `hidden_profile_notes`, `large_stream_preview`, `double_click_reply_edit`. | `host.supports_tweak("expanded_roles")` |
-| `host_imports` | `Vec<String>` / array of strings, empty on older hosts | Preview. Functions importable from the `serein` Wasm module: `clock_now_ms`, `random_fill`, `db_execute`, `result_read`, `journal_read`. Each still needs its capability; see [host imports](extensions.md#host-imports-preview). | `host.supports_import("clock_now_ms")` |
+| `host_imports` | `Vec<String>` / array of strings, empty on older hosts | Preview. Functions importable from the `serein` Wasm module: `clock_now_ms`, `random_fill`, `db_execute`, `result_read`, `journal_read`, `https_request`. Each still needs its capability; see [host imports](extensions.md#host-imports-preview). | `host.supports_import("clock_now_ms")` |
 
 A supported capability still needs to be declared and explicitly granted. Older
 hosts reject unknown required manifest capabilities **before** a handler can run;
@@ -198,7 +198,8 @@ account snapshot or grant-dependent data:
       "clock",
       "random",
       "database",
-      "message_journal"
+      "message_journal",
+      "network"
     ],
     "app_events": [
       "ready",
@@ -223,7 +224,7 @@ account snapshot or grant-dependent data:
       "typing",
       "polls"
     ],
-    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read"]
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request"]
   }
 }
 ```
