@@ -82,6 +82,22 @@ pub struct Annotation {
 	pub text: String,
 }
 
+/// Text shown in place of a message the plugin was given, such as its translation, with a
+/// toggle back to the message itself; empty text removes this plugin's alternate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alternate {
+	pub message_id: String,
+	/// What the text is, such as "Translation", shown beside the toggle.
+	pub label: String,
+	pub text: String,
+}
+
+/// Longest alternate label, in UTF-8 bytes.
+pub const MAX_ALTERNATE_LABEL_BYTES: usize = 64;
+/// Longest follow-up message from a send hook, in UTF-8 bytes.
+pub const MAX_FOLLOW_UP_BYTES: usize = 16 * 1024;
+
 /// Earlier versions of a message the plugin was given, oldest first, shown behind its
 /// "edited" label; an empty list removes this plugin's history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +211,43 @@ pub(crate) fn validate_annotations(
 		}
 	}
 	Ok(())
+}
+
+/// Checks returned alternates: each names a given message once, with a short plain label.
+pub(crate) fn validate_alternates(alternates: &[Alternate], allowed: &[&str]) -> Result<(), Error> {
+	if alternates.len() > MAX_ANNOTATE_MESSAGES {
+		return Err(Error::Limit);
+	}
+	let mut seen = std::collections::BTreeSet::new();
+	for alternate in alternates {
+		if !allowed.contains(&alternate.message_id.as_str()) || !seen.insert(&alternate.message_id)
+		{
+			return Err(Error::Invalid);
+		}
+		if alternate.text.len() > MAX_ANNOTATION_BYTES
+			|| alternate.label.len() > MAX_ALTERNATE_LABEL_BYTES
+		{
+			return Err(Error::Limit);
+		}
+		if alternate.text.chars().any(|c| c.is_control() && c != '\n')
+			|| alternate.label.chars().any(char::is_control)
+			|| !alternate.text.is_empty() && alternate.label.trim().is_empty()
+		{
+			return Err(Error::Invalid);
+		}
+	}
+	Ok(())
+}
+
+/// A follow-up is a non-blank message within its byte limit.
+pub(crate) fn validate_follow_up(text: &str) -> Result<(), Error> {
+	if text.len() > MAX_FOLLOW_UP_BYTES {
+		Err(Error::Limit)
+	} else if text.trim().is_empty() {
+		Err(Error::Invalid)
+	} else {
+		Ok(())
+	}
 }
 
 /// A hook action needs its capability, and its capability needs the action.

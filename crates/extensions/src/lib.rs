@@ -8,8 +8,8 @@ pub use runtime::{MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke, invoke_
 pub mod imports;
 pub mod message_hooks;
 pub use message_hooks::{
-	AnnotateBatch, AnnotateMessage, Annotation, DeletedMessage, DeletedMessages, MessageHistory,
-	SendTarget,
+	Alternate, AnnotateBatch, AnnotateMessage, Annotation, DeletedMessage, DeletedMessages,
+	MessageHistory, SendTarget,
 };
 pub mod captions;
 pub use captions::Caption;
@@ -893,6 +893,14 @@ pub struct Output {
 	/// followed; same rules as `annotations`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub deleted_messages: Vec<DeletedMessages>,
+	/// Text shown in place of messages, such as their translation, with a toggle back to the
+	/// message itself; same rules as `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub alternates: Vec<Alternate>,
+	/// A second message a `send` action sends right after the first one is confirmed, in the
+	/// same channel. Requires `send_hook`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub follow_up: Option<String>,
 	/// This plugin's caption lines in the call; an empty list clears them. Requires
 	/// `call_captions`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1620,6 +1628,7 @@ impl Output {
 		if !self.annotations.is_empty()
 			|| !self.histories.is_empty()
 			|| !self.deleted_messages.is_empty()
+			|| !self.alternates.is_empty()
 		{
 			let allowed: Vec<&str> = match (surface, &input.annotate, &input.selected_message_ref) {
 				(Surface::Annotate, Some(batch), _) => batch
@@ -1638,6 +1647,13 @@ impl Output {
 			}
 			message_hooks::validate_annotations(&self.annotations, &allowed)?;
 			message_hooks::validate_history(&self.histories, &self.deleted_messages, &allowed)?;
+			message_hooks::validate_alternates(&self.alternates, &allowed)?;
+		}
+		if let Some(text) = &self.follow_up {
+			if surface != Surface::Send || !manifest.capabilities.contains(&Capability::SendHook) {
+				return Err(Error::Capability);
+			}
+			message_hooks::validate_follow_up(text)?;
 		}
 		match (&self.notification, surface == Surface::Notification) {
 			(Some(decision), true) => decision.validate()?,

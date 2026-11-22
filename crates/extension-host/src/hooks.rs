@@ -207,7 +207,8 @@ impl AnnotateTracker {
 }
 
 /// One plugin's additions to a message: a note under it, earlier versions behind its
-/// "edited" label, and deleted messages the plugin kept, shown as rows under it.
+/// "edited" label, deleted messages the plugin kept, shown as rows under it, and text shown
+/// in place of the message, such as its translation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Note {
 	pub plugin: String,
@@ -218,6 +219,15 @@ pub struct Note {
 	/// Oldest first.
 	pub history: Vec<Revision>,
 	pub deleted: Vec<Archived>,
+	pub alternate: Option<Alternate>,
+}
+
+/// Text shown in place of a message, with a toggle back to the message itself.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Alternate {
+	/// What the text is, such as "Translation".
+	pub label: String,
+	pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -250,9 +260,16 @@ impl Note {
 				.iter()
 				.map(|row| size_of::<Archived>() + row.author.len() + row.text.len())
 				.sum::<usize>()
+			+ self
+				.alternate
+				.as_ref()
+				.map_or(0, |alternate| alternate.label.len() + alternate.text.len())
 	}
 	fn is_empty(&self) -> bool {
-		self.text.is_empty() && self.history.is_empty() && self.deleted.is_empty()
+		self.text.is_empty()
+			&& self.history.is_empty()
+			&& self.deleted.is_empty()
+			&& self.alternate.is_none()
 	}
 }
 
@@ -284,6 +301,25 @@ impl Annotations {
 	/// Sets the deleted messages `plugin` shows under `message`; an empty list removes them.
 	pub fn set_deleted(&mut self, plugin: &str, name: &str, message: Id, rows: Vec<Archived>) {
 		self.update(plugin, name, message, |note| note.deleted = rows);
+	}
+	/// Sets the text `plugin` shows in place of `message`; empty text removes it.
+	pub fn set_alternate(
+		&mut self,
+		plugin: &str,
+		name: &str,
+		message: Id,
+		label: &str,
+		text: &str,
+	) {
+		let text = text.trim();
+		if text.len() > MAX_ANNOTATION_BYTES {
+			return;
+		}
+		let alternate = (!text.is_empty()).then(|| Alternate {
+			label: label.trim().chars().take(64).collect(),
+			text: text.to_owned(),
+		});
+		self.update(plugin, name, message, |note| note.alternate = alternate);
 	}
 	fn update(&mut self, plugin: &str, name: &str, message: Id, change: impl FnOnce(&mut Note)) {
 		let notes = self.notes.entry(message).or_default();
@@ -319,6 +355,13 @@ impl Annotations {
 				self.bytes -= note.bytes();
 			}
 		}
+	}
+
+	/// The note whose alternate replaces `message`'s text: the first plugin's, in plugin order.
+	pub fn alternate(&self, message: Id) -> Option<&Note> {
+		self.get(message)
+			.iter()
+			.find(|note| note.alternate.is_some())
 	}
 
 	/// The notes under `message`, in plugin order.
@@ -448,6 +491,14 @@ mod tests {
 		assert_eq!((kept.history.len(), kept.deleted.len()), (1, 1));
 		notes.set_history("a", "A", Id(1), Vec::new());
 		notes.set_deleted("a", "A", Id(1), Vec::new());
+		assert_eq!(notes.get(Id(1)).len(), 1, "only plugin b's note is left");
+		// An alternate alone keeps an entry, and the first plugin's is shown.
+		notes.set_alternate("c", "C", Id(1), "Translation", "later plugin");
+		notes.set_alternate("a", "A", Id(1), "Translation", "hello");
+		assert_eq!(notes.alternate(Id(1)).unwrap().plugin, "a");
+		notes.set_alternate("a", "A", Id(1), "Translation", "");
+		notes.set_alternate("c", "C", Id(1), "", " ");
+		assert!(notes.alternate(Id(1)).is_none());
 		assert_eq!(notes.get(Id(1)).len(), 1, "only plugin b's note is left");
 		notes.set_history("a", "A", Id(1), vec![revision]);
 		for id in 0..MAX_NOTED as u64 + 10 {

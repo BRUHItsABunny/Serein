@@ -1241,7 +1241,7 @@ impl ExtensionUi {
 		state: &State,
 	) {
 		if invocation.send_target.is_some() {
-			self.send_result(&id, &invocation, output.replacement);
+			self.send_result(&id, &invocation, output.replacement, output.follow_up);
 			return;
 		}
 		if self.receive_page(&id, &invocation, &mut output, state) {
@@ -1252,7 +1252,8 @@ impl ExtensionUi {
 		if invocation.annotate.is_some()
 			|| (!output.annotations.is_empty()
 				|| !output.histories.is_empty()
-				|| !output.deleted_messages.is_empty())
+				|| !output.deleted_messages.is_empty()
+				|| !output.alternates.is_empty())
 				&& output.panel.is_empty()
 				&& output.effects.is_empty()
 				&& output.replacement.is_none()

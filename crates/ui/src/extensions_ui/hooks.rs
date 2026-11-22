@@ -33,7 +33,21 @@ struct Review {
 	channel: Id,
 	name: String,
 	original: String,
+	/// Sent after the reviewed draft.
+	follow_up: Option<String>,
 }
+
+/// A send hook's second message, waiting for the first to be confirmed.
+struct FollowUp {
+	channel: Id,
+	generation: u64,
+	nonce: String,
+	name: String,
+	text: String,
+}
+
+/// Follow-ups waiting at once; more are dropped with a notice.
+const MAX_FOLLOW_UPS: usize = 8;
 
 #[derive(Default)]
 pub(crate) struct SendState {
@@ -42,6 +56,11 @@ pub(crate) struct SendState {
 	review: Option<Review>,
 	/// The next send in this channel skips the hook.
 	bypass: Option<Id>,
+	/// The follow-up for the next send in this channel, with the plugin's name.
+	armed: Option<(Id, String, String)>,
+	follow_ups: Vec<FollowUp>,
+	/// The follow-up of the outcome waiting to be applied.
+	outcome_follow_up: Option<(String, String)>,
 }
 
 pub(crate) enum NoteUpdate {
@@ -65,6 +84,14 @@ pub(crate) enum NoteUpdate {
 		name: String,
 		message: Id,
 		rows: Vec<extension_host::hooks::Archived>,
+	},
+	/// Text a plugin shows in place of a message; empty text removes it.
+	Alternate {
+		plugin: String,
+		name: String,
+		message: Id,
+		label: String,
+		text: String,
 	},
 	/// Every note of one plugin.
 	Forget(String),
@@ -143,12 +170,8 @@ impl ExtensionUi {
 		}
 		let draft = state.drafts.get(&channel).map_or("", String::as_str);
 		// The user reviewed this rewrite; send it, edited or not.
-		if self
-			.send
-			.review
-			.take_if(|review| review.channel == channel)
-			.is_some()
-		{
+		if let Some(review) = self.send.review.take_if(|review| review.channel == channel) {
+			self.send.armed = review.follow_up.map(|text| (channel, review.name, text));
 			return false;
 		}
 		let Some((hook, name, action)) = self.send_hook(channel) else {
@@ -197,6 +220,7 @@ impl ExtensionUi {
 			self.send.outcome = Some((target, generation, original, outcome));
 			return None;
 		}
+		let follow_up = self.send.outcome_follow_up.take();
 		if state.drafts.get(&channel).map_or("", String::as_str) != original {
 			self.send.review = None;
 			return Some(Outcome::Keep(crate::i18n::translate(
@@ -205,6 +229,7 @@ impl ExtensionUi {
 		}
 		if let Outcome::Replace { send: true, .. } | Outcome::Send = &outcome {
 			self.send.bypass = Some(channel);
+			self.send.armed = follow_up.map(|(name, text)| (channel, name, text));
 		}
 		Some(outcome)
 	}
@@ -215,6 +240,7 @@ impl ExtensionUi {
 		id: &str,
 		invocation: &Invocation,
 		replacement: Option<String>,
+		follow_up: Option<String>,
 	) {
 		let Some(pending) = self.send.pending.take_if(|pending| {
 			pending.plugin == id
@@ -226,21 +252,30 @@ impl ExtensionUi {
 		}) else {
 			return;
 		};
+		let follow_up = follow_up
+			.filter(|text| !text.trim().is_empty() && text.len() <= client_core::MAX_DRAFT_BYTES);
+		self.send.outcome_follow_up = None;
 		let outcome = match replacement.filter(|text| *text != pending.original) {
-			None => Outcome::Send,
+			None if follow_up.is_none() => Outcome::Send,
 			Some(text) if text.trim().is_empty() || text.len() > client_core::MAX_DRAFT_BYTES => {
 				Outcome::Keep(crate::i18n::translate_args(
 					"extensions-ui-hook-unusable",
 					&[("plugin", &pending.name)],
 				))
 			}
-			Some(text) => {
+			// A follow-up alone still waits for review: the draft goes first, unchanged.
+			rewrite => {
+				let text = rewrite.unwrap_or_else(|| pending.original.clone());
 				let send = pending.mode == SendMode::Auto;
-				if !send {
+				if send {
+					self.send.outcome_follow_up =
+						follow_up.map(|follow_up| (pending.name.clone(), follow_up));
+				} else {
 					self.send.review = Some(Review {
 						channel: pending.channel,
 						name: pending.name.clone(),
 						original: pending.original.clone(),
+						follow_up,
 					});
 				}
 				Outcome::Replace { text, send }
@@ -252,6 +287,77 @@ impl ExtensionUi {
 			pending.original,
 			outcome,
 		));
+	}
+
+	/// The composer queued `command` in `channel`: the armed follow-up, if any, now waits
+	/// for it to be confirmed. Any other send drops it.
+	pub(crate) fn sent(
+		&mut self,
+		state: &State,
+		channel: Id,
+		command: Option<&client_core::Command>,
+	) {
+		let Some((armed, name, text)) = self.send.armed.take() else {
+			return;
+		};
+		let Some(client_core::Command::Send { nonce, .. }) = command else {
+			return;
+		};
+		if armed != channel {
+			return;
+		}
+		if self.send.follow_ups.len() >= MAX_FOLLOW_UPS {
+			self.send.follow_ups.remove(0);
+		}
+		self.send.follow_ups.push(FollowUp {
+			channel,
+			generation: state.generation,
+			nonce: nonce.clone(),
+			name,
+			text,
+		});
+	}
+
+	/// Sends each follow-up whose message was confirmed, and drops those whose message
+	/// failed; returns the commands and a notice per dropped follow-up.
+	pub(crate) fn send_follow_ups(
+		&mut self,
+		state: &mut State,
+	) -> (Vec<client_core::Command>, Vec<String>) {
+		let mut commands = Vec::new();
+		let mut notices = Vec::new();
+		if self.send.follow_ups.is_empty() {
+			return (commands, notices);
+		}
+		for follow_up in std::mem::take(&mut self.send.follow_ups) {
+			if follow_up.generation != state.generation {
+				continue;
+			}
+			let confirmed = state
+				.confirmed_sends
+				.iter()
+				.any(|(nonce, _)| *nonce == follow_up.nonce);
+			let sending = state.pending.iter().any(|pending| {
+				pending.nonce == follow_up.nonce && pending.delivery == model::Delivery::Sending
+			});
+			if confirmed {
+				match state.prepare_text_send_in(follow_up.channel, &follow_up.text) {
+					Some(command) => commands.push(command),
+					None => notices.push(crate::i18n::translate_args(
+						"extensions-ui-hook-follow-up-unsent",
+						&[("plugin", &follow_up.name)],
+					)),
+				}
+			} else if sending {
+				self.send.follow_ups.push(follow_up);
+			} else {
+				notices.push(crate::i18n::translate_args(
+					"extensions-ui-hook-follow-up-unsent",
+					&[("plugin", &follow_up.name)],
+				));
+			}
+		}
+		(commands, notices)
 	}
 
 	/// A send hook failed; its fallback decides whether the draft is sent unchanged.
@@ -309,13 +415,20 @@ impl ExtensionUi {
 				Some("extensions-ui-hook-cancel"),
 			)
 		} else if let Some(review) = review {
-			(
-				crate::i18n::translate_args(
+			let text = match &review.follow_up {
+				Some(follow_up) => {
+					let preview: String = follow_up.chars().take(200).collect();
+					crate::i18n::translate_args(
+						"extensions-ui-hook-review-follow-up",
+						&[("plugin", &review.name), ("text", &preview)],
+					)
+				}
+				None => crate::i18n::translate_args(
 					"extensions-ui-hook-review",
 					&[("plugin", &review.name)],
 				),
-				Some("extensions-ui-hook-use-original"),
-			)
+			};
+			(text, Some("extensions-ui-hook-use-original"))
 		} else if let Some((hook, name, _)) = self.send_hook(channel) {
 			(
 				crate::i18n::translate_args(
@@ -458,7 +571,10 @@ impl ExtensionUi {
 	/// Notes a plugin returned, shown under their messages.
 	pub fn receive_annotations(&mut self, id: &str, output: &extensions::Output) {
 		let annotations: &[Annotation] = &output.annotations;
-		let additions = annotations.len() + output.histories.len() + output.deleted_messages.len();
+		let additions = annotations.len()
+			+ output.histories.len()
+			+ output.deleted_messages.len()
+			+ output.alternates.len();
 		if additions == 0 {
 			return;
 		}
@@ -482,6 +598,7 @@ impl ExtensionUi {
 						NoteUpdate::Set { .. }
 							| NoteUpdate::History { .. }
 							| NoteUpdate::Deleted { .. }
+							| NoteUpdate::Alternate { .. }
 					);
 				dropped += usize::from(drop);
 				!drop
@@ -494,6 +611,17 @@ impl ExtensionUi {
 					name: name.clone(),
 					message: Id(message),
 					text: annotation.text.clone(),
+				});
+			}
+		}
+		for alternate in &output.alternates {
+			if let Ok(message) = alternate.message_id.parse() {
+				self.notes.push(NoteUpdate::Alternate {
+					plugin: id.to_owned(),
+					name: name.clone(),
+					message: Id(message),
+					label: alternate.label.clone(),
+					text: alternate.text.clone(),
 				});
 			}
 		}
@@ -584,6 +712,13 @@ impl ExtensionUi {
 					message,
 					rows,
 				} => into.set_deleted(&plugin, &name, message, rows),
+				NoteUpdate::Alternate {
+					plugin,
+					name,
+					message,
+					label,
+					text,
+				} => into.set_alternate(&plugin, &name, message, &label, &text),
 				NoteUpdate::Forget(plugin) => into.remove_plugin(&plugin),
 				NoteUpdate::Clear => into.clear(),
 			}

@@ -1141,6 +1141,53 @@ fn message_hooks_get_only_their_draft_or_batch_and_annotate_only_what_they_were_
 			.is_err(),
 		"a send hook cannot annotate"
 	);
+
+	// A send hook may follow its message with a second one; nothing else may send one.
+	let follow = |text: &str| Output {
+		follow_up: Some(text.into()),
+		..Default::default()
+	};
+	follow("hola").validate(&manifest, &send).unwrap();
+	assert!(follow(" \n").validate(&manifest, &send).is_err());
+	assert!(matches!(
+		follow(&"x".repeat(16 * 1024 + 1)).validate(&manifest, &send),
+		Err(Error::Limit)
+	));
+	assert!(matches!(
+		follow("hola").validate(&manifest, &batch),
+		Err(Error::Capability)
+	));
+	// Alternates follow the annotation rules and need a plain label.
+	let alternate = |id: &str, label: &str, text: &str| Output {
+		alternates: vec![extensions::Alternate {
+			message_id: id.into(),
+			label: label.into(),
+			text: text.into(),
+		}],
+		..Default::default()
+	};
+	alternate("1", "Translation", "hello\nthere")
+		.validate(&manifest, &batch)
+		.unwrap();
+	alternate("1", "", "").validate(&manifest, &batch).unwrap();
+	for (invalid, error) in [
+		(alternate("2", "Translation", "hi"), "unrelated message"),
+		(alternate("1", " ", "hi"), "unlabelled"),
+		(alternate("1", "Trans\u{7}", "hi"), "control label"),
+		(
+			alternate("1", "Translation", &"x".repeat(4097)),
+			"oversized",
+		),
+		(alternate("1", &"x".repeat(65), "hi"), "long label"),
+	] {
+		assert!(invalid.validate(&manifest, &batch).is_err(), "{error}");
+	}
+	assert!(
+		alternate("1", "Translation", "hi")
+			.validate(&manifest, &send)
+			.is_err(),
+		"a send hook cannot replace messages"
+	);
 }
 
 #[test]

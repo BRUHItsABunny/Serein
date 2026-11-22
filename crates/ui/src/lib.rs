@@ -2567,6 +2567,12 @@ impl MessagingUi {
 				}
 				self.apply_voice_join(state, commands);
 				self.take_archive_request(state, commands);
+				// A send hook's second message goes once its first is confirmed.
+				let (follow_ups, notices) = self.extensions.send_follow_ups(state);
+				commands.extend(follow_ups);
+				for notice in notices {
+					self.toasts.push(design::Level::Warning, notice);
+				}
 			});
 		if self.banner_rows > 0
 			&& let Some(art) = art
@@ -3425,6 +3431,7 @@ impl MessagingUi {
 			}
 			self.image_share_requested =
 				Some((state.generation, channel, assets, draft.to_owned()));
+			self.extensions.sent(state, channel, None);
 			return;
 		}
 		let original_draft = if self.convert_emoticons {
@@ -3445,9 +3452,13 @@ impl MessagingUi {
 			// Consume this selection once, before desktop dispatch.
 			self.stage_pending_upload(ctx, &command);
 			self.timeline.follow_latest(state);
+			self.extensions.sent(state, channel, Some(&command));
 			commands.push(command);
-		} else if let Some(original) = original_draft {
-			state.drafts.insert(channel, original);
+		} else {
+			self.extensions.sent(state, channel, None);
+			if let Some(original) = original_draft {
+				state.drafts.insert(channel, original);
+			}
 		}
 	}
 	/// Submits message drafts or edits after applying the device conversion preference.
@@ -7610,6 +7621,72 @@ mod composer_tests {
 		);
 		view.extensions.send_failed(&id, &invocation);
 		assert_eq!(sent(&frame(&mut view, &mut state)).as_deref(), Some("fünf"));
+		state.pending.clear();
+
+		// A follow-up alone still waits for review, then goes only after Discord confirms
+		// the first message, in the same channel.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Preview,
+			Fallback::KeepDraft,
+			"sechs",
+		);
+		let follow = extensions::Output {
+			follow_up: Some("six".into()),
+			..Default::default()
+		};
+		view.extensions
+			.present_output(id.clone(), invocation, context, follow.clone(), &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "sechs");
+		let mut commands = Vec::new();
+		view.submit_composer(&mut state, &ctx, &mut commands);
+		let Some(Command::Send { nonce, .. }) = commands.into_iter().next() else {
+			panic!("the reviewed draft is sent first")
+		};
+		assert!(view.extensions.send_follow_ups(&mut state).0.is_empty());
+		let mut first = test_support::message(7001, channel);
+		first.author = state.user.clone().unwrap();
+		first.nonce = Some(nonce.clone());
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::SendResult {
+				nonce,
+				result: Ok(first),
+			},
+		});
+		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
+		assert!(notices.is_empty());
+		assert_eq!(sent(&follow_ups).as_deref(), Some("six"));
+		assert!(
+			view.extensions.send_follow_ups(&mut state).0.is_empty(),
+			"sent once"
+		);
+		// When the first message fails, the follow-up is dropped with a notice.
+		state.pending.clear();
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"sieben",
+		);
+		view.extensions
+			.present_output(id, invocation, context, follow, &state);
+		let Some(Command::Send { nonce, .. }) = frame(&mut view, &mut state).into_iter().next()
+		else {
+			panic!("sent at once")
+		};
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::SendResult {
+				nonce,
+				result: Err(client_core::auth::Failure::ProtocolAt("rejected")),
+			},
+		});
+		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
+		assert!(follow_ups.is_empty() && notices.len() == 1);
 	}
 
 	fn edit_state() -> State {

@@ -90,7 +90,8 @@ pub struct DeletedMessage {
 }
 
 /// Output of an `annotate` action, or of a `message` action annotating the chosen message.
-/// Each note, history and deleted-row anchor must name a message the action was given.
+/// Each note, history, alternate and deleted-row anchor must name a message the action was
+/// given.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotationOutput {
 	#[serde(flatten)]
@@ -101,6 +102,28 @@ pub struct AnnotationOutput {
 	pub histories: Vec<MessageHistory>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub deleted_messages: Vec<DeletedMessages>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub alternates: Vec<Alternate>,
+}
+
+/// Text shown in place of a message, such as its translation, with a toggle back to the
+/// message itself. Empty `text` removes yours. At most 4 KiB of text, line breaks allowed,
+/// and a label of at most 64 bytes, such as "Translation".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alternate {
+	pub message_id: String,
+	pub label: String,
+	pub text: String,
+}
+
+/// Output of a `send` action: the rewrite in `output.replacement`, and optionally a second
+/// message sent right after the first is confirmed, in the same channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendOutput {
+	#[serde(flatten)]
+	pub output: Output,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub follow_up: Option<String>,
 }
 
 #[cfg(test)]
@@ -133,6 +156,18 @@ mod tests {
 		assert!(
 			output.get("panel").is_some(),
 			"Output fields stay flattened"
+		);
+		let send = serde_json::to_value(SendOutput {
+			output: Output {
+				replacement: Some("hi".into()),
+				..Default::default()
+			},
+			follow_up: Some("hola".into()),
+		})
+		.unwrap();
+		assert_eq!(
+			(send["replacement"].as_str(), send["follow_up"].as_str()),
+			(Some("hi"), Some("hola"))
 		);
 	}
 }

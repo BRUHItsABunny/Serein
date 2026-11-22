@@ -804,6 +804,13 @@ unchanged; it may also save `storage`, nothing else. The user chooses per channe
   an empty or oversized rewrite, or a plugin that stops running counts as failing; the
   plugin keeps running for other messages.
 
+**Follow-up.** A send hook may also return `follow_up`: a second message (at most 16 KiB,
+not blank) that Serein sends in the same channel only after Discord confirms the first,
+so the two arrive in order. A follow-up without a rewrite still waits for review in the
+**Show me the rewrite first** mode, and the line above the composer shows it. If the first
+message fails, the follow-up is dropped with a notice. A translator sends the original and
+then its translation this way.
+
 A draft edited while the hook runs is neither replaced nor sent. One plugin per channel
 holds the send hook; attachments are sent with the rewritten text, and attachment-only
 messages skip the hook. Only one draft waits for a hook at a time.
@@ -838,6 +845,14 @@ four plugins may annotate one channel.
 
 Texts follow page rows: at most 4 KiB, line breaks allowed. Like notes, they live in RAM
 within the same 2,000-message, 2 MiB budget and never reach Discord.
+
+**Alternates.** `alternates: [{"message_id", "label", "text"}]` shows `text` in place of a
+given message, such as its translation, under the same rules, with a label of at most 64
+bytes. A line under it reads "*label* by *plugin*" with **Show as sent**, which switches
+that message back to its own text (and **Show *label*** again); the choice is kept in
+memory for up to 512 messages. When several plugins give one, the first by plugin ID is
+shown. Empty text removes the plugin's alternate. Only the screen changes: the message,
+copying, replies and search keep the text Discord has.
 
 ## Call captions (preview)
 

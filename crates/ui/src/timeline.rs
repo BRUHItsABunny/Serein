@@ -42,6 +42,9 @@ pub struct TimelineView {
 	pub(super) extension_actions: std::sync::Arc<Vec<crate::extensions_ui::MenuAction>>,
 	/// Notes plugins added under messages.
 	pub(super) notes: extension_host::hooks::Annotations,
+	/// Messages with a plugin's alternate, such as a translation, switched back to their
+	/// own text; RAM only.
+	pub(super) show_original: std::collections::HashSet<Id>,
 	pub(super) extension_request: Option<(
 		crate::extensions_ui::MenuAction,
 		String,
@@ -506,6 +509,12 @@ pub(crate) fn fill_header_line(ui: &mut egui::Ui, compact: bool, text_line: egui
 	}
 }
 /// The "edited" label; when plugins supplied earlier versions it opens them.
+/// The format cache part holding a plugin's alternate text; message components use parts
+/// below `u16::MAX`.
+const ALTERNATE_PART: u16 = u16::MAX;
+/// Messages switched back from their alternate that are remembered at once.
+const MAX_SHOWN_ORIGINALS: usize = 512;
+
 fn plugin_history(
 	ui: &mut egui::Ui,
 	edited: bool,
@@ -4097,8 +4106,22 @@ impl TimelineView {
 											} else {
 												None
 											};
-											let formatted =
-												self.formatted.get(id, &message.content);
+											// A plugin's alternate, such as a translation, shows in
+											// place of the text until the reader switches back.
+											let alternate =
+												self.notes.alternate(message.id).and_then(|note| {
+													Some((
+														note.name.clone(),
+														note.alternate.clone()?,
+													))
+												});
+											let original_shown = self.show_original.contains(&id);
+											let formatted = match &alternate {
+												Some((_, alternate)) if !original_shown => self
+													.formatted
+													.get_part(id, ALTERNATE_PART, &alternate.text),
+												_ => self.formatted.get(id, &message.content),
+											};
 											let reveal = self
 												.revealed
 												.get(&id)
@@ -4175,7 +4198,67 @@ impl TimelineView {
 													.response
 													.rect;
 											}
-											if formatted.limited {
+											let limited = formatted.limited;
+											if let Some((name, alternate)) = &alternate {
+												let toggle = ui
+													.horizontal_wrapped(|ui| {
+														ui.spacing_mut().item_spacing.x = 6.0;
+														if !original_shown {
+															ui.label(
+																RichText::new(
+																	crate::i18n::translate_args(
+																		"timeline-alternate-from",
+																		&[
+																			(
+																				"label",
+																				&alternate.label,
+																			),
+																			("plugin", name),
+																		],
+																	),
+																)
+																.small()
+																.color(colors.muted),
+															);
+														}
+														let label = if original_shown {
+															crate::i18n::translate_args(
+																"timeline-alternate-show",
+																&[("label", &alternate.label)],
+															)
+														} else {
+															crate::i18n::translate(
+																"timeline-alternate-show-sent",
+															)
+														};
+														ui.add(
+															egui::Button::new(
+																RichText::new(label)
+																	.small()
+																	.color(colors.link),
+															)
+															.frame(false)
+															.small(),
+														)
+													})
+													.inner;
+												surface.keep(&toggle);
+												if toggle.clicked() {
+													if original_shown {
+														self.show_original.remove(&id);
+													} else {
+														if self.show_original.len()
+															>= MAX_SHOWN_ORIGINALS
+														{
+															self.show_original.clear();
+														}
+														self.show_original.insert(id);
+													}
+													self.heights.remove(&id);
+													ui.ctx().request_repaint();
+												}
+											}
+											if limited {
 												ui.label(
 													RichText::new(crate::i18n::translate(
 														"timeline-show-with-scroll-display-limited-copy-message-for-the-full-text",
