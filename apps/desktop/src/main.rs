@@ -5528,6 +5528,32 @@ impl Desktop {
 				|| matches!(&event.event, Event::Reactions(client_core::reactions::Event::Read {channel,result:Err(Failure::Forbidden),..}) if self.state.selected==Some(*channel))
 				|| matches!(&event.event, Event::HistoryFailed { channel, request, failure: Failure::Forbidden }
                 if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending);
+			// Losing one conversation forgets only its cached history (and its threads'); a
+			// session-wide reset still clears the account's.
+			let reset_history = matches!(event.event, Event::Resync | Event::PermissionsChanged);
+			let lost_channels: Vec<model::Id> = if !invalidate || reset_history {
+				Vec::new()
+			} else {
+				match &event.event {
+					Event::Unavailable(channel) => std::iter::once(*channel)
+						.chain(
+							self.state
+								.channels
+								.iter()
+								.filter(|c| {
+									matches!(c.kind, 10..=12) && c.parent_id == Some(*channel)
+								})
+								.map(|c| c.id),
+						)
+						.collect(),
+					Event::RecipientRemoved { channel, .. }
+					| Event::HistoryFailed { channel, .. }
+					| Event::Reactions(client_core::reactions::Event::Read { channel, .. }) => {
+						vec![*channel]
+					}
+					_ => Vec::new(),
+				}
+			};
 			let history_changed = changes_active_history(&self.state, &event.event);
 			if history_changed {
 				match &event.event {
@@ -5669,10 +5695,18 @@ impl Desktop {
 			{
 				self.command(command);
 			}
-			// ponytail: accepted navigation removals clear account-wide history;
-			// add scoped disk deletion if channel churn makes refetch cost significant.
-			if invalidate || !removed_channels.is_empty() {
+			// A session-wide invalidation clears the account's cached history; losing some
+			// conversations removes only theirs, so the rest needs no refetch.
+			if invalidate && (reset_history || lost_channels.is_empty()) {
 				self.queue_cache(cache::Operation::ClearHistory);
+			} else {
+				let mut lost = lost_channels;
+				lost.extend(removed_channels.iter().copied());
+				lost.sort_unstable();
+				lost.dedup();
+				for channels in lost.chunks(512) {
+					self.queue_cache(cache::Operation::ClearChannels(channels.to_vec()));
+				}
 			}
 			persist_timeline |= history_changed;
 			if let Some(channel) = confirmed_channel {

@@ -2923,6 +2923,7 @@ impl ExtensionUi {
 			return;
 		};
 		let mut close = false;
+		let flows = data_flows(&self.entries, &consent.entry.manifest);
 		let theme = consent.entry.manifest.kind == ExtensionKind::Theme;
 		let illustrated =
 			consent.entry.theme_preview.is_some()
@@ -3162,6 +3163,13 @@ impl ExtensionUi {
 							.color(colors.text),
 						);
 					}
+				}
+				for warning in &flows {
+					ui.label(
+						egui::RichText::new(warning)
+							.size(13.0)
+							.color(colors.warning),
+					);
 				}
 				if !consent.entry.manifest.secrets.is_empty() {
 					let labels: Vec<&str> = consent
@@ -3968,6 +3976,58 @@ fn badge(ui: &mut egui::Ui, text: &str, foreground: egui::Color32, background: e
 	ui.painter().rect_filled(rect, 7, background);
 	ui.painter()
 		.galley(rect.center() - galley.size() / 2.0, galley, foreground);
+}
+
+/// Warnings for data that could pass between this plugin and enabled ones over shared
+/// topics once the user approves the connection, and then leave the device: into this
+/// plugin from providers when it can use the network or files, and from it to subscribers
+/// that can.
+fn data_flows(entries: &[ExtensionEntry], manifest: &Manifest) -> Vec<String> {
+	let leaves = |manifest: &Manifest| {
+		manifest.capabilities.contains(&Capability::Network)
+			|| manifest.capabilities.contains(&Capability::Files)
+	};
+	let others = || {
+		entries
+			.iter()
+			.filter(|entry| entry.enabled && entry.manifest.id != manifest.id)
+	};
+	let names = |names: Vec<&str>| names.join(", ");
+	let mut warnings = Vec::new();
+	let providers: Vec<&str> = others()
+		.filter(|entry| {
+			entry
+				.manifest
+				.broadcasts
+				.iter()
+				.any(|topic| manifest.subscribes.contains(topic))
+		})
+		.map(|entry| entry.manifest.name.as_str())
+		.collect();
+	if !providers.is_empty() && leaves(manifest) {
+		warnings.push(crate::i18n::translate_args(
+			"extensions-ui-consent-flow-in",
+			&[("plugins", &names(providers))],
+		));
+	}
+	let subscribers: Vec<&str> = others()
+		.filter(|entry| {
+			leaves(&entry.manifest)
+				&& entry
+					.manifest
+					.subscribes
+					.iter()
+					.any(|topic| manifest.broadcasts.contains(topic))
+		})
+		.map(|entry| entry.manifest.name.as_str())
+		.collect();
+	if !subscribers.is_empty() {
+		warnings.push(crate::i18n::translate_args(
+			"extensions-ui-consent-flow-out",
+			&[("plugins", &names(subscribers))],
+		));
+	}
+	warnings
 }
 
 /// User-facing description of what granting a capability allows.
@@ -5336,6 +5396,54 @@ pub(crate) mod tests {
 			shop.requests.as_slice(),
 			[ExtensionRequest::SetSecret { value: None, .. }]
 		));
+	}
+
+	/// The consent dialog warns only about flows that can leave the device: from enabled
+	/// providers into a plugin with network or files, and from it to enabled subscribers
+	/// with network or files.
+	#[test]
+	fn consent_warns_when_shared_topics_could_carry_data_off_the_device() {
+		let plugin = |id: &str, enabled, broadcasts: &[&str], subscribes: &[&str], caps| {
+			let mut entry = entry();
+			entry.manifest.id = id.into();
+			entry.manifest.name = id.into();
+			entry.enabled = enabled;
+			entry.manifest.broadcasts = broadcasts.iter().map(|t| t.to_string()).collect();
+			entry.manifest.subscribes = subscribes.iter().map(|t| t.to_string()).collect();
+			entry.manifest.capabilities = caps;
+			entry
+		};
+		let entries = vec![
+			plugin("Archive", true, &["serein.messages/1"], &[], vec![]),
+			plugin(
+				"Uploader",
+				true,
+				&[],
+				&["serein.captions/1"],
+				vec![Capability::Network],
+			),
+			plugin("Viewer", true, &[], &["serein.captions/1"], vec![]),
+			plugin("Off", false, &["serein.messages/1"], &[], vec![]),
+		];
+		let new = plugin(
+			"New",
+			false,
+			&["serein.captions/1"],
+			&["serein.messages/1"],
+			vec![Capability::Files],
+		)
+		.manifest;
+		let warnings = data_flows(&entries, &new);
+		assert_eq!(warnings.len(), 2);
+		assert!(warnings[0].contains("Archive") && !warnings[0].contains("Off"));
+		assert!(warnings[1].contains("Uploader") && !warnings[1].contains("Viewer"));
+		let mut offline = new.clone();
+		offline.capabilities.clear();
+		offline.broadcasts.clear();
+		assert!(
+			data_flows(&entries, &offline).is_empty(),
+			"nothing can leave through it"
+		);
 	}
 
 	#[test]

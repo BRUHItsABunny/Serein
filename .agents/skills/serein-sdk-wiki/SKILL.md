@@ -5,8 +5,9 @@ description: Synchronize Serein’s creator wiki for author-visible extension SD
 
 # Maintain the Serein SDK wiki
 
-The creator wiki is `https://github.com/ViceVerse-cz/Serein/wiki`; its separate Git
-remote is `https://github.com/ViceVerse-cz/Serein.wiki.git`. The authoritative sources
+The creator wiki is `https://github.com/BRUHItsABunny/Serein/wiki`, the fork's own; its
+separate Git remote is `https://github.com/BRUHItsABunny/Serein.wiki.git`. Never publish to
+the upstream project's wiki (see "Fork" in `AGENTS.md`). The authoritative sources
 are `examples/extensions/README.md`, `docs/extension-sdk-reference.md`,
 `docs/extension-sdk-actions.md`, `docs/extension-sdk-overview.md`,
 `docs/extension-sdk-troubleshooting.md`, `docs/extensions.md`, and `docs/theme-api.md`.

@@ -1488,6 +1488,25 @@ impl LocalStore {
 			.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(64);")?;
 		Ok(())
 	}
+	/// Removes the cached history of `channels` only, such as conversations the account lost
+	/// access to; other channels and every draft stay.
+	pub fn clear_channels(&mut self, account: Id, channels: &[Id]) -> Result<()> {
+		if channels.len() > 512 || account.0 == 0 || channels.iter().any(|id| id.0 == 0) {
+			return Err(StoreError::Capacity);
+		}
+		let transaction = self.0.transaction()?;
+		for table in ["messages", "channels", "history_starts"] {
+			let mut statement = transaction.prepare(&format!(
+				"DELETE FROM {table} WHERE account=?1 AND channel=?2"
+			))?;
+			for channel in channels {
+				statement.execute(params![account.to_string(), channel.to_string()])?;
+			}
+		}
+		transaction.commit()?;
+		self.0.execute_batch("PRAGMA incremental_vacuum(64);")?;
+		Ok(())
+	}
 	pub fn delete_messages(&mut self, account: Id, channel: Id, ids: &[Id]) -> Result<()> {
 		if ids.len() > 100 || account.0 == 0 || channel.0 == 0 || ids.iter().any(|id| id.0 == 0) {
 			return Err(StoreError::Capacity);
@@ -1701,6 +1720,69 @@ mod tests {
 			Err(super::StoreError::Capacity)
 		);
 		assert_eq!(store.custom_font().unwrap().unwrap().0, "CJK");
+	}
+
+	/// Clearing some channels removes only their messages, channel rows and history starts,
+	/// in this account; other channels, other accounts and drafts stay.
+	#[test]
+	fn clearing_channels_removes_only_their_cached_history() {
+		let connection = rusqlite::Connection::open_in_memory().unwrap();
+		let mut store = super::LocalStore::initialize(connection).unwrap();
+		for (account, channel) in [("1", "10"), ("1", "11"), ("2", "10")] {
+			store
+				.0
+				.execute(
+					"INSERT INTO messages(account,channel,id,author,name,content,edited,reply,unsupported) VALUES(?1,?2,'100','5','Ada','hi',0,NULL,0)",
+					[account, channel],
+				)
+				.unwrap();
+			store
+				.0
+				.execute("INSERT INTO channels VALUES(?1,?2,1)", [account, channel])
+				.unwrap();
+			store
+				.0
+				.execute(
+					"INSERT INTO history_starts VALUES(?1,?2,'100')",
+					[account, channel],
+				)
+				.unwrap();
+		}
+		store
+			.save_draft(model::Id(1), model::Id(10), "unsent")
+			.unwrap();
+		store
+			.clear_channels(model::Id(1), &[model::Id(10)])
+			.unwrap();
+		let rows = |table: &str| -> Vec<(String, String)> {
+			let mut query = store
+				.0
+				.prepare(&format!(
+					"SELECT account,channel FROM {table} ORDER BY account,channel"
+				))
+				.unwrap();
+			query
+				.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+				.unwrap()
+				.map(|row| row.unwrap())
+				.collect()
+		};
+		let kept = vec![("1".into(), "11".into()), ("2".into(), "10".into())];
+		for table in ["messages", "channels", "history_starts"] {
+			assert_eq!(rows(table), kept, "{table}");
+		}
+		assert_eq!(
+			store
+				.load_drafts(model::Id(1))
+				.unwrap()
+				.get(&model::Id(10))
+				.map(String::as_str),
+			Some("unsent")
+		);
+		assert_eq!(
+			store.clear_channels(model::Id(1), &vec![model::Id(1); 513]),
+			Err(super::StoreError::Capacity)
+		);
 	}
 
 	#[test]

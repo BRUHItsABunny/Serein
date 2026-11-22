@@ -695,8 +695,8 @@ written directly to Discord through the existing authenticated transport, never 
 settings file. Relationship state keeps at most 4000 fixed ID/bool entries with a 128 KiB
 estimated allocation ceiling; only one fixed-size action may be pending. DM mute state reuses
 the existing bounded notification overrides. Logout clears both with other account RAM state.
-Closing a DM preserves its local draft. Accepted navigation removal uses the existing account
-history invalidation path, which can clear other cached history but preserves drafts. The
+Closing a DM preserves its local draft. Accepted navigation removal deletes only the removed
+conversations' cached history (see "Scoped history deletion" below) and preserves drafts. The
 standalone offline fixture changes synthetic RAM only and issues no service or storage writes.
 
 Current reply metadata schema is 10. It adds one constrained reply_deleted boolean to each
@@ -852,7 +852,7 @@ Microphone gain and speaker volume are saved bounded integer percentages (0..=20
 initially 100. System mixer settings are unchanged. Two callback atomics hold active levels;
 no audio is retained. Preview levels remain session-only.
 
-Loaded thread navigation shares the 4,000-entry account navigation and 4 MiB normalized navigation budgets. Incoming thread syncs additionally cap combined parent/thread entries at 4,000 and normalized snapshot metadata at 2 MiB; wire JSON remains capped at 4 MiB. Removed-member arrays are capped at 4,000 and are discarded after checking the owner. Navigation/member lists are session-only; selected thread messages/drafts reuse existing account history/draft storage. Actual accepted thread removals enqueue the existing account-wide history clear, preserving drafts; ignored, empty-scope and rename-only events do not clear disk history. This coarse invalidation trades refetch cost for simpler deletion, without new tables or workers.
+Loaded thread navigation shares the 4,000-entry account navigation and 4 MiB normalized navigation budgets. Incoming thread syncs additionally cap combined parent/thread entries at 4,000 and normalized snapshot metadata at 2 MiB; wire JSON remains capped at 4 MiB. Removed-member arrays are capped at 4,000 and are discarded after checking the owner. Navigation/member lists are session-only; selected thread messages/drafts reuse existing account history/draft storage. Actual accepted thread removals delete only those threads' cached history, preserving drafts; ignored, empty-scope and rename-only events do not clear disk history.
 
 The owner explicitly withdrew the no-storage policy on 2026-09-09. Local files, SQLite, saved drafts, settings and caches are permitted. The implementation persists **history with embeds, attachments and mentioned users; avatar/server-icon/banner/preview images; drafts; appearance; reading/layout preferences; and the login token**. Normal window size and supported outer position are retained in the bounded device-local app_preferences singleton.
 
@@ -1062,9 +1062,8 @@ account, selected server and query changes invalidate results; navigation/sessio
 reset releases the cache. No catalog strings or image pixels are duplicated.
 
 
-Channel obfuscation and accepted READY removals invalidate inaccessible history using the existing
-account-wide ClearHistory operation; readable-to-unsupported channel changes count as removal.
-This deliberately trades a broader history refetch for no new per-channel deletion API. Cache
+Channel obfuscation and accepted READY removals delete the inaccessible conversations' cached
+history only; readable-to-unsupported channel changes count as removal. Cache
 hydration requires the current request, a pending empty loading view, a loaded text channel and
 matching message channel IDs. Late disk/HTTP responses cannot refill a revoked view. Drafts remain
 available for recovery. This does not erase explicit downloaded files or promise deletion of
@@ -1082,8 +1081,8 @@ RSS. Decisions expire at timeout boundaries, are recomputed after clock rollback
 cleared on metadata updates. Logout/READY replace the session mirror.
 
 Current VIEW and READ_MESSAGE_HISTORY are required for HTTP/cache admission and history
-persistence. Read-access loss, including thread parent/type changes, queues the existing
-account-wide ClearHistory operation. Sending-only permission changes do not erase cached
+persistence. Read-access loss, including thread parent/type changes, deletes only the affected
+conversations' cached history. Sending-only permission changes do not erase cached
 history. VIEW-only live messages stay in the bounded RAM timeline without being persisted.
 Existing recovery drafts and explicitly downloaded files keep their documented lifecycle.
 No schema change or external runtime dependency is added; UI tests reuse the existing
@@ -2185,6 +2184,16 @@ it from the file. Drafts and messages handed to hooks are not stored by the host
 plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with the
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
+
+## Scoped history deletion (November 22, 2026)
+
+Losing one conversation no longer clears the account's whole history cache. When channels
+are removed or become unreadable, when one channel or server becomes unavailable (with its
+threads), when the user is removed from a group DM, or when the open conversation's history
+or reactions are refused, only those channels' cached messages, channel rows and history
+starts are deleted, in one transaction of at most 512 channels. Drafts stay. A failed
+deletion disables the history cache until restart, like other deletions. A session-wide
+reset (resync or a permission model reset) still clears the account's cached history.
 
 ## Catalog sources (preview, November 22, 2026)
 
