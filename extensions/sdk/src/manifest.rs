@@ -136,6 +136,8 @@ pub enum Capability {
 	/// Show a [`crate::Page`] in the main area from activation and panel actions; see
 	/// [`crate::PageOutput`].
 	Pages,
+	/// Show caption lines above the call controls; see [`crate::CaptionOutput`].
+	CallCaptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

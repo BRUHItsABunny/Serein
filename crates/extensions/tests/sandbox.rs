@@ -1388,3 +1388,122 @@ fn pages_need_their_grant_and_rows_answer_exactly_the_request() {
 	let output: Output = serde_json::from_value(sdk_close).unwrap();
 	assert!(matches!(output.page, Some(None)));
 }
+
+#[test]
+fn annotators_add_history_and_deleted_rows_only_around_their_messages_and_captions_need_a_grant() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::MessageAnnotations, Capability::CallCaptions];
+	manifest.actions = vec![
+		Action {
+			id: "notes".into(),
+			label: "Notes".into(),
+			surface: Surface::Annotate,
+		},
+		Action {
+			id: "open".into(),
+			label: "Open".into(),
+			surface: Surface::Panel,
+		},
+	];
+	manifest.validate().unwrap();
+	let message = |id: &str| AnnotateMessage {
+		message_id: id.into(),
+		author_id: "2".into(),
+		content: "hola".into(),
+		edited: true,
+	};
+	let batch = Invocation {
+		action: "notes".into(),
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: vec![message("10"), message("30")],
+		})),
+		..Default::default()
+	};
+	let history = |id: &str| MessageHistory {
+		message_id: id.into(),
+		revisions: vec![PageRevision {
+			time_ms: Some(1),
+			text: "earlier\ntext".into(),
+		}],
+	};
+	let deleted = |after: &str, id: &str| DeletedMessages {
+		after_message_id: after.into(),
+		messages: vec![DeletedMessage {
+			message_id: id.into(),
+			author: "Ada".into(),
+			time_ms: None,
+			text: "gone".into(),
+		}],
+	};
+	let output = |histories, deleted_messages| Output {
+		histories,
+		deleted_messages,
+		..Default::default()
+	};
+	output(vec![history("10")], vec![deleted("10", "20")])
+		.validate(&manifest, &batch)
+		.unwrap();
+	for (invalid, why) in [
+		(
+			output(vec![history("99")], vec![]),
+			"history of a message not given",
+		),
+		(
+			output(vec![history("10"), history("10")], vec![]),
+			"duplicate history",
+		),
+		(
+			output(vec![], vec![deleted("99", "20")]),
+			"anchor not given",
+		),
+		(
+			output(vec![], vec![deleted("10", "30")]),
+			"a loaded message is not deleted",
+		),
+	] {
+		assert!(invalid.validate(&manifest, &batch).is_err(), "{why}");
+	}
+	let mut too_many = deleted("10", "20");
+	too_many.messages = (0..26)
+		.map(|id| DeletedMessage {
+			message_id: (100 + id).to_string(),
+			author: "Ada".into(),
+			time_ms: None,
+			text: "gone".into(),
+		})
+		.collect();
+	assert!(matches!(
+		output(vec![], vec![too_many]).validate(&manifest, &batch),
+		Err(Error::Limit)
+	));
+	let open = Invocation {
+		action: "open".into(),
+		..Default::default()
+	};
+	assert!(
+		output(vec![history("10")], vec![])
+			.validate(&manifest, &open)
+			.is_err(),
+		"only annotate and message actions add history"
+	);
+
+	let captions = |text: &str| Output {
+		captions: Some(vec![Caption {
+			speaker_id: Some("5".into()),
+			text: text.into(),
+			done: true,
+		}]),
+		..Default::default()
+	};
+	captions("hello").validate(&manifest, &open).unwrap();
+	assert!(captions("two\nlines").validate(&manifest, &open).is_err());
+	assert!(
+		captions("hello").validate(&manifest, &batch).is_err(),
+		"hooks do not caption"
+	);
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities = vec![Capability::MessageAnnotations];
+	assert!(captions("hello").validate(&ungranted, &open).is_err());
+}

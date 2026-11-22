@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 67 capabilities, with at most 96 distinct declarations per manifest.
+supports 68 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -185,6 +185,7 @@ supports 67 capabilities, with at most 96 distinct declarations per manifest.
 | `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on; notes are shown, never sent |
 | `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
 | `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
+| `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -506,7 +507,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 67 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 68 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -780,6 +781,37 @@ four plugins may annotate one channel.
 
 ```json
 {"annotations": [{"message_id": "1300000000000000000", "text": "Hi everyone"}]}
+```
+
+**History and deleted rows.** The same results may return `histories` and
+`deleted_messages`, under the same rules: each names a message the action was given, once.
+
+- `histories: [{"message_id", "revisions": [{"time_ms", "text"}]}]` gives up to 8 earlier
+  versions of a message, oldest first. The message's **(edited)** label then opens them,
+  labelled with the plugin's name; a message the client does not know as edited gets a
+  **(history)** label. An empty list removes the plugin's history for it.
+- `deleted_messages: [{"after_message_id", "messages": [{"message_id", "author",
+  "time_ms", "text"}]}]` shows deleted messages the plugin kept as struck-through rows
+  under the message they followed, marked "deleted · kept by" the plugin. At most 25 rows
+  per result; a deleted row cannot be one of the given messages. An empty list removes
+  the plugin's rows there.
+
+Texts follow page rows: at most 4 KiB, line breaks allowed. Like notes, they live in RAM
+within the same 2,000-message, 2 MiB budget and never reach Discord.
+
+## Call captions (preview)
+
+With `call_captions`, any action except `send`, `annotate`, `notification` and page row
+fetches may return `captions`: up to 4 lines of at most 512 bytes, without control
+characters or line breaks, each with an optional `speaker_id` and `final`. They replace
+the plugin's previous lines; an empty list clears them. The host shows them in a bar
+above the call controls, with the speaker's name from the call roster (or the plugin's
+name), and unfinished lines dimmer. Lines fade 10 seconds after the plugin's last update,
+are shown only during a call, and at most two plugins' lines show at once. A `topic`
+subscriber, such as one receiving `serein.captions/1`, can return them from each delivery.
+
+```json
+{"captions": [{"speaker_id": "1200000000000000000", "text": "Can everyone hear me?", "final": true}]}
 ```
 
 ## Notification hook (preview)

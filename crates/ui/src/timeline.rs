@@ -505,6 +505,101 @@ pub(crate) fn fill_header_line(ui: &mut egui::Ui, compact: bool, text_line: egui
 		ui.expand_to_include_y(text_line.bottom() + slack);
 	}
 }
+/// The "edited" label; when plugins supplied earlier versions it opens them.
+fn plugin_history(
+	ui: &mut egui::Ui,
+	edited: bool,
+	notes: &[extension_host::hooks::Note],
+	colors: &crate::design::Palette,
+) {
+	let label = crate::i18n::translate(if edited {
+		"timeline-show-with-scroll-edited"
+	} else {
+		"timeline-plugin-history"
+	});
+	if notes.iter().all(|note| note.history.is_empty()) {
+		ui.label(RichText::new(label).small().color(colors.muted));
+		return;
+	}
+	let button = ui.add(
+		egui::Button::new(RichText::new(label).small().color(colors.muted))
+			.frame(false)
+			.small(),
+	);
+	egui::Popup::from_toggle_button_response(&button).show(|ui| {
+		ui.set_max_width(420.0);
+		egui::ScrollArea::vertical()
+			.max_height(320.0)
+			.show(ui, |ui| {
+				for note in notes.iter().filter(|note| !note.history.is_empty()) {
+					ui.label(
+						RichText::new(crate::i18n::translate_args(
+							"timeline-plugin-history-from",
+							&[("plugin", &note.name)],
+						))
+						.small()
+						.strong()
+						.color(colors.muted),
+					);
+					for revision in &note.history {
+						if let Some(time) = revision.time_ms.and_then(plugin_time) {
+							ui.label(
+								RichText::new(crate::local_time::full(time))
+									.small()
+									.color(colors.muted),
+							);
+						}
+						ui.add(egui::Label::new(&revision.text).wrap());
+						ui.add_space(4.0);
+					}
+					ui.separator();
+				}
+			});
+	});
+}
+
+/// A deleted message a plugin kept, drawn plainly where it was.
+fn archived_row(
+	ui: &mut egui::Ui,
+	plugin: &str,
+	row: &extension_host::hooks::Archived,
+	colors: &crate::design::Palette,
+) {
+	egui::Frame::new()
+		.inner_margin(egui::Margin::symmetric(8, 4))
+		.corner_radius(4)
+		.stroke(egui::Stroke::new(1.0, colors.danger.gamma_multiply(0.35)))
+		.show(ui, |ui| {
+			ui.horizontal_wrapped(|ui| {
+				ui.spacing_mut().item_spacing.x = 6.0;
+				ui.label(RichText::new(&row.author).small().strong());
+				if let Some(time) = row.time_ms.and_then(plugin_time) {
+					ui.label(
+						RichText::new(crate::local_time::header(time))
+							.small()
+							.color(colors.muted),
+					);
+				}
+				ui.label(
+					RichText::new(crate::i18n::translate_args(
+						"timeline-plugin-deleted",
+						&[("plugin", plugin)],
+					))
+					.small()
+					.color(colors.danger),
+				);
+			});
+			ui.add(
+				egui::Label::new(RichText::new(&row.text).color(colors.muted).strikethrough())
+					.wrap(),
+			);
+		});
+}
+
+fn plugin_time(ms: i64) -> Option<time::OffsetDateTime> {
+	time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+}
+
 // Discord snowflakes carry milliseconds since 2015-01-01. All u64 IDs fit time's range.
 fn timestamp(id: Id) -> time::OffsetDateTime {
 	crate::local_time::local(
@@ -4198,16 +4293,15 @@ impl TimelineView {
 												self.heights.remove(&id);
 												ui.ctx().request_repaint();
 											}
-											if message.edited {
-												ui.label(
-													RichText::new(crate::i18n::translate(
-														"timeline-show-with-scroll-edited",
-													))
-													.small()
-													.color(colors.muted),
-												);
+											let notes = self.notes.get(message.id);
+											let history =
+												notes.iter().any(|note| !note.history.is_empty());
+											if message.edited || history {
+												plugin_history(ui, message.edited, notes, &colors);
 											}
-											for note in self.notes.get(message.id) {
+											for note in
+												notes.iter().filter(|note| !note.text.is_empty())
+											{
 												ui.horizontal_wrapped(|ui| {
 													ui.spacing_mut().item_spacing.x = 6.0;
 													ui.label(
@@ -4222,6 +4316,11 @@ impl TimelineView {
 															.color(colors.muted),
 													);
 												});
+											}
+											for note in notes {
+												for row in &note.deleted {
+													archived_row(ui, &note.name, row, &colors);
+												}
 											}
 											if !message.components.is_empty() {
 												let shown = ui.scope(|ui| {

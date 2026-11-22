@@ -4041,6 +4041,9 @@ timeline-show-with-scroll-dismiss-message = Dismiss message
 timeline-show-with-scroll-display-limited-copy-message-for-the-full-text = Display limited · Copy message for the full text
 # Context: show_with_scroll
 timeline-show-with-scroll-edited = (edited)
+timeline-plugin-history = (history)
+timeline-plugin-history-from = Earlier versions from { $plugin }
+timeline-plugin-deleted = deleted · kept by { $plugin }
 # Context: show_with_scroll
 timeline-show-with-scroll-forwarded = ↪ Forwarded
 # Context: show_with_scroll

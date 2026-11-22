@@ -7,7 +7,12 @@ mod runtime;
 pub use runtime::{invoke, invoke_with};
 pub mod imports;
 pub mod message_hooks;
-pub use message_hooks::{AnnotateBatch, AnnotateMessage, Annotation, SendTarget};
+pub use message_hooks::{
+	AnnotateBatch, AnnotateMessage, Annotation, DeletedMessage, DeletedMessages, MessageHistory,
+	SendTarget,
+};
+pub mod captions;
+pub use captions::Caption;
 pub mod notification_hook;
 pub mod pages;
 pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
@@ -191,6 +196,8 @@ pub enum Capability {
 	/// Show a page in the main area from activation and panel actions, with a long list the
 	/// host fetches from a panel action as the user scrolls.
 	Pages,
+	/// Show a few caption lines above the call controls during a call.
+	CallCaptions,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -850,6 +857,18 @@ pub struct Output {
 	/// Rows answering the invocation's `page_request`. Requires `pages`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub page_rows: Option<PageRows>,
+	/// Earlier versions of messages, shown behind their "edited" label; same rules as
+	/// `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub histories: Vec<MessageHistory>,
+	/// Deleted messages the plugin kept, shown as deleted rows under the message they
+	/// followed; same rules as `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub deleted_messages: Vec<DeletedMessages>,
+	/// This plugin's caption lines in the call; an empty list clears them. Requires
+	/// `call_captions`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub captions: Option<Vec<Caption>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1543,7 +1562,10 @@ impl Output {
 				screen.validate().map_err(|_| Error::Invalid)?;
 			}
 		}
-		if !self.annotations.is_empty() {
+		if !self.annotations.is_empty()
+			|| !self.histories.is_empty()
+			|| !self.deleted_messages.is_empty()
+		{
 			let allowed: Vec<&str> = match (surface, &input.annotate, &input.selected_message_ref) {
 				(Surface::Annotate, Some(batch), _) => batch
 					.messages
@@ -1560,6 +1582,7 @@ impl Output {
 				return Err(Error::Capability);
 			}
 			message_hooks::validate_annotations(&self.annotations, &allowed)?;
+			message_hooks::validate_history(&self.histories, &self.deleted_messages, &allowed)?;
 		}
 		match (&self.notification, surface == Surface::Notification) {
 			(Some(decision), true) => decision.validate()?,
@@ -1591,6 +1614,17 @@ impl Output {
 				|| !matches!(surface, Surface::Activation | Surface::Panel))
 		{
 			return Err(Error::Capability);
+		}
+		if let Some(captions) = &self.captions {
+			if !manifest.capabilities.contains(&Capability::CallCaptions)
+				|| matches!(
+					surface,
+					Surface::Send | Surface::Annotate | Surface::Notification
+				) || input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			captions::validate(captions)?;
 		}
 		match (&self.page_rows, &input.page_request) {
 			(Some(rows), Some(request)) => rows.validate(request)?,

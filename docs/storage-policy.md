@@ -2186,6 +2186,13 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin call captions and message history (preview, November 21, 2026)
+
+Nothing is written to disk. Earlier versions and kept deleted rows plugins return share
+the RAM budget of notes (2,000 messages, 2 MiB). Caption lines live in RAM, at most four
+lines from two plugins, and are dropped 10 seconds after the plugin's last update, when
+the call ends, the plugin stops or the account changes.
+
 ## Plugin pages (preview, November 21, 2026)
 
 Nothing is written to disk. An open page and its fetched rows live in RAM, at most 2,000

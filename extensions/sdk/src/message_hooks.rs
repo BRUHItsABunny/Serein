@@ -63,14 +63,44 @@ pub struct Annotation {
 	pub text: String,
 }
 
+/// Earlier versions of a message, oldest first, shown behind its "edited" label; an empty
+/// list removes your history for it. At most 8 versions of 4 KiB each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageHistory {
+	pub message_id: String,
+	pub revisions: Vec<crate::PageRevision>,
+}
+
+/// Deleted messages you kept, shown as deleted rows under the message they followed; an
+/// empty list removes your rows there. At most 25 rows per result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedMessages {
+	pub after_message_id: String,
+	pub messages: Vec<DeletedMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedMessage {
+	/// Must not be one of the messages you were given.
+	pub message_id: String,
+	pub author: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub time_ms: Option<i64>,
+	pub text: String,
+}
+
 /// Output of an `annotate` action, or of a `message` action annotating the chosen message.
-/// Each note must name a message the action was given.
+/// Each note, history and deleted-row anchor must name a message the action was given.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotationOutput {
 	#[serde(flatten)]
 	pub output: Output,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub annotations: Vec<Annotation>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub histories: Vec<MessageHistory>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub deleted_messages: Vec<DeletedMessages>,
 }
 
 #[cfg(test)]

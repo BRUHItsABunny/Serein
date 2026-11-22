@@ -596,6 +596,8 @@ pub struct MessagingUi {
 	pub notification_options: model::notification_preferences::Device,
 	pub notification_preview: Option<model::notification_preferences::Sound>,
 	pub notification_sound_status: &'static str,
+	/// Caption lines plugins show above the call controls.
+	pub call_captions: extension_host::captions::Captions,
 	pub notification_test_available: bool,
 	pub notification_test_requested: bool,
 	pub notification_status: &'static str,

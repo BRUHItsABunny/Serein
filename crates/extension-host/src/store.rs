@@ -431,6 +431,8 @@ pub enum Event {
 	TopicDelivered {
 		id: String,
 		more: bool,
+		/// Caption lines the subscriber returned, which the host shows in the call.
+		captions: Option<Vec<extensions::Caption>>,
 	},
 	/// The account's approved plugin subscriptions.
 	Subscriptions(Vec<Subscription>),
@@ -1445,6 +1447,7 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Ok(Event::TopicDelivered {
 					id,
 					more: topics_more,
+					captions: output.captions,
 				});
 			}
 			Ok(Event::Invoked { id, output })

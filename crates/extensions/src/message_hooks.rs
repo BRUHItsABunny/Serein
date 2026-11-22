@@ -82,6 +82,99 @@ pub struct Annotation {
 	pub text: String,
 }
 
+/// Earlier versions of a message the plugin was given, oldest first, shown behind its
+/// "edited" label; an empty list removes this plugin's history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageHistory {
+	pub message_id: String,
+	pub revisions: Vec<crate::PageRevision>,
+}
+
+/// Deleted messages the plugin kept, shown as deleted rows under the message they followed;
+/// an empty list removes this plugin's rows there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletedMessages {
+	pub after_message_id: String,
+	pub messages: Vec<DeletedMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletedMessage {
+	pub message_id: String,
+	pub author: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub time_ms: Option<i64>,
+	pub text: String,
+}
+
+/// Most deleted rows one result may add under all its messages.
+pub const MAX_DELETED_ROWS: usize = 25;
+
+/// Checks returned histories and deleted rows against the messages the plugin was given.
+pub(crate) fn validate_history(
+	histories: &[MessageHistory],
+	deleted: &[DeletedMessages],
+	allowed: &[&str],
+) -> Result<(), Error> {
+	if histories.len() > MAX_ANNOTATE_MESSAGES || deleted.len() > MAX_ANNOTATE_MESSAGES {
+		return Err(Error::Limit);
+	}
+	let anchors = histories
+		.iter()
+		.map(|history| history.message_id.as_str())
+		.chain(deleted.iter().map(|rows| rows.after_message_id.as_str()));
+	let mut seen = std::collections::BTreeSet::new();
+	for (index, id) in anchors.enumerate() {
+		// Each message once among histories, and once among deleted rows.
+		let list = usize::from(index >= histories.len());
+		if !allowed.contains(&id) || !seen.insert((list, id)) {
+			return Err(Error::Invalid);
+		}
+	}
+	let text = |text: &str| {
+		if text.len() > crate::pages::MAX_PAGE_ROW_TEXT_BYTES {
+			Err(Error::Limit)
+		} else if text.chars().any(|c| c.is_control() && c != '\n') {
+			Err(Error::Invalid)
+		} else {
+			Ok(())
+		}
+	};
+	for history in histories {
+		if history.revisions.len() > crate::pages::MAX_PAGE_REVISIONS {
+			return Err(Error::Limit);
+		}
+		for revision in &history.revisions {
+			text(&revision.text)?;
+		}
+	}
+	let mut rows = 0;
+	for group in deleted {
+		rows += group.messages.len();
+		if rows > MAX_DELETED_ROWS {
+			return Err(Error::Limit);
+		}
+		for message in &group.messages {
+			app::entity_id(&message.message_id)?;
+			// A deleted row is not one of the loaded messages it sits between.
+			if allowed.contains(&message.message_id.as_str()) {
+				return Err(Error::Invalid);
+			}
+			if message.author.len() > crate::pages::MAX_PAGE_AUTHOR_BYTES
+				|| message.author.trim().is_empty()
+				|| message.author.chars().any(char::is_control)
+			{
+				return Err(Error::Invalid);
+			}
+			text(&message.text)?;
+		}
+	}
+	Ok(())
+}
+
 /// Checks returned notes: each names a message the plugin was given, at most once, and fits.
 pub(crate) fn validate_annotations(
 	annotations: &[Annotation],

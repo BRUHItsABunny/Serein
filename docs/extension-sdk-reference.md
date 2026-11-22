@@ -103,7 +103,7 @@ common optional fields above may instead be serialized as `null`.
 | `menu_target` | `Option<MenuTarget>` / object tagged by `kind` or absent | For `user`, `channel`, `server` and `role` actions only, and always present for them: `{"kind":"user","user_id","guild_id"?,"channel_id"?}`, `{"kind":"channel","channel_id","guild_id"?}`, `{"kind":"server","guild_id"}` or `{"kind":"role","guild_id","role_id","user_id"?,"name","color"}`. Role actions appear when a role in a member's profile is right-clicked; `user_id` is that member, and `name` and `color` (`0xRRGGBB`, `0` for none) are what its chip shows. Requires `context_menus`. Other targets carry IDs only; read details through your other grants. Available through `MenuInvocation`. | `match &input.menu_target { Some(MenuTarget::User { user_id, .. }) => …, _ => … }` |
 | `tick_ms` | `Option<u64>` / integer or absent | Elapsed milliseconds since this plugin was enabled for the session. Present only on preview `tick` calls through `TickInvocation`. | `input.tick_ms` |
 | `send_target` | `Option<SendTarget>` / object or absent | Preview. `channel_id` and, in servers, `guild_id` the draft in `composer` is being sent to. Present only on `send` actions, with `send_hook`, through `SendInvocation`. Return the text to send in `Output::replacement`, or `None` to send the draft unchanged. | `input.send_target.as_ref().map(\|t\| &t.channel_id)` |
-| `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
+| `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. `histories` and `deleted_messages` add earlier versions and kept deleted rows the same way. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
 | `notification` | `Option<Notification>` / object or absent | Preview. The desktop alert about to be shown: `source` (`gateway` or `push`), `message_id`, `channel_id`, `guild_id`, `author_id`, `direct`, `title`, `body` and `upgrade`. Present only on `notification` actions, with `notifications`, through `NotificationInvocation`. Answer with `NotificationOutput::notification` (`hide`, or a new `title`/`body`); the original shows if you fail or take longer than 1.5 s. | `input.notification.as_ref().map(\|n\| &n.body)` |
 | `page_request` | `Option<PageRequest>` / object or absent | Preview. `version`, `start` and `count` (1–100) of the rows a page list needs. Present only on the list's `rows_action`, a panel action, with `pages`, through `PageInvocation`. Answer with `PageOutput::page_rows` for the same version and start, at most `count` rows. | `input.page_request.as_ref().map(\|r\| r.start)` |
 
@@ -211,7 +211,8 @@ account snapshot or grant-dependent data:
       "send_hook",
       "message_annotations",
       "notifications",
-      "pages"
+      "pages",
+      "call_captions"
     ],
     "app_events": [
       "ready",

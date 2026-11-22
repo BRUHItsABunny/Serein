@@ -8,6 +8,7 @@
 //! journal ([`journal`]). Device-local UI state reaches snapshots through [`HostLocal`].
 
 pub mod broker;
+pub mod captions;
 pub mod data_events;
 pub mod database;
 pub mod forum_data;

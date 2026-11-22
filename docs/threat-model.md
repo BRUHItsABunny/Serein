@@ -21,7 +21,8 @@ messages and can only add notes the host renders as plain text. A notification p
 sees the sender and preview of every alert Serein would show and may reword or hide it,
 but cannot create alerts, silence sounds or delay one past 1.5 s. Plugin pages show only
 text the plugin returns, drawn by the host as plain text in bounded rows; they read nothing
-from the client themselves. Only explicitly granted, user-selected context crosses that boundary.
+from the client themselves. Histories, kept deleted rows and call captions are likewise
+plugin-supplied plain text, labelled with the plugin's name and never sent to Discord. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

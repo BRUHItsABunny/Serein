@@ -1224,10 +1224,12 @@ impl ExtensionUi {
 		if self.receive_page(&id, &invocation, &mut output, state) {
 			return;
 		}
-		self.receive_annotations(&id, &output.annotations);
+		self.receive_annotations(&id, &output);
 		// Notes need no review: a batch, or a message action that only annotated.
 		if invocation.annotate.is_some()
-			|| !output.annotations.is_empty()
+			|| (!output.annotations.is_empty()
+				|| !output.histories.is_empty()
+				|| !output.deleted_messages.is_empty())
 				&& output.panel.is_empty()
 				&& output.effects.is_empty()
 				&& output.replacement.is_none()
@@ -3894,6 +3896,7 @@ fn capability_label(capability: Capability) -> &'static str {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
 		Capability::Pages => "Show its own pages in the main area",
+		Capability::CallCaptions => "Show caption lines above the call controls during calls",
 		Capability::Notifications => {
 			"See every desktop notification, including its message preview, and reword or hide it"
 		}

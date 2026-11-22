@@ -206,22 +206,57 @@ impl AnnotateTracker {
 	}
 }
 
-/// One plugin's note under a message.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One plugin's additions to a message: a note under it, earlier versions behind its
+/// "edited" label, and deleted messages the plugin kept, shown as rows under it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Note {
 	pub plugin: String,
 	/// The plugin's name when the note arrived, shown with it.
 	pub name: String,
+	/// Empty without a note.
+	pub text: String,
+	/// Oldest first.
+	pub history: Vec<Revision>,
+	pub deleted: Vec<Archived>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Revision {
+	pub time_ms: Option<i64>,
+	pub text: String,
+}
+
+/// A deleted message a plugin kept, shown where it was.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Archived {
+	pub message: Id,
+	pub author: String,
+	pub time_ms: Option<i64>,
 	pub text: String,
 }
 
 impl Note {
 	fn bytes(&self) -> usize {
-		self.plugin.len() + self.name.len() + self.text.len()
+		self.plugin.len()
+			+ self.name.len()
+			+ self.text.len()
+			+ self
+				.history
+				.iter()
+				.map(|revision| size_of::<Revision>() + revision.text.len())
+				.sum::<usize>()
+			+ self
+				.deleted
+				.iter()
+				.map(|row| size_of::<Archived>() + row.author.len() + row.text.len())
+				.sum::<usize>()
+	}
+	fn is_empty(&self) -> bool {
+		self.text.is_empty() && self.history.is_empty() && self.deleted.is_empty()
 	}
 }
 
-/// Notes plugins added under messages, in memory only and bounded.
+/// What plugins added to messages, in memory only and bounded.
 #[derive(Default)]
 pub struct Annotations {
 	notes: HashMap<Id, Vec<Note>>,
@@ -229,7 +264,7 @@ pub struct Annotations {
 	bytes: usize,
 }
 
-/// Messages with notes kept, and the bytes of all notes.
+/// Messages with additions kept, and the bytes of all of them.
 const MAX_NOTED: usize = 2000;
 const MAX_NOTE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -240,16 +275,32 @@ impl Annotations {
 		if text.len() > MAX_ANNOTATION_BYTES {
 			return;
 		}
+		self.update(plugin, name, message, |note| note.text = text.to_owned());
+	}
+	/// Sets the earlier versions `plugin` knows of `message`; an empty list removes them.
+	pub fn set_history(&mut self, plugin: &str, name: &str, message: Id, history: Vec<Revision>) {
+		self.update(plugin, name, message, |note| note.history = history);
+	}
+	/// Sets the deleted messages `plugin` shows under `message`; an empty list removes them.
+	pub fn set_deleted(&mut self, plugin: &str, name: &str, message: Id, rows: Vec<Archived>) {
+		self.update(plugin, name, message, |note| note.deleted = rows);
+	}
+	fn update(&mut self, plugin: &str, name: &str, message: Id, change: impl FnOnce(&mut Note)) {
 		let notes = self.notes.entry(message).or_default();
-		if let Some(index) = notes.iter().position(|note| note.plugin == plugin) {
-			self.bytes -= notes.remove(index).bytes();
-		}
-		if !text.is_empty() {
-			let note = Note {
+		let mut note = match notes.iter().position(|note| note.plugin == plugin) {
+			Some(index) => {
+				let note = notes.remove(index);
+				self.bytes -= note.bytes();
+				note
+			}
+			None => Note {
 				plugin: plugin.to_owned(),
-				name: name.chars().take(64).collect(),
-				text: text.to_owned(),
-			};
+				..Default::default()
+			},
+		};
+		note.name = name.chars().take(64).collect();
+		change(&mut note);
+		if !note.is_empty() {
 			self.bytes += note.bytes();
 			notes.push(note);
 			notes.sort_by(|a, b| a.plugin.cmp(&b.plugin));
@@ -295,7 +346,7 @@ impl Annotations {
 			.map(|(id, _)| *id)
 			.collect();
 		for message in messages {
-			self.set(plugin, "", message, "");
+			self.update(plugin, "", message, |note| *note = Note::default());
 		}
 	}
 
@@ -374,6 +425,31 @@ mod tests {
 			before,
 			"row layouts see the change"
 		);
+		// A history or deleted rows keep a plugin's entry without a note, and clearing all
+		// three removes it.
+		let revision = Revision {
+			time_ms: None,
+			text: "earlier".into(),
+		};
+		notes.set_history("a", "A", Id(1), vec![revision.clone()]);
+		notes.set_deleted(
+			"a",
+			"A",
+			Id(1),
+			vec![Archived {
+				message: Id(2),
+				author: "Ada".into(),
+				time_ms: None,
+				text: "gone".into(),
+			}],
+		);
+		notes.set("a", "A", Id(1), "");
+		let kept = &notes.get(Id(1))[0];
+		assert_eq!((kept.history.len(), kept.deleted.len()), (1, 1));
+		notes.set_history("a", "A", Id(1), Vec::new());
+		notes.set_deleted("a", "A", Id(1), Vec::new());
+		assert_eq!(notes.get(Id(1)).len(), 1, "only plugin b's note is left");
+		notes.set_history("a", "A", Id(1), vec![revision]);
 		for id in 0..MAX_NOTED as u64 + 10 {
 			notes.set("a", "A", Id(100 + id), "x");
 		}

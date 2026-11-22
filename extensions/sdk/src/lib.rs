@@ -49,6 +49,8 @@ mod notification_hook;
 pub use notification_hook::*;
 mod pages;
 pub use pages::*;
+mod captions;
+pub use captions::*;
 
 /// Maximum serialized size of either ABI buffer, in UTF-8 bytes.
 pub const MAX_IO_BYTES: usize = 256 * 1024;

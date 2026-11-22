@@ -928,6 +928,7 @@ impl Bridge {
 			self.message_events.clear();
 			self.channel_hooks.clear();
 			self.annotated.clear();
+			messaging.call_captions.clear();
 			self.notify.dismiss(true);
 			self.notify_running = None;
 			messaging.extensions.channel_hooks.clear();
@@ -1136,8 +1137,9 @@ impl Bridge {
 						.clone_from(&subscriptions);
 					self.subscriptions = subscriptions;
 				}
-				Ok(Event::TopicDelivered { id, .. }) => {
+				Ok(Event::TopicDelivered { id, captions, .. }) => {
 					self.topic_retry.remove(&id);
+					self.show_captions(state, messaging, &id, captions);
 				}
 				Ok(Event::Loaded {
 					catalog,
@@ -1278,6 +1280,7 @@ impl Bridge {
 					}
 					self.annotated.forget(&id);
 					messaging.extensions.forget_annotations(Some(&id));
+					messaging.call_captions.remove_plugin(&id);
 					self.ticks.remove(&id);
 					self.transitions.remove(&id);
 					let theme = self.installed.iter().any(|entry| {
@@ -1300,11 +1303,12 @@ impl Bridge {
 						};
 					}
 				}
-				Ok(Event::Invoked { id, output })
+				Ok(Event::Invoked { id, mut output })
 					if pending
 						.as_ref()
 						.is_some_and(|pending| pending.tick.as_deref() == Some(id.as_str())) =>
 				{
+					self.show_captions(state, messaging, &id, output.captions.take());
 					let now = Instant::now();
 					if let Some(schedule) = self.ticks.get_mut(&id) {
 						schedule.next_due =
@@ -1963,6 +1967,10 @@ impl Bridge {
 			}
 		}
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
+		// Captions belong to the call they were shown in.
+		if state.voice.active.is_none() {
+			messaging.call_captions.clear();
+		}
 		self.notifications(&account, state, ctx, messaging);
 		self.journal(&account, state, ctx, messaging);
 		self.topics(&account, state.generation, ctx, messaging);
@@ -2100,6 +2108,28 @@ impl Bridge {
 			ctx,
 			messaging,
 		);
+	}
+	/// Shows a running plugin's caption lines while the user is in a call.
+	fn show_captions(
+		&self,
+		state: &State,
+		messaging: &mut ui::MessagingUi,
+		id: &str,
+		captions: Option<Vec<extensions::Caption>>,
+	) {
+		let Some(captions) = captions else {
+			return;
+		};
+		let Some(entry) = self.installed.iter().find(|entry| {
+			entry.manifest.id == id && entry.error.is_none() && !self.disabled.contains(id)
+		}) else {
+			return;
+		};
+		if state.voice.active.is_some() {
+			messaging
+				.call_captions
+				.set(id, &entry.manifest.name, captions, Instant::now());
+		}
 	}
 	/// Takes in a desktop alert for the enabled `notification` plugins.
 	pub fn offer_notification(&mut self, state: &State, alert: crate::notification_runtime::Alert) {
@@ -2560,6 +2590,7 @@ impl Bridge {
 		invocation: (Invocation, ExtensionContext),
 	) {
 		let (invocation, context) = invocation;
+		self.show_captions(state, messaging, id, output.captions.take());
 		if context.is_current(state)
 			&& let Some(appearance) = &output.appearance
 		{

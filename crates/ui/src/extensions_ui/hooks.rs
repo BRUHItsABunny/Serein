@@ -52,6 +52,20 @@ pub(crate) enum NoteUpdate {
 		message: Id,
 		text: String,
 	},
+	/// A plugin's earlier versions of a message; an empty list removes them.
+	History {
+		plugin: String,
+		name: String,
+		message: Id,
+		history: Vec<extension_host::hooks::Revision>,
+	},
+	/// Deleted messages a plugin shows under a message; an empty list removes them.
+	Deleted {
+		plugin: String,
+		name: String,
+		message: Id,
+		rows: Vec<extension_host::hooks::Archived>,
+	},
 	/// Every note of one plugin.
 	Forget(String),
 	/// Every note, such as when the account changes.
@@ -442,7 +456,12 @@ impl ExtensionUi {
 	}
 
 	/// Notes a plugin returned, shown under their messages.
-	pub fn receive_annotations(&mut self, id: &str, annotations: &[Annotation]) {
+	pub fn receive_annotations(&mut self, id: &str, output: &extensions::Output) {
+		let annotations: &[Annotation] = &output.annotations;
+		let additions = annotations.len() + output.histories.len() + output.deleted_messages.len();
+		if additions == 0 {
+			return;
+		}
 		let Some(name) = self
 			.entries
 			.iter()
@@ -453,11 +472,17 @@ impl ExtensionUi {
 		};
 		// Until the timeline takes them, keep the newest few batches.
 		const MAX_WAITING: usize = 8 * extensions::message_hooks::MAX_ANNOTATE_MESSAGES;
-		if self.notes.len() + annotations.len() > MAX_WAITING {
-			let excess = self.notes.len() + annotations.len() - MAX_WAITING;
+		if self.notes.len() + additions > MAX_WAITING {
+			let excess = self.notes.len() + additions - MAX_WAITING;
 			let mut dropped = 0;
 			self.notes.retain(|update| {
-				let drop = dropped < excess && matches!(update, NoteUpdate::Set { .. });
+				let drop = dropped < excess
+					&& matches!(
+						update,
+						NoteUpdate::Set { .. }
+							| NoteUpdate::History { .. }
+							| NoteUpdate::Deleted { .. }
+					);
 				dropped += usize::from(drop);
 				!drop
 			});
@@ -471,6 +496,46 @@ impl ExtensionUi {
 					text: annotation.text.clone(),
 				});
 			}
+		}
+		for history in &output.histories {
+			if let Ok(message) = history.message_id.parse() {
+				self.notes.push(NoteUpdate::History {
+					plugin: id.to_owned(),
+					name: name.clone(),
+					message: Id(message),
+					history: history
+						.revisions
+						.iter()
+						.map(|revision| extension_host::hooks::Revision {
+							time_ms: revision.time_ms,
+							text: revision.text.clone(),
+						})
+						.collect(),
+				});
+			}
+		}
+		for group in &output.deleted_messages {
+			let Ok(anchor) = group.after_message_id.parse() else {
+				continue;
+			};
+			let rows = group
+				.messages
+				.iter()
+				.filter_map(|row| {
+					Some(extension_host::hooks::Archived {
+						message: Id(row.message_id.parse().ok()?),
+						author: row.author.clone(),
+						time_ms: row.time_ms,
+						text: row.text.clone(),
+					})
+				})
+				.collect();
+			self.notes.push(NoteUpdate::Deleted {
+				plugin: id.to_owned(),
+				name: name.clone(),
+				message: Id(anchor),
+				rows,
+			});
 		}
 	}
 
@@ -507,6 +572,18 @@ impl ExtensionUi {
 					message,
 					text,
 				} => into.set(&plugin, &name, message, &text),
+				NoteUpdate::History {
+					plugin,
+					name,
+					message,
+					history,
+				} => into.set_history(&plugin, &name, message, history),
+				NoteUpdate::Deleted {
+					plugin,
+					name,
+					message,
+					rows,
+				} => into.set_deleted(&plugin, &name, message, rows),
 				NoteUpdate::Forget(plugin) => into.remove_plugin(&plugin),
 				NoteUpdate::Clear => into.clear(),
 			}
