@@ -1595,6 +1595,9 @@ fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
 		time_us: 0,
 		offset,
 		length,
+		rtp_timestamp: Some(960),
+		sequence: Some(1),
+		keyframe: false,
 	};
 	let batch = |items: Vec<MediaItem>, data_bytes| Invocation {
 		action: "media".into(),
@@ -1676,4 +1679,28 @@ fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
 	] {
 		assert!(invalid.validate(&manifest, &input).is_err());
 	}
+
+	// Keyframe requests need `media_packets` and name a camera or screen share; the media
+	// taps need the worker they run in.
+	let keyframes = |streams: &[&str]| Output {
+		keyframes: streams.iter().map(|stream| stream.to_string()).collect(),
+		..Default::default()
+	};
+	assert!(
+		keyframes(&["camera:5"])
+			.validate(&manifest, &input)
+			.is_err()
+	);
+	manifest.capabilities.push(Capability::MediaPackets);
+	manifest.validate().unwrap();
+	keyframes(&["camera:5", "screen:6"])
+		.validate(&manifest, &input)
+		.unwrap();
+	for invalid in [&["voice:5"][..], &["camera:x"], &["camera"]] {
+		assert!(keyframes(invalid).validate(&manifest, &input).is_err());
+	}
+	let mut unpaired = manifest.clone();
+	unpaired.capabilities = vec![Capability::MediaAudio];
+	unpaired.actions.clear();
+	assert!(matches!(unpaired.validate(), Err(Error::Capability)));
 }

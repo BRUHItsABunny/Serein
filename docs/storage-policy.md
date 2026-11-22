@@ -2186,6 +2186,14 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin media taps (preview, November 22, 2026)
+
+Nothing is written to disk by the host. While a `media_packets` or `media_audio` worker
+runs, the voice transport copies decrypted remote packets into one RAM queue of at most
+4,096 packets or 16 MiB, drained every 20 ms; packets that do not fit are counted, not
+kept. Turning the tap off discards the queue. Audio conversion keeps one Opus decoder per
+stream, for at most twice the participant limit.
+
 ## Plugin media workers (preview, November 22, 2026)
 
 Nothing is written to disk by the host. Each running media worker holds its plugin

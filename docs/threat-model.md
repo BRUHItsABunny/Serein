@@ -27,7 +27,10 @@ plugin-supplied plain text, labelled with the plugin's name and never sent to Di
 for it through the system picker; paths are relative, `..` and symbolic links are refused,
 and the plugin never learns full paths. A media worker stays loaded only during a call,
 inside the same sandbox with a 64 MiB memory cap and per-batch fuel, and sees only what
-the host puts in its batches. Only explicitly granted, user-selected context crosses that boundary.
+the host puts in its batches. With `media_packets` or `media_audio` that includes the
+decrypted audio and video of everyone else in the call, which a plugin with `network` or
+`files` can send away or keep; the consent dialog says so, and nothing is tapped unless
+such a plugin runs. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

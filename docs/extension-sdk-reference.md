@@ -216,7 +216,9 @@ account snapshot or grant-dependent data:
       "pages",
       "call_captions",
       "files",
-      "media_worker"
+      "media_worker",
+      "media_packets",
+      "media_audio"
     ],
     "app_events": [
       "ready",

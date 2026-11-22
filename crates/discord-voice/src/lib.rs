@@ -12,6 +12,7 @@ pub mod screen;
 mod stream_audio_receive;
 mod stream_playout;
 mod stream_sync;
+pub mod tap;
 mod teardown;
 mod timer;
 mod transport;

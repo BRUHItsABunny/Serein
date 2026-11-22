@@ -3951,6 +3951,10 @@ fn capability_label(capability: Capability) -> &'static str {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
 		Capability::Pages => "Show its own pages in the main area",
+		Capability::MediaPackets => {
+			"Receive the audio and video of everyone in your calls, decrypted, and ask for fresh pictures"
+		}
+		Capability::MediaAudio => "Hear what everyone says in your calls, as audio per speaker",
 		Capability::MediaWorker => {
 			"Stay running during your calls and hear who joins and leaves, and call media once available"
 		}

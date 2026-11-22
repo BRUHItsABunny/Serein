@@ -16,6 +16,8 @@ const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 pub enum MediaEvent {
 	/// Caption lines a batch returned.
 	Captions(Vec<Caption>),
+	/// Camera and screen share streams the plugin wants keyframes for.
+	Keyframes(Vec<String>),
 	/// The worker stopped after an error; a new one may be started.
 	Failed(String),
 }
@@ -37,6 +39,32 @@ struct Shared {
 
 /// Loads the plugin for a worker: its instance and its `media` action.
 pub type Starter = Box<dyn FnOnce() -> Result<(MediaInstance, String), String> + Send>;
+
+/// Queues batches for a worker from any thread.
+#[derive(Clone)]
+pub struct MediaSender(Arc<Shared>);
+
+impl MediaSender {
+	/// See [`MediaWorker::push`].
+	pub fn push(&self, items: Vec<MediaItem>, data: Vec<u8>) {
+		let Ok(mut queue) = self.0.queue.lock() else {
+			return;
+		};
+		if queue.closing || items.is_empty() {
+			return;
+		}
+		queue.bytes += data.len();
+		queue.batches.push_back((items, data));
+		while queue.batches.len() > MAX_QUEUED || queue.bytes > MAX_QUEUED_BYTES {
+			let Some((_, data)) = queue.batches.pop_front() else {
+				break;
+			};
+			queue.bytes -= data.len();
+			queue.dropped = queue.dropped.saturating_add(1);
+		}
+		self.0.ready.notify_one();
+	}
+}
 
 pub struct MediaWorker {
 	shared: Arc<Shared>,
@@ -79,6 +107,9 @@ impl MediaWorker {
 							if let Some(captions) = output.captions {
 								report(MediaEvent::Captions(captions));
 							}
+							if !output.keyframes.is_empty() {
+								report(MediaEvent::Keyframes(output.keyframes));
+							}
 						}
 						Err(error) => return report(MediaEvent::Failed(error.to_string())),
 					}
@@ -94,22 +125,11 @@ impl MediaWorker {
 	/// Queues a batch of at most [`extensions::media::MAX_MEDIA_ITEMS`] items whose chunks
 	/// point into `data`. Over the bound, the oldest queued batches are dropped.
 	pub fn push(&self, items: Vec<MediaItem>, data: Vec<u8>) {
-		let Ok(mut queue) = self.shared.queue.lock() else {
-			return;
-		};
-		if queue.closing || items.is_empty() {
-			return;
-		}
-		queue.bytes += data.len();
-		queue.batches.push_back((items, data));
-		while queue.batches.len() > MAX_QUEUED || queue.bytes > MAX_QUEUED_BYTES {
-			let Some((_, data)) = queue.batches.pop_front() else {
-				break;
-			};
-			queue.bytes -= data.len();
-			queue.dropped = queue.dropped.saturating_add(1);
-		}
-		self.shared.ready.notify_one();
+		self.sender().push(items, data);
+	}
+	/// A handle that queues batches from another thread.
+	pub fn sender(&self) -> MediaSender {
+		MediaSender(Arc::clone(&self.shared))
 	}
 	/// Lets the worker finish what is queued, then end. Nothing is waited for.
 	pub fn close(&self) {

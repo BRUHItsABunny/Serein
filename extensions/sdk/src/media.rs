@@ -1,7 +1,7 @@
 //! Media worker (preview): one instance stays loaded during a call and runs your `media`
 //! action once per batch, so statics and heap state carry over between batches. Copy a
 //! chunk's bytes with [`crate::host::media::read`].
-use crate::Invocation;
+use crate::{Caption, Invocation, Output};
 use serde::{Deserialize, Serialize};
 
 /// Input of a [`crate::Surface::Media`] action.
@@ -31,12 +31,30 @@ pub enum MediaItem {
 	/// Something that happened in the call, in microseconds since the worker started.
 	Event { time_us: u64, event: CallEvent },
 	/// A piece of one stream's media at `offset..offset + length` of the batch's data.
+	/// Streams are `voice:<user>`, `camera:<user>`, `screen:<user>` and
+	/// `screen_audio:<user>`. With `media_packets`, `codec` is `opus` (one frame), `h264`,
+	/// `h265` or `av1` (one access unit); with `media_audio`, `pcm_s16le` is 16 kHz mono
+	/// little-endian samples decoded from one Opus frame.
 	Chunk {
 		stream: String,
 		codec: String,
 		time_us: u64,
 		offset: u32,
 		length: u32,
+		/// The sender's RTP timestamp: 48 kHz for audio, 90 kHz for screen video; absent
+		/// or zero for cameras.
+		#[serde(default)]
+		rtp_timestamp: Option<u32>,
+		#[serde(default)]
+		sequence: Option<u16>,
+		#[serde(default)]
+		keyframe: bool,
+	},
+	/// Packets of `stream` the host dropped because they did not fit its queue.
+	Gap {
+		stream: String,
+		time_us: u64,
+		lost: u32,
 	},
 	/// An item this SDK version does not know.
 	#[serde(other)]
@@ -61,6 +79,20 @@ pub enum CallEvent {
 	Ended,
 	#[serde(other)]
 	Other,
+}
+
+/// Output of a `media` action.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaOutput {
+	#[serde(flatten)]
+	pub output: Output,
+	/// Requires `call_captions`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub captions: Option<Vec<Caption>>,
+	/// Up to 16 `camera:<user>` or `screen:<user>` streams to ask a keyframe for, such as
+	/// when a recording starts. Requires `media_packets`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub keyframes: Vec<String>,
 }
 
 #[cfg(test)]

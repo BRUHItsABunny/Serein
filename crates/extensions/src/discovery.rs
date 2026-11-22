@@ -94,6 +94,8 @@ impl HostInfo {
 				Capability::CallCaptions,
 				Capability::Files,
 				Capability::MediaWorker,
+				Capability::MediaPackets,
+				Capability::MediaAudio,
 			],
 			app_events: &[
 				AppEventKind::Ready,

@@ -34,14 +34,47 @@ fn is_zero(value: &u32) -> bool {
 pub enum MediaItem {
 	/// Something that happened in the call, at `time_us` on the host's media clock.
 	Event { time_us: u64, event: CallEvent },
-	/// A piece of one stream's media in the batch's binary payload.
+	/// A piece of one stream's media in the batch's binary payload. Streams are named
+	/// `voice:<user>`, `camera:<user>`, `screen:<user>` and `screen_audio:<user>`.
 	Chunk {
 		stream: String,
+		/// `opus`, `h264`, `h265`, `av1`, or `pcm_s16le` for 16 kHz mono audio.
 		codec: String,
 		time_us: u64,
 		offset: u32,
 		length: u32,
+		/// The sender's RTP timestamp: 48 kHz for Opus, 90 kHz for video.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		rtp_timestamp: Option<u32>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		sequence: Option<u16>,
+		#[serde(default, skip_serializing_if = "crate::interface_ui::is_false")]
+		keyframe: bool,
 	},
+	/// Packets of a stream the host could not keep up with and dropped.
+	Gap {
+		stream: String,
+		time_us: u64,
+		lost: u32,
+	},
+}
+
+/// Most streams one result may ask a keyframe for.
+pub const MAX_KEYFRAME_REQUESTS: usize = 16;
+
+/// Checks the streams a `media` result asks keyframes for: cameras and screen shares only.
+pub(crate) fn validate_keyframes(streams: &[String]) -> Result<(), Error> {
+	if streams.len() > MAX_KEYFRAME_REQUESTS {
+		return Err(Error::Limit);
+	}
+	for stream in streams {
+		let (kind, user) = stream.split_once(':').ok_or(Error::Invalid)?;
+		if !matches!(kind, "camera" | "screen") {
+			return Err(Error::Invalid);
+		}
+		app::entity_id(user)?;
+	}
+	Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +130,7 @@ impl MediaBatch {
 					}
 					CallEvent::Ended => {}
 				},
+				MediaItem::Gap { stream, .. } => name(stream)?,
 				MediaItem::Chunk {
 					stream,
 					codec,

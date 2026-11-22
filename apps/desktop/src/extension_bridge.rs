@@ -282,6 +282,8 @@ pub struct Bridge {
 	media: BTreeMap<String, MediaSession>,
 	/// Plugins whose media worker failed, and when one may start again.
 	media_retry: BTreeMap<String, Instant>,
+	/// Hands tapped call media to the workers that may receive it.
+	media_tap: crate::media_tap::Pump,
 }
 
 /// A plugin's media worker for one call.
@@ -2218,6 +2220,7 @@ impl Bridge {
 			self.media_retry.clear();
 		}
 		let (Some(channel), Some(account)) = (call, account) else {
+			self.update_media_tap();
 			return;
 		};
 		let present: BTreeSet<model::Id> = state
@@ -2296,6 +2299,21 @@ impl Bridge {
 							);
 						}
 					}
+					extension_host::media::MediaEvent::Keyframes(streams) => {
+						for stream in streams {
+							let Some((kind, user)) = stream.split_once(':') else {
+								continue;
+							};
+							let source = match kind {
+								"camera" => discord_voice::tap::Source::Camera,
+								"screen" => discord_voice::tap::Source::Screen,
+								_ => continue,
+							};
+							if let Ok(user) = user.parse() {
+								discord_voice::tap::request_keyframe(source, user);
+							}
+						}
+					}
 					extension_host::media::MediaEvent::Failed(error) => {
 						messaging.extensions.status =
 							format!("{id} stopped handling the call and restarts shortly. {error}");
@@ -2308,6 +2326,30 @@ impl Bridge {
 			self.media.remove(&id);
 			self.media_retry.insert(id, now + MEDIA_RETRY);
 		}
+		self.update_media_tap();
+	}
+	/// Points the media tap at the running workers granted packets or audio.
+	fn update_media_tap(&mut self) {
+		let targets = self
+			.media
+			.iter()
+			.filter_map(|(id, session)| {
+				let grants = &self
+					.installed
+					.iter()
+					.find(|entry| entry.manifest.id == *id)?
+					.manifest
+					.capabilities;
+				Some(crate::media_tap::Target {
+					plugin: id.clone(),
+					sender: session.worker.sender(),
+					packets: grants.contains(&Capability::MediaPackets),
+					audio: grants.contains(&Capability::MediaAudio),
+					started: session.started,
+				})
+			})
+			.collect();
+		self.media_tap.set_targets(targets);
 	}
 	/// Opens the picker a plugin asked for, and saves what the user picked.
 	fn file_picker(

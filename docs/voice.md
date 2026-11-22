@@ -1176,6 +1176,18 @@ Start-Process .\dist\serein.exe -RedirectStandardError "$PWD\stream-debug-retest
 Start sharing promptly after launch so the bounded diagnostic budget covers the test.
 Keep these local logs out of commits.
 
+## Media taps for plugins (preview, November 22, 2026)
+
+`discord_voice::tap` copies decrypted remote media for media-worker plugins with
+`media_packets` or `media_audio`. The copy points are right after DAVE decryption: call
+audio and screen-share audio in their receive loops, and video in `decrypt_video` once
+the receiver accepted the picture. While no such plugin runs, the cost is one relaxed
+atomic load per packet. While one runs, each copy goes into one mutex-guarded queue of at
+most 4,096 packets or 16 MiB; overflow is counted per stream. Nothing runs in audio
+callbacks, and Opus decoding for `media_audio` happens on the desktop's own tap thread.
+Plugin keyframe requests join the existing lost-picture lists, so they go out as PLIs
+under the same rate limit. Own microphone and camera media are not tapped.
+
 ## Local microphone preview
 
 Voice & Video settings has an explicit Start testing / Stop testing control, a live RMS

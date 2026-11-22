@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 70 capabilities, with at most 96 distinct declarations per manifest.
+supports 72 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -188,6 +188,8 @@ supports 70 capabilities, with at most 96 distinct declarations per manifest.
 | `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
 | `files` | Read and write files in a private folder, and in folders and files the user picks for it, with `serein.file_request` and `serein.file_write` | Preview; [files](#files-preview); the private folder counts against the data limit; picks are listed in the plugin's details and can be removed |
 | `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions` |
+| `media_packets` | Receive the decrypted Opus, H.264, H.265 and AV1 packets of everyone else in the call in `media` batches, and ask senders for keyframes | Preview; [media taps](#media-taps-preview); requires `media_worker`; the user's own microphone and camera are not included |
+| `media_audio` | Receive each other speaker's audio as 16 kHz mono 16-bit samples in `media` batches | Preview; [media taps](#media-taps-preview); requires `media_worker` |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -509,7 +511,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 70 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 72 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -948,6 +950,31 @@ worker ends with the call, or when the plugin is disabled or the account changes
 {"action": "media", "media": {"seq": 2, "items": [
   {"type": "event", "time_us": 1520000, "event": {"kind": "joined", "user_id": "1200000000000000000"}}]}}
 ```
+
+## Media taps (preview)
+
+With `media_packets` or `media_audio` (each requires `media_worker`), the media worker's
+batches also carry the call's media. The voice transport copies each packet right after
+DAVE decryption, on its network task, into one queue of at most 4,096 packets or 16 MiB;
+the copy happens only while such a worker runs. A separate thread drains the queue every
+20 ms and builds each worker's batches.
+
+- Streams are `voice:<user>`, `camera:<user>`, `screen:<user>` and `screen_audio:<user>`.
+- `media_packets` chunks are one Opus frame (`opus`) or one complete access unit (`h264`,
+  `h265`, `av1`), with the sender's `rtp_timestamp`, audio `sequence` and video
+  `keyframe`. Video is copied only once the client accepted the picture, so a stream
+  starts on a keyframe.
+- `media_audio` chunks (`pcm_s16le`) are one Opus frame decoded to 16 kHz mono
+  little-endian samples, one decoder per stream, off the UI thread.
+- `{"type": "gap", "stream", "time_us", "lost"}` reports packets the tap could not keep.
+  A larger-than-4 MiB picture also becomes a gap.
+- A `media` result with `media_packets` may return `keyframes`: up to 16 `camera:<user>`
+  or `screen:<user>` streams. The host asks those senders through the same rate-limited
+  path it uses to recover lost pictures.
+
+Not included: the user's own microphone and camera, audio while the user is deafened
+(it is not decrypted then), and video Discord does not send, such as streams the user is
+not watching.
 
 ## Plugin data (preview)
 

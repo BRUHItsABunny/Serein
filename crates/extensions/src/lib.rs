@@ -208,6 +208,12 @@ pub enum Capability {
 	/// Keep one instance loaded during calls that receives call events, and with media taps
 	/// call media, in batches through a `media` action.
 	MediaWorker,
+	/// Receive the decrypted audio and video packets of everyone in the call in `media`
+	/// batches, and ask senders for keyframes. Requires `media_worker`.
+	MediaPackets,
+	/// Receive each speaker's audio as 16 kHz mono samples in `media` batches. Requires
+	/// `media_worker`.
+	MediaAudio,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -889,6 +895,10 @@ pub struct Output {
 	/// and panel actions only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub pick: Option<FilePick>,
+	/// Camera and screen share streams, such as `camera:<user>`, whose senders are asked for
+	/// a keyframe. Requires `media_packets`; `media` actions only.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub keyframes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1038,6 +1048,12 @@ impl Manifest {
 		network::validate_secrets(&self.secrets, &origins)?;
 		topics::validate(self)?;
 		message_hooks::validate(self)?;
+		if (capabilities.contains(&Capability::MediaPackets)
+			|| capabilities.contains(&Capability::MediaAudio))
+			&& !capabilities.contains(&Capability::MediaWorker)
+		{
+			return Err(Error::Capability);
+		}
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)
 		{
@@ -1656,6 +1672,14 @@ impl Output {
 					.iter()
 					.any(|action| action.id == id && action.surface == Surface::Panel)
 			})?;
+		}
+		if !self.keyframes.is_empty() {
+			if surface != Surface::Media
+				|| !manifest.capabilities.contains(&Capability::MediaPackets)
+			{
+				return Err(Error::Capability);
+			}
+			media::validate_keyframes(&self.keyframes)?;
 		}
 		if let Some(captions) = &self.captions {
 			if !manifest.capabilities.contains(&Capability::CallCaptions)

@@ -658,6 +658,7 @@ async fn run_inner(
 					   // Lost or stalled pictures stay frozen until the sender refreshes; ask twice a second at most.
 					   if enabled && let Some(lost)=&lost && let Some(crypto)=encryption.as_mut() && let Some(socket)=&udp {
 						   receivers.absorb(lost);
+						   receivers.absorb(crate::tap::keyframe_requests(crate::tap::Source::Camera));
 						   let requests=receivers.take_keyframe_requests(now.into_std());
 						   metrics.video(Video::PliSent,requests.len() as u64);
 						   for media in requests {let (header,body)=pli(ssrc,media);udp_failures.send(socket,&crypto.seal_rtcp(&header,&body)?,"Voice RTCP send failed")?;}
@@ -807,6 +808,7 @@ async fn run_inner(
 					   let Some(user)=mixer.user(source) else{continue;};
 					   if !dave.ready || !dave.contains(user) || controls.borrow().deafened {continue;}
 					   let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&frame) else{continue;};
+					   if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::Voice,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(seq),keyframe:false,data:opus.clone()});}
 					   mixer.push(source,seq,opus);
 					   metrics.finish(crate::diagnostics::Stage::Receive, start);
 				   },
@@ -1132,6 +1134,7 @@ fn decrypt_video(
 	user: u64,
 	codec: Codec,
 	frame: Vec<u8>,
+	tapped: (crate::tap::Source, u32),
 ) -> Option<Encoded> {
 	if !dave.contains(user) {
 		metrics.video(Video::NotReady, 1);
@@ -1165,6 +1168,23 @@ fn decrypt_video(
 		return None;
 	}
 	metrics.finish(crate::diagnostics::Stage::VideoReceive, start);
+	// Only accepted pictures are copied, so a tapped stream starts on a keyframe.
+	if crate::tap::enabled() {
+		crate::tap::push(crate::tap::Packet {
+			source: tapped.0,
+			user,
+			codec: match codec {
+				Codec::H264 => "h264",
+				Codec::H265 => "h265",
+				Codec::Av1 => "av1",
+			},
+			received: std::time::Instant::now(),
+			rtp_timestamp: tapped.1,
+			sequence: None,
+			keyframe,
+			data: data.clone(),
+		});
+	}
 	Some(Encoded {
 		codec,
 		user,
@@ -1182,7 +1202,15 @@ fn receive_video(
 	mut first: Option<(u64, Vec<u8>)>,
 ) -> Result<(), &'static str> {
 	while let Some((user, frame)) = first.take().or_else(|| receivers.pop()) {
-		let Some(frame) = decrypt_video(receivers, dave, metrics, user, Codec::H264, frame) else {
+		let Some(frame) = decrypt_video(
+			receivers,
+			dave,
+			metrics,
+			user,
+			Codec::H264,
+			frame,
+			(crate::tap::Source::Camera, 0),
+		) else {
 			continue;
 		};
 		if !offer(decoder, frame)? {
@@ -1209,6 +1237,7 @@ fn receive_stream_video(
 			received.user,
 			received.codec,
 			received.data,
+			(crate::tap::Source::Screen, received.timestamp),
 		) else {
 			continue;
 		};
@@ -1745,6 +1774,7 @@ async fn run_stream_inner(
 				}
 				if secure && let Some(lost)=&lost && let Some(crypto)=encryption.as_mut() && let Some(socket)=&udp {
 					receivers.absorb(lost);
+					receivers.absorb(crate::tap::keyframe_requests(crate::tap::Source::Screen));
 					let requests=receivers.take_keyframe_requests(now.into_std());
 					metrics.video(Video::PliSent,requests.len() as u64);
 					for media in requests {let (header,body)=pli(audio_ssrc,media);udp_failures.send(socket,&crypto.seal_rtcp(&header,&body)?,"Stream RTCP send failed")?;}
@@ -1834,6 +1864,7 @@ async fn run_stream_inner(
 					if !dave.contains(user) {continue;}
 					let start=metrics.start();
 					let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&rtp.payload) else {metrics.poll(false,1,false,0);continue;};
+					if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::ScreenAudio,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(rtp.sequence),keyframe:false,data:opus.clone()});}
 					metrics.finish(crate::diagnostics::Stage::Receive,start);
 					mixer.push(rtp.ssrc,rtp.sequence,rtp.timestamp,opus,&mut sync,Instant::now().into_std());
 					continue;

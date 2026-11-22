@@ -143,6 +143,11 @@ pub enum Capability {
 	/// Stay loaded during calls and receive [`crate::MediaBatch`]es in a
 	/// [`Surface::Media`] action.
 	MediaWorker,
+	/// Receive decrypted call packets in media batches and ask for keyframes. Requires
+	/// `media_worker`.
+	MediaPackets,
+	/// Receive 16 kHz mono samples per speaker in media batches. Requires `media_worker`.
+	MediaAudio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

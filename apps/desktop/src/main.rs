@@ -30,6 +30,7 @@ mod gpu;
 mod gpu_video;
 mod group_icon;
 mod interaction_uploads;
+mod media_tap;
 mod native_login;
 mod notification_runtime;
 mod notification_sounds;

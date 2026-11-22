@@ -3564,6 +3564,9 @@ mod tests {
 			time_us: 0,
 			offset: 0,
 			length,
+			rtp_timestamp: None,
+			sequence: None,
+			keyframe: false,
 		};
 		let worker = host.start_media("media", "account", Arc::clone(&wake));
 		worker.push(vec![chunk(5)], b"hello".to_vec());
