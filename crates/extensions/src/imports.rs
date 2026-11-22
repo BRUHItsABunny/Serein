@@ -79,6 +79,9 @@ pub(crate) enum Kind {
 	/// `(ptr: i32, offset: i32, len: i32) -> i32`: copies `len` bytes of the current media
 	/// batch's data from `offset`; the copied length, or [`status::INVALID`].
 	MediaRead,
+	/// `(ptr: i32, len: i32) -> i32`: queues one JSON [`crate::AttachmentFetch`];
+	/// [`status::OK`] or a [`status`] code.
+	AttachmentFetch,
 }
 
 /// One importable host function.
@@ -154,6 +157,11 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		capability: Some(Capability::MediaWorker),
 		kind: Kind::MediaRead,
 	},
+	HostImport {
+		name: "attachment_fetch",
+		capability: Some(Capability::MediaArchive),
+		kind: Kind::AttachmentFetch,
+	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
@@ -218,6 +226,10 @@ pub trait HostImports: Send {
 	}
 	/// Writes `data` as the [`crate::FileWrite`] header says; an empty reply on success.
 	fn file_write(&mut self, _header: &[u8], _data: &[u8]) -> Reply {
+		Reply::Unavailable
+	}
+	/// Queues a [`crate::AttachmentFetch`]; an empty reply once queued.
+	fn attachment_fetch(&mut self, _request: &[u8]) -> Reply {
 		Reply::Unavailable
 	}
 }

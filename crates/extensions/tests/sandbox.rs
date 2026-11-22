@@ -1570,6 +1570,12 @@ fn picks_need_the_files_grant_a_declared_action_and_come_from_the_foreground() {
 	let mut ungranted = manifest.clone();
 	ungranted.capabilities = vec![Capability::MessageEvents];
 	assert!(pick(export.clone()).validate(&ungranted, &panel).is_err());
+	// Archiving writes into the private folder, so it needs `files`.
+	let mut archiving = manifest.clone();
+	archiving.capabilities = vec![Capability::MediaArchive, Capability::MessageEvents];
+	assert!(matches!(archiving.validate(), Err(Error::Capability)));
+	archiving.capabilities.push(Capability::Files);
+	archiving.validate().unwrap();
 }
 
 #[test]

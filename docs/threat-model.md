@@ -27,7 +27,9 @@ plugin-supplied plain text, labelled with the plugin's name and never sent to Di
 for it through the system picker; paths are relative, `..` and symbolic links are refused,
 and the plugin never learns full paths. A media worker stays loaded only during a call,
 inside the same sandbox with a 64 MiB memory cap and per-batch fuel, and sees only what
-the host puts in its batches. Catalog source tokens stay in the system credential store
+the host puts in its batches. An archiving plugin can make the host download only signed Discord CDN attachment links
+it names, without redirects or credentials, into its own folder within its data limit.
+Catalog source tokens stay in the system credential store
 and are sent only to the origins the user set for that source, rechecked on every
 redirect; packages from any source keep their pinned hashes. With `media_packets` or `media_audio` that includes the
 decrypted audio and video of everyone else in the call, which a plugin with `network` or

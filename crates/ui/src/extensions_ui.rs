@@ -4048,6 +4048,9 @@ fn capability_label(capability: Capability) -> &'static str {
 			"Receive the audio and video of everyone in your calls, decrypted, and ask for fresh pictures"
 		}
 		Capability::MediaAudio => "Hear what everyone says in your calls, as audio per speaker",
+		Capability::MediaArchive => {
+			"Save original attachments of messages it receives into its own folder"
+		}
 		Capability::MediaWorker => {
 			"Stay running during your calls and hear who joins and leaves, and call media once available"
 		}

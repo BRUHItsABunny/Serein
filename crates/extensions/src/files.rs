@@ -61,6 +61,25 @@ pub enum FileRequest {
 		path: String,
 		to: String,
 	},
+	/// What became of this plugin's recent `attachment_fetch` requests. Requires
+	/// `media_archive`.
+	Fetches,
+}
+
+/// Largest attachment one `attachment_fetch` saves.
+pub const MAX_ARCHIVE_FILE_BYTES: u64 = 100 * 1024 * 1024;
+/// Fetches one plugin may have waiting.
+pub const MAX_QUEUED_FETCHES: usize = 256;
+
+/// One `attachment_fetch`: save the Discord attachment at `url`, of `size` bytes, to `path`
+/// in the plugin's private folder. The download runs after the invocation; the plugin
+/// learns the outcome from the `fetches` file request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentFetch {
+	pub url: String,
+	pub size: u64,
+	pub path: String,
 }
 
 fn list_limit() -> u32 {

@@ -277,11 +277,7 @@ pub fn demo_check_examples() -> Result<bool, String> {
 	{
 		return Err("Expected one starter plugin and nine themes".into());
 	}
-	let gate = Gate {
-		epoch: 0,
-		generation: Arc::new(AtomicU64::new(0)),
-		wake_cancel: Arc::new(tokio::sync::Notify::new()),
-	};
+	let gate = Gate::detached();
 	let mut activated = false;
 	for starter in starters {
 		let InstallSource::Bundled {
@@ -502,6 +498,14 @@ pub struct SystemImports {
 	network: Option<PluginNetwork>,
 	topics: Option<SharedTopics>,
 	files: Option<crate::files::PluginFiles>,
+	archive: Option<ArchiveAccess>,
+}
+
+/// A `media_archive` plugin's way into the host's archive queue.
+struct ArchiveAccess {
+	archive: Arc<crate::archive::Archive>,
+	data: PathBuf,
+	quota: u64,
 }
 
 type SharedTopics = Arc<std::sync::Mutex<TopicSession>>;
@@ -598,6 +602,16 @@ impl SystemImports {
 				database: database.clone(),
 				journal: journal.clone(),
 				topics: topics.clone(),
+				archive: directory
+					.filter(|_| {
+						stored.grants.contains(&Capability::MediaArchive)
+							&& stored.grants.contains(&Capability::Files)
+					})
+					.map(|directory| ArchiveAccess {
+						archive: Arc::clone(&gate.archive),
+						data: directory.to_path_buf(),
+						quota: database_quota(directory),
+					}),
 				files: directory
 					.filter(|_| stored.grants.contains(&Capability::Files))
 					.map(|directory| {
@@ -669,9 +683,71 @@ impl extensions::HostImports for SystemImports {
 		}
 	}
 	fn file_request(&mut self, request: &[u8]) -> extensions::Reply {
+		if matches!(
+			serde_json::from_slice::<extensions::FileRequest>(request),
+			Ok(extensions::FileRequest::Fetches)
+		) {
+			let Some(access) = &self.archive else {
+				return extensions::Reply::Unavailable;
+			};
+			let fetches: Vec<_> = access
+				.archive
+				.results(&access.data)
+				.into_iter()
+				.map(|(path, state)| match state {
+					crate::archive::FetchState::Queued => {
+						serde_json::json!({"path": path, "state": "queued"})
+					}
+					crate::archive::FetchState::Done => {
+						serde_json::json!({"path": path, "state": "done"})
+					}
+					crate::archive::FetchState::Failed(error) => {
+						serde_json::json!({"path": path, "state": "failed", "error": error})
+					}
+				})
+				.collect();
+			return serde_json::to_vec(&serde_json::json!({ "fetches": fetches })).map_or(
+				extensions::Reply::Failed("Cannot encode the reply".into()),
+				extensions::Reply::Ok,
+			);
+		}
 		match &mut self.files {
 			Some(files) => files.request(request),
 			None => extensions::Reply::Unavailable,
+		}
+	}
+	fn attachment_fetch(&mut self, request: &[u8]) -> extensions::Reply {
+		let (Some(access), Some(files)) = (&self.archive, &self.files) else {
+			return extensions::Reply::Unavailable;
+		};
+		let Ok(request) = serde_json::from_slice::<extensions::AttachmentFetch>(request) else {
+			return extensions::Reply::Failed("Invalid attachment fetch".into());
+		};
+		let Some(url) = crate::archive::cdn_url(&request.url) else {
+			return extensions::Reply::Failed(
+				"Only Discord attachment links can be fetched".into(),
+			);
+		};
+		if request.size == 0 || request.size > extensions::files::MAX_ARCHIVE_FILE_BYTES {
+			return extensions::Reply::Failed(
+				"Attachments must be nonempty and at most 100 MiB".into(),
+			);
+		}
+		let target = match files.private_target(&request.path) {
+			Ok(target) => target,
+			Err(error) => return extensions::Reply::Failed(error.into()),
+		};
+		let fetch = crate::archive::Fetch {
+			url,
+			size: request.size,
+			target,
+			path: request.path,
+			private: access.data.join(crate::files::PRIVATE_FOLDER),
+			quota: access.quota,
+		};
+		match access.archive.queue(&access.data, fetch) {
+			Ok(()) => extensions::Reply::Ok(Vec::new()),
+			Err(error) => extensions::Reply::Failed(error),
 		}
 	}
 	fn file_write(&mut self, header: &[u8], data: &[u8]) -> extensions::Reply {
@@ -705,6 +781,7 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub struct ExtensionHost {
 	root: PathBuf,
 	broker: Arc<Broker>,
+	archive: Arc<crate::archive::Archive>,
 	generation: Arc<AtomicU64>,
 	wake_cancel: Arc<tokio::sync::Notify>,
 	queue: VecDeque<(u64, Job)>,
@@ -718,6 +795,7 @@ impl ExtensionHost {
 		Self {
 			root,
 			broker: Arc::new(Broker::default()),
+			archive: Arc::default(),
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::new(tokio::sync::Notify::new()),
 			queue: VecDeque::new(),
@@ -767,6 +845,7 @@ impl ExtensionHost {
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::clone(&self.wake_cancel),
 			broker: Arc::clone(&self.broker),
+			archive: Arc::clone(&self.archive),
 		};
 		let (id, account) = (id.to_owned(), account.to_owned());
 		crate::media::MediaWorker::spawn(
@@ -860,6 +939,7 @@ impl ExtensionHost {
 			generation,
 			wake_cancel: self.wake_cancel.clone(),
 			broker: self.broker.clone(),
+			archive: self.archive.clone(),
 		};
 		let wake = self.wake.clone();
 		self.active = Some((token, receiver));
@@ -896,6 +976,8 @@ pub(crate) struct Gate {
 	pub(crate) wake_cancel: Arc<tokio::sync::Notify>,
 	/// The host's broker for plugin broadcasts.
 	pub(crate) broker: Arc<Broker>,
+	/// The host's attachment archive queue.
+	pub(crate) archive: Arc<crate::archive::Archive>,
 }
 impl Gate {
 	/// A gate no job cancellation reaches, for device files written outside the job queue.
@@ -905,6 +987,7 @@ impl Gate {
 			generation: Arc::new(AtomicU64::new(0)),
 			wake_cancel: Arc::new(tokio::sync::Notify::new()),
 			broker: Arc::new(Broker::default()),
+			archive: Arc::default(),
 		}
 	}
 	pub(crate) fn check(&self) -> Result<(), String> {
@@ -1397,6 +1480,11 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 		} => {
 			let parent = scope(root, kind, account.as_deref())?;
 			disable(&parent, &id, gate)?;
+			if kind == ExtensionKind::Plugin
+				&& let Ok(directory) = data_dir(root, &id, account.as_deref())
+			{
+				gate.archive.forget(&directory);
+			}
 			// Disabling either side of a subscription ends it.
 			if let Some(account) = account.as_deref().filter(|_| kind == ExtensionKind::Plugin) {
 				let mut subscriptions = read_subscriptions(root, account);
@@ -1715,6 +1803,9 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			Ok(Event::Invoked { id, output })
 		}
 		Job::Logout { account } => {
+			if let Ok(scope) = data_scope(root, Some(&account)) {
+				gate.archive.forget(&scope);
+			}
 			let directory = scope(root, ExtensionKind::Plugin, Some(&account))?;
 			// The tombstone survives failed deletion and is retried before the next load.
 			if directory.exists() {
@@ -3922,6 +4013,112 @@ mod tests {
 		};
 		assert!(sources.is_empty() && !cache.exists());
 		assert!(secrets::store().unwrap().load(&key).unwrap().is_none());
+	}
+
+	/// A `media_archive` plugin queues an attachment through the real import; the archive
+	/// saves it into the private folder and the `fetches` request reports it. A link that is
+	/// not a Discord attachment is refused at the call. The downloader is synthetic.
+	#[test]
+	fn archive_plugins_queue_cdn_attachments_into_their_folder() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let archive = Arc::new(crate::archive::Archive::new(Arc::new(
+			|fetch, partial, _| {
+				fs::write(partial, vec![1; fetch.size as usize]).map_err(|_| "write".to_string())
+			},
+		)));
+		let gate = Gate {
+			archive: Arc::clone(&archive),
+			..gate()
+		};
+		let plugin = |id: &str, url: &str| {
+			let request = format!(r#"{{"url":"{url}","size":3,"path":"saved/a.png"}}"#);
+			let escaped: String = request.bytes().map(|b| format!("\\{b:02x}")).collect();
+			let mut package = topic_plugin(
+				id,
+				true,
+				r#"(import "serein" "attachment_fetch" (func $fetch (param i32 i32) (result i32)))"#,
+				&format!(r#"(data (i32.const 1024) "{escaped}")"#),
+				&format!(
+					"(if (i32.ne (call $fetch (i32.const 1024) (i32.const {})) (i32.const 0)) (then unreachable))",
+					request.len()
+				),
+			);
+			package.manifest.broadcasts.clear();
+			package.manifest.capabilities = vec![Capability::Files, Capability::MediaArchive];
+			package
+		};
+		let good = plugin(
+			"archiver",
+			"https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&is=2&hm=3",
+		);
+		let bad = plugin("phisher", "https://example.org/attachments/1/2/a.png");
+		for package in [&good, &bad] {
+			let grants = package.manifest.capabilities.clone();
+			enable(
+				&root,
+				source(&profile, package),
+				grants,
+				Some("account"),
+				&gate,
+			)
+			.unwrap();
+		}
+		let invoke = |id: &str| {
+			run(
+				&root,
+				Job::Invoke {
+					id: id.into(),
+					account: "account".into(),
+					invocation: Invocation {
+						action: "run".into(),
+						..Default::default()
+					},
+				},
+				&gate,
+			)
+		};
+		assert!(invoke("archiver").is_ok());
+		assert!(
+			invoke("phisher").is_err(),
+			"a non-attachment link fails the call"
+		);
+		let data = data_dir(&root, "archiver", Some("account")).unwrap();
+		let saved = loop {
+			match archive
+				.results(&data)
+				.first()
+				.map(|(_, state)| state.clone())
+			{
+				Some(crate::archive::FetchState::Queued) | None => std::thread::yield_now(),
+				Some(state) => break state,
+			}
+		};
+		assert_eq!(saved, crate::archive::FetchState::Done);
+		assert_eq!(
+			fs::read(data.join(crate::files::PRIVATE_FOLDER).join("saved/a.png")).unwrap(),
+			vec![1; 3]
+		);
+		let mut imports = SystemImports::for_plugin(
+			&read_stored(
+				&scope(&root, ExtensionKind::Plugin, Some("account"))
+					.unwrap()
+					.join("archiver")
+					.join("package.json"),
+			)
+			.unwrap(),
+			Some(&data),
+			&gate,
+		)
+		.0;
+		let extensions::Reply::Ok(reply) =
+			extensions::HostImports::file_request(&mut *imports, br#"{"op":"fetches"}"#)
+		else {
+			panic!("no fetches")
+		};
+		let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+		assert_eq!(reply["fetches"][0]["state"], "done");
+		assert_eq!(reply["fetches"][0]["path"], "saved/a.png");
 	}
 
 	#[test]

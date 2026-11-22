@@ -7,6 +7,7 @@
 //! [`message_events`]), each plugin's private SQLite file ([`database`]) and the account's message
 //! journal ([`journal`]). Device-local UI state reaches snapshots through [`HostLocal`].
 
+pub mod archive;
 pub mod broker;
 pub mod captions;
 pub mod data_events;

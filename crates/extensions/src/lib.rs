@@ -14,7 +14,7 @@ pub use message_hooks::{
 pub mod captions;
 pub use captions::Caption;
 pub mod files;
-pub use files::{FileHandleInfo, FilePick, FileRequest, FileWrite, PickKind};
+pub use files::{AttachmentFetch, FileHandleInfo, FilePick, FileRequest, FileWrite, PickKind};
 pub mod media;
 pub use media::{CallEvent, MediaBatch, MediaItem};
 pub mod notification_hook;
@@ -214,6 +214,9 @@ pub enum Capability {
 	/// Receive each speaker's audio as 16 kHz mono samples in `media` batches. Requires
 	/// `media_worker`.
 	MediaAudio,
+	/// Save original message attachments from Discord's CDN into the private folder with
+	/// `serein.attachment_fetch`. Requires `files`.
+	MediaArchive,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -1051,6 +1054,11 @@ impl Manifest {
 		network::validate_secrets(&self.secrets, &origins)?;
 		topics::validate(self)?;
 		message_hooks::validate(self)?;
+		if capabilities.contains(&Capability::MediaArchive)
+			&& !capabilities.contains(&Capability::Files)
+		{
+			return Err(Error::Capability);
+		}
 		if (capabilities.contains(&Capability::MediaPackets)
 			|| capabilities.contains(&Capability::MediaAudio))
 			&& !capabilities.contains(&Capability::MediaWorker)

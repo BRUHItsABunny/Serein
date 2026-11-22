@@ -151,7 +151,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 72 capabilities, with at most 96 distinct declarations per manifest.
+supports 73 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -214,6 +214,7 @@ supports 72 capabilities, with at most 96 distinct declarations per manifest.
 | `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions` |
 | `media_packets` | Receive the decrypted Opus, H.264, H.265 and AV1 packets of everyone else in the call in `media` batches, and ask senders for keyframes | Preview; [media taps](#media-taps-preview); requires `media_worker`; the user's own microphone and camera are not included |
 | `media_audio` | Receive each other speaker's audio as 16 kHz mono 16-bit samples in `media` batches | Preview; [media taps](#media-taps-preview); requires `media_worker` |
+| `media_archive` | Save original message attachments from Discord's CDN into the private folder with `serein.attachment_fetch` | Preview; [attachment archive](#attachment-archive-preview); requires `files`; counts against the data limit |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -535,7 +536,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 72 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 73 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -586,6 +587,7 @@ granted by the user:
 | `file_request` | `(ptr, len) -> i32` | `files` | Runs one JSON file request of at most 4 KiB; the pending reply's length (raw bytes for `read`, JSON otherwise) |
 | `file_write` | `(ptr, len, data, data_len) -> i32` | `files` | Writes up to 1 MiB of raw bytes as a JSON header says; `0`, or `-3` with a message pending |
 | `media_read` | `(ptr, offset, len) -> i32` | `media_worker` | Copies bytes of the current media batch's data; the copied length, or `-1` outside the data |
+| `attachment_fetch` | `(ptr, len) -> i32` | `media_archive` | Queues `{"url", "size", "path"}`; `0` once queued, or `-3` with a message pending |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -999,6 +1001,32 @@ the copy happens only while such a worker runs. A separate thread drains the que
 Not included: the user's own microphone and camera, audio while the user is deafened
 (it is not decrypted then), and video Discord does not send, such as streams the user is
 not watching.
+
+## Attachment archive (preview)
+
+With `media_archive` (and `files`), a plugin saves original attachments, for example the
+ones its message journal reports, before their signed links expire or the message is
+deleted. `serein.attachment_fetch` takes `{"url", "size", "path"}` and returns at once;
+the host downloads the file afterwards, one at a time across plugins, into `path` in the
+plugin's private folder.
+
+- **Links**: only signed original attachment links on `cdn.discordapp.com` (a
+  `media.discordapp.net` link is rewritten to its original), with the same admission as
+  the client's own downloads: HTTPS on port 443, no credentials or fragment, the
+  `attachments/<channel>/[<message>/]<attachment>/<file>` path, and only the `ex`, `is`,
+  `hm` and `backend` parameters. No redirects are followed and no credentials are sent.
+- **Size**: `size` is the attachment's size, 1 byte to 100 MiB. The download must match it
+  exactly; anything else fails. Each file must fit the plugin's data limit before it
+  starts.
+- **Writing**: the file is written as `<path>.part` and renamed once complete; an existing
+  file is never replaced. `path` follows the private folder's path rules.
+- **Queue**: at most 256 waiting fetches per plugin (1,024 in all) and one per path.
+  `{"op": "fetches"}` through `serein.file_request` returns the last 256 outcomes as
+  `{"path", "state": "queued" | "done" | "failed", "error"?}`. Disabling the plugin or
+  logging out of its account drops its waiting fetches, stops the running one and forgets
+  its outcomes.
+
+Expired links are not refreshed; a fetch of one fails with "its link may have expired".
 
 ## Plugin data (preview)
 

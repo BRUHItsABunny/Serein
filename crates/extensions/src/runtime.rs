@@ -56,7 +56,8 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			| Kind::HttpsRequest
 			| Kind::Broadcast
 			| Kind::HasSubscribers
-			| Kind::FileRequest => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+			| Kind::FileRequest
+			| Kind::AttachmentFetch => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
 			Kind::FileWrite => FuncType::new([ValType::I32; 4], [ValType::I32]),
 			Kind::MediaRead => FuncType::new([ValType::I32; 3], [ValType::I32]),
 			Kind::JournalRead | Kind::TopicRead => FuncType::new([ValType::I32], [ValType::I32]),
@@ -269,6 +270,28 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					.read(&caller, pointer, &mut request)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
 				let reply = caller.data_mut().services.file_request(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"attachment_fetch",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				caller.data_mut().pending = None;
+				let Some((pointer, length)) =
+					span(pointer, length, crate::files::MAX_FILE_REQUEST_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let mut request = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut request)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let reply = caller.data_mut().services.attachment_fetch(&request);
 				hold(&mut caller, reply)
 			},
 		)

@@ -218,7 +218,8 @@ account snapshot or grant-dependent data:
       "files",
       "media_worker",
       "media_packets",
-      "media_audio"
+      "media_audio",
+      "media_archive"
     ],
     "app_events": [
       "ready",
@@ -243,7 +244,7 @@ account snapshot or grant-dependent data:
       "typing",
       "polls"
     ],
-    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write", "media_read"]
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write", "media_read", "attachment_fetch"]
   }
 }
 ```

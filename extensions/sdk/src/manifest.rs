@@ -148,6 +148,9 @@ pub enum Capability {
 	MediaPackets,
 	/// Receive 16 kHz mono samples per speaker in media batches. Requires `media_worker`.
 	MediaAudio,
+	/// Save original attachments into the private folder with [`crate::host::archive`].
+	/// Requires `files`.
+	MediaArchive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

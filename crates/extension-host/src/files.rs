@@ -173,6 +173,13 @@ impl PluginFiles {
 		})
 	}
 
+	/// Where a new file at `path` in the private folder goes, checked like a write.
+	pub(crate) fn private_target(&self, path: &str) -> Result<PathBuf, &'static str> {
+		if path.is_empty() {
+			return Err("Name a file inside the folder");
+		}
+		Ok(self.resolve(PRIVATE_ROOT, path, true)?.target)
+	}
 	fn handles(&self) -> Reply {
 		let handles: Vec<_> = self.handles.iter().map(FileHandle::info).collect();
 		json(&serde_json::json!({ "handles": handles }))
@@ -191,6 +198,7 @@ impl PluginFiles {
 	fn run(&mut self, request: FileRequest) -> Result<Reply, &'static str> {
 		Ok(match request {
 			FileRequest::Handles => self.handles(),
+			FileRequest::Fetches => return Err("Attachment fetches need media_archive"),
 			FileRequest::Stat { root, path } => {
 				let resolved = self.resolve(&root, &path, false)?;
 				match fs::metadata(&resolved.target) {

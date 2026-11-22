@@ -2185,6 +2185,16 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin attachment archive (preview, November 22, 2026)
+
+Attachments a `media_archive` plugin fetches are saved in its private folder
+(`extensions/plugin-data/<account key>/<id>/files/`), count against its data limit and
+follow its data's lifecycle: kept on disable or logout unless the user deletes the data.
+At most 100 MiB per file; a download in progress lives as `<path>.part` and is removed on
+failure. The queue (256 fetches per plugin, 1,024 in all) and the last 256 outcomes per
+plugin live in RAM only and are dropped when the plugin is disabled or its account logs
+out.
+
 ## Scoped history deletion (November 22, 2026)
 
 Losing one conversation no longer clears the account's whole history cache. When channels

@@ -38,6 +38,7 @@ mod raw {
 			data_length: i32,
 		) -> i32;
 		pub fn media_read(pointer: *mut u8, offset: i32, length: i32) -> i32;
+		pub fn attachment_fetch(pointer: *const u8, length: i32) -> i32;
 	}
 }
 
@@ -1098,12 +1099,21 @@ pub mod files {
 		serde_json::from_slice(&bytes).map_err(|_| FileError::Reply)
 	}
 
+	pub(super) fn raw_request(value: &serde_json::Value) -> Result<Vec<u8>, FileError> {
+		request(value)
+	}
+
 	fn request(value: &serde_json::Value) -> Result<Vec<u8>, FileError> {
 		let bytes = serde_json::to_vec(value).map_err(|_| FileError::Reply)?;
 		if bytes.len() > 4096 {
 			return Err(FileError::Host(HostError::Invalid));
 		}
 		call(&bytes)
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	pub(super) fn reply_code(code: i32) -> Result<Vec<u8>, FileError> {
+		reply(code)
 	}
 
 	#[cfg(target_arch = "wasm32")]
@@ -1189,5 +1199,74 @@ pub mod media {
 			let _ = (offset, &mut bytes);
 			Err(HostError::Unavailable)
 		}
+	}
+}
+
+/// Saves original message attachments into the private folder. Requires `media_archive`
+/// and `files`.
+///
+/// [`fetch`] queues a download and returns at once; the host saves the file after the
+/// invocation, one at a time, and [`fetches`] reports what became of recent ones. Only
+/// signed Discord CDN attachment links are accepted, such as the `url` of an attachment in
+/// a journal entry, at most 100 MiB and within the plugin's data limit. A file appears
+/// under its path only once complete.
+pub mod archive {
+	use super::HostError;
+	use super::files::FileError;
+	use serde::Deserialize;
+
+	#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+	#[serde(rename_all = "snake_case")]
+	pub enum FetchState {
+		Queued,
+		Done,
+		Failed,
+		#[serde(other)]
+		Other,
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+	pub struct Fetch {
+		pub path: String,
+		pub state: FetchState,
+		#[serde(default)]
+		pub error: Option<String>,
+	}
+
+	#[derive(Deserialize)]
+	struct Fetches {
+		fetches: Vec<Fetch>,
+	}
+
+	/// Queues saving the attachment at `url`, of `size` bytes, to `path` in the private
+	/// folder.
+	pub fn fetch(url: &str, size: u64, path: &str) -> Result<(), FileError> {
+		let request =
+			serde_json::to_vec(&serde_json::json!({"url": url, "size": size, "path": path}))
+				.map_err(|_| FileError::Reply)?;
+		if request.len() > 4096 {
+			return Err(FileError::Host(HostError::Invalid));
+		}
+		call(&request)
+	}
+
+	/// This plugin's recent fetches, oldest first, at most 256.
+	pub fn fetches() -> Result<Vec<Fetch>, FileError> {
+		let bytes = super::files::raw_request(&serde_json::json!({"op": "fetches"}))?;
+		serde_json::from_slice::<Fetches>(&bytes)
+			.map(|fetches| fetches.fetches)
+			.map_err(|_| FileError::Reply)
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn call(request: &[u8]) -> Result<(), FileError> {
+		// SAFETY: the host reads `request.len()` bytes from this live buffer.
+		let code = unsafe { super::raw::attachment_fetch(request.as_ptr(), request.len() as i32) };
+		super::files::reply_code(code).map(drop)
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn call(_: &[u8]) -> Result<(), FileError> {
+		Err(FileError::Host(HostError::Unavailable))
 	}
 }
