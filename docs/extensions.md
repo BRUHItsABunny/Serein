@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 69 capabilities, with at most 96 distinct declarations per manifest.
+supports 70 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -187,6 +187,7 @@ supports 69 capabilities, with at most 96 distinct declarations per manifest.
 | `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
 | `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
 | `files` | Read and write files in a private folder, and in folders and files the user picks for it, with `serein.file_request` and `serein.file_write` | Preview; [files](#files-preview); the private folder counts against the data limit; picks are listed in the plugin's details and can be removed |
+| `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions` |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -508,7 +509,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 69 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 70 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -558,6 +559,7 @@ granted by the user:
 | `topic_read` | `(max: i32) -> i32` | manifest `subscribes` | Reads 1-64 delivered messages in a `topic` action; the pending reply's length |
 | `file_request` | `(ptr, len) -> i32` | `files` | Runs one JSON file request of at most 4 KiB; the pending reply's length (raw bytes for `read`, JSON otherwise) |
 | `file_write` | `(ptr, len, data, data_len) -> i32` | `files` | Writes up to 1 MiB of raw bytes as a JSON header says; `0`, or `-3` with a message pending |
+| `media_read` | `(ptr, offset, len) -> i32` | `media_worker` | Copies bytes of the current media batch's data; the copied length, or `-1` outside the data |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -915,6 +917,36 @@ and read at most 512 MiB each.
 
 ```json
 {"pick": {"kind": "save_file", "purpose": "Export the archive", "name": "archive.json", "action": "exported"}}
+```
+
+## Media worker (preview)
+
+With `media_worker`, a plugin declares one action with `surface: "media"`. While the user
+is in a call, the host keeps one instance of the plugin loaded on its own thread, so its
+memory carries state from one call of `serein_invoke` to the next, and runs the action
+once per batch. The instance may grow to 64 MiB of memory, and each batch gets fresh fuel
+(50,000,000) and host-call budgets.
+
+The action receives `media`: `seq`, `dropped` (batches the host discarded because the
+plugin fell behind), `data_bytes` and up to 256 `items` in time order:
+
+- `{"type": "event", "time_us", "event"}` with `event.kind` of `started` (`channel_id`,
+  `guild_id`; first), `joined` and `left` (`user_id`), or `ended` (last). `time_us` counts
+  from the worker's start.
+- `{"type": "chunk", "stream", "codec", "time_us", "offset", "length"}` points into the
+  batch's binary data (at most 4 MiB), copied with `serein.media_read`. Media taps fill
+  these; until then batches carry only events.
+
+The action may return only `captions` (with `call_captions`), shown above the call
+controls. It may also call the clock, randomness, its files, its network origins and
+`broadcast`; the database, journal and topic deliveries are not available, and it cannot
+save `storage`. The host queues at most 32 batches or 16 MiB per worker, dropping the
+oldest. An error ends the worker; a new one starts 10 seconds later in the same call. The
+worker ends with the call, or when the plugin is disabled or the account changes.
+
+```json
+{"action": "media", "media": {"seq": 2, "items": [
+  {"type": "event", "time_us": 1520000, "event": {"kind": "joined", "user_id": "1200000000000000000"}}]}}
 ```
 
 ## Plugin data (preview)

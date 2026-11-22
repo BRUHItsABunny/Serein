@@ -58,6 +58,7 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			| Kind::HasSubscribers
 			| Kind::FileRequest => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
 			Kind::FileWrite => FuncType::new([ValType::I32; 4], [ValType::I32]),
+			Kind::MediaRead => FuncType::new([ValType::I32; 3], [ValType::I32]),
 			Kind::JournalRead | Kind::TopicRead => FuncType::new([ValType::I32], [ValType::I32]),
 		};
 		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
@@ -77,7 +78,14 @@ pub(crate) fn validate_module(bytes: &[u8], manifest: &Manifest) -> Result<(), E
 	{
 		return Err(Error::Capability);
 	}
-	instantiate(&engine, &module, Box::new(NoHostImports)).map(|_| ())
+	instantiate(
+		&engine,
+		&module,
+		Box::new(NoHostImports),
+		MEMORY_BYTES,
+		FUEL,
+	)
+	.map(|_| ())
 }
 
 // Classify only engine-owned codes: never surface Wasm-provided text or input/output bytes.
@@ -102,6 +110,8 @@ struct HostState {
 	calls: u32,
 	/// Reply of the last variable-size call, until `result_read` copies it.
 	pending: Option<Vec<u8>>,
+	/// The current media batch's binary payload, for `media_read`.
+	media: Vec<u8>,
 }
 
 fn exported_memory(caller: &Caller<'_, HostState>) -> Result<Memory, wasmi::Error> {
@@ -296,6 +306,35 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 	linker
 		.func_wrap(
 			module,
+			"media_read",
+			|mut caller: Caller<'_, HostState>, pointer: i32, offset: i32, length: i32| {
+				let (Ok(offset), Some((pointer, length))) = (
+					u32::try_from(offset),
+					span(pointer, length, crate::media::MAX_MEDIA_DATA_BYTES),
+				) else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				let offset = offset as usize;
+				let Some(end) = offset
+					.checked_add(length)
+					.filter(|end| *end <= caller.data().media.len())
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let bytes = caller.data().media[offset..end].to_vec();
+				exported_memory(&caller)?
+					.write(&mut caller, pointer, &bytes)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				Ok(length as i32)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
 			"broadcast",
 			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
 				let Some((pointer, length)) =
@@ -400,9 +439,11 @@ fn instantiate(
 	engine: &Engine,
 	module: &Module,
 	services: Box<dyn HostImports>,
+	memory: usize,
+	fuel: u64,
 ) -> Result<(Store<HostState>, Instance), Error> {
 	let limits = StoreLimitsBuilder::new()
-		.memory_size(MEMORY_BYTES)
+		.memory_size(memory)
 		.memories(1)
 		.tables(1)
 		.table_elements(4096)
@@ -416,10 +457,11 @@ fn instantiate(
 			services,
 			calls: 0,
 			pending: None,
+			media: Vec::new(),
 		},
 	);
 	store.limiter(|state| &mut state.limits);
-	store.set_fuel(FUEL).map_err(|_| Error::Execution)?;
+	store.set_fuel(fuel).map_err(|_| Error::Execution)?;
 	let instance = linker(engine)?
 		.instantiate_and_start(&mut store, module)
 		.map_err(execution_error)?;
@@ -443,6 +485,15 @@ pub fn invoke_with(
 	grants: &[Capability],
 	services: Box<dyn HostImports>,
 ) -> Result<Output, Error> {
+	let bytes = prepare(package, input)?;
+	let engine = engine();
+	let module = granted_module(&engine, package, grants)?;
+	let (mut store, instance) = instantiate(&engine, &module, services, MEMORY_BYTES, FUEL)?;
+	run(&mut store, &instance, &package.manifest, input, &bytes)
+}
+
+/// Checks the package and input and encodes the input for the module.
+fn prepare(package: &Package, input: &Invocation) -> Result<Vec<u8>, Error> {
 	if package.manifest.kind != ExtensionKind::Plugin || package.theme.is_some() {
 		return Err(Error::Invalid);
 	}
@@ -468,29 +519,49 @@ pub fn invoke_with(
 	if bytes.len() > MAX_IO_BYTES {
 		return Err(Error::InputLimit);
 	}
-	let engine = engine();
-	let module = module(&engine, &package.wasm)?;
+	Ok(bytes)
+}
+
+/// Compiles the module, refusing imports whose capability is not both declared and granted.
+fn granted_module(
+	engine: &Engine,
+	package: &Package,
+	grants: &[Capability],
+) -> Result<Module, Error> {
+	let module = module(engine, &package.wasm)?;
 	if !required_capabilities(&module)?.iter().all(|capability| {
 		grants.contains(capability) && package.manifest.capabilities.contains(capability)
 	}) {
 		return Err(Error::Capability);
 	}
-	let (mut store, instance) = instantiate(&engine, &module, services)?;
-	let memory = instance.get_memory(&store, "memory").ok_or(Error::Module)?;
+	Ok(module)
+}
+
+/// Runs `serein_invoke` once on an instance and validates what it returns.
+fn run(
+	store: &mut Store<HostState>,
+	instance: &Instance,
+	manifest: &Manifest,
+	input: &Invocation,
+	bytes: &[u8],
+) -> Result<Output, Error> {
+	let memory = instance
+		.get_memory(&*store, "memory")
+		.ok_or(Error::Module)?;
 	let alloc = instance
-		.get_typed_func::<i32, i32>(&store, "serein_alloc")
+		.get_typed_func::<i32, i32>(&*store, "serein_alloc")
 		.map_err(|_| Error::Module)?;
-	let run = instance
-		.get_typed_func::<(i32, i32), i64>(&store, "serein_invoke")
+	let invoke = instance
+		.get_typed_func::<(i32, i32), i64>(&*store, "serein_invoke")
 		.map_err(|_| Error::Module)?;
 	let pointer = alloc
-		.call(&mut store, bytes.len() as i32)
+		.call(&mut *store, bytes.len() as i32)
 		.map_err(execution_error)?;
 	memory
-		.write(&mut store, pointer as u32 as usize, &bytes)
+		.write(&mut *store, pointer as u32 as usize, bytes)
 		.map_err(|_| Error::Trap)?;
-	let packed = run
-		.call(&mut store, (pointer, bytes.len() as i32))
+	let packed = invoke
+		.call(&mut *store, (pointer, bytes.len() as i32))
 		.map_err(execution_error)? as u64;
 	let length = packed as u32 as usize;
 	if length == 0 {
@@ -499,17 +570,73 @@ pub fn invoke_with(
 	if length > MAX_IO_BYTES {
 		return Err(Error::OutputLimit);
 	}
-	let mut bytes = vec![0; length];
+	let mut out = vec![0; length];
 	memory
-		.read(&store, (packed >> 32) as usize, &mut bytes)
+		.read(&*store, (packed >> 32) as usize, &mut out)
 		.map_err(|_| Error::Output)?;
-	let output: Output = serde_json::from_slice(&bytes).map_err(|_| Error::Output)?;
+	let output: Output = serde_json::from_slice(&out).map_err(|_| Error::Output)?;
 	output
-		.validate(&package.manifest, input)
+		.validate(manifest, input)
 		.map_err(|error| match error {
 			Error::Limit => Error::OutputLimit,
 			Error::Invalid => Error::Output,
 			other => other,
 		})?;
 	Ok(output)
+}
+
+/// Linear memory a media instance may grow to.
+pub const MEDIA_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Fuel each media batch may spend.
+pub const MEDIA_FUEL: u64 = 50_000_000;
+
+/// A plugin instance that stays loaded across calls, so its memory carries state from one
+/// media batch to the next. Each call gets fresh fuel and host-call budgets. After any
+/// error the instance may be inconsistent; drop it and start a new one.
+pub struct MediaInstance {
+	store: Store<HostState>,
+	instance: Instance,
+	package: Package,
+}
+
+impl MediaInstance {
+	pub fn new(
+		package: Package,
+		grants: &[Capability],
+		services: Box<dyn HostImports>,
+	) -> Result<Self, Error> {
+		if package.manifest.kind != ExtensionKind::Plugin || package.theme.is_some() {
+			return Err(Error::Invalid);
+		}
+		package.manifest.validate()?;
+		let engine = engine();
+		let module = granted_module(&engine, &package, grants)?;
+		let (store, instance) =
+			instantiate(&engine, &module, services, MEDIA_MEMORY_BYTES, MEDIA_FUEL)?;
+		Ok(Self {
+			store,
+			instance,
+			package,
+		})
+	}
+	/// Runs one call with `data`, the batch's binary payload `media_read` copies from.
+	pub fn invoke(&mut self, input: &Invocation, data: Vec<u8>) -> Result<Output, Error> {
+		let bytes = prepare(&self.package, input)?;
+		self.store
+			.set_fuel(MEDIA_FUEL)
+			.map_err(|_| Error::Execution)?;
+		let state = self.store.data_mut();
+		state.calls = 0;
+		state.pending = None;
+		state.media = data;
+		let output = run(
+			&mut self.store,
+			&self.instance,
+			&self.package.manifest,
+			input,
+			&bytes,
+		);
+		self.store.data_mut().media = Vec::new();
+		output
+	}
 }

@@ -1570,3 +1570,110 @@ fn picks_need_the_files_grant_a_declared_action_and_come_from_the_foreground() {
 	ungranted.capabilities = vec![Capability::MessageEvents];
 	assert!(pick(export.clone()).validate(&ungranted, &panel).is_err());
 }
+
+#[test]
+fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![
+		Capability::MediaWorker,
+		Capability::CallCaptions,
+		Capability::Storage,
+	];
+	assert!(
+		matches!(manifest.validate(), Err(Error::Capability)),
+		"grant without action"
+	);
+	manifest.actions = vec![Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	}];
+	manifest.validate().unwrap();
+	let chunk = |stream: &str, offset, length| MediaItem::Chunk {
+		stream: stream.into(),
+		codec: "opus".into(),
+		time_us: 0,
+		offset,
+		length,
+	};
+	let batch = |items: Vec<MediaItem>, data_bytes| Invocation {
+		action: "media".into(),
+		media: Some(Box::new(MediaBatch {
+			seq: 1,
+			dropped: 0,
+			data_bytes,
+			items,
+		})),
+		..Default::default()
+	};
+	let input = batch(
+		vec![
+			MediaItem::Event {
+				time_us: 0,
+				event: CallEvent::Joined {
+					user_id: "5".into(),
+				},
+			},
+			chunk("user:5", 0, 10),
+		],
+		10,
+	);
+	input.validate(&manifest).unwrap();
+	for (invalid, why) in [
+		(
+			batch(vec![chunk("user:5", 6, 5)], 10),
+			"chunk past the data",
+		),
+		(
+			batch(vec![chunk("user:5", u32::MAX, 2)], 10),
+			"overflowing offset",
+		),
+		(batch(vec![chunk("user 5", 0, 1)], 10), "stream name"),
+		(
+			batch(vec![], extensions::media::MAX_MEDIA_DATA_BYTES + 1),
+			"data size",
+		),
+		(
+			batch(
+				(0..257)
+					.map(|_| MediaItem::Event {
+						time_us: 0,
+						event: CallEvent::Ended,
+					})
+					.collect(),
+				0,
+			),
+			"item count",
+		),
+		(
+			Invocation {
+				media: None,
+				..input.clone()
+			},
+			"a media action without a batch",
+		),
+	] {
+		assert!(invalid.validate(&manifest).is_err(), "{why}");
+	}
+	let captions = Output {
+		captions: Some(vec![Caption {
+			speaker_id: Some("5".into()),
+			text: "hello".into(),
+			done: false,
+		}]),
+		..Default::default()
+	};
+	captions.validate(&manifest, &input).unwrap();
+	for invalid in [
+		Output {
+			storage: Some("{}".into()),
+			..Default::default()
+		},
+		Output {
+			panel: vec![Element::Separator],
+			..Default::default()
+		},
+	] {
+		assert!(invalid.validate(&manifest, &input).is_err());
+	}
+}

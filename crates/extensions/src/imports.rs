@@ -76,6 +76,9 @@ pub(crate) enum Kind {
 	/// `(ptr: i32, len: i32, data: i32, data_len: i32) -> i32`: writes raw bytes as a JSON
 	/// [`crate::FileWrite`] header says; [`status::OK`] or a [`status`] code.
 	FileWrite,
+	/// `(ptr: i32, offset: i32, len: i32) -> i32`: copies `len` bytes of the current media
+	/// batch's data from `offset`; the copied length, or [`status::INVALID`].
+	MediaRead,
 }
 
 /// One importable host function.
@@ -145,6 +148,11 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		name: "file_write",
 		capability: Some(Capability::Files),
 		kind: Kind::FileWrite,
+	},
+	HostImport {
+		name: "media_read",
+		capability: Some(Capability::MediaWorker),
+		kind: Kind::MediaRead,
 	},
 ];
 

@@ -933,6 +933,11 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 		label: "Alert".into(),
 		surface: Surface::Notification,
 	});
+	supported.actions.push(Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	});
 	// The network capability is declared for specific origins.
 	supported.network = vec!["https://api.example.org".into()];
 	supported.validate().unwrap();
@@ -942,9 +947,9 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 	assert!(host.supports_import("db_execute") && host.supports_import("result_read"));
 	assert!(host.supports_import("journal_read") && host.supports_import("https_request"));
 	assert!(host.supports_import("broadcast") && host.supports_import("topic_read"));
-	assert_eq!(caps.len(), 69);
+	assert_eq!(caps.len(), 70);
 	assert_eq!(HostInfo::current().app_events.len(), 21);
-	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 69);
+	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 70);
 }
 
 #[test]

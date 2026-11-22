@@ -25,7 +25,9 @@ from the client themselves. Histories, kept deleted rows and call captions are l
 plugin-supplied plain text, labelled with the plugin's name and never sent to Discord. A
 `files` plugin reaches only its private folder and the folders and files the user picked
 for it through the system picker; paths are relative, `..` and symbolic links are refused,
-and the plugin never learns full paths. Only explicitly granted, user-selected context crosses that boundary.
+and the plugin never learns full paths. A media worker stays loaded only during a call,
+inside the same sandbox with a 64 MiB memory cap and per-batch fuel, and sees only what
+the host puts in its batches. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

@@ -53,6 +53,8 @@ mod captions;
 pub use captions::*;
 mod files;
 pub use files::*;
+mod media;
+pub use media::*;
 
 /// Maximum serialized size of either ABI buffer, in UTF-8 bytes.
 pub const MAX_IO_BYTES: usize = 256 * 1024;

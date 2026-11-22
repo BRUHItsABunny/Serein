@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod runtime;
-pub use runtime::{invoke, invoke_with};
+pub use runtime::{MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke, invoke_with};
 pub mod imports;
 pub mod message_hooks;
 pub use message_hooks::{
@@ -15,6 +15,8 @@ pub mod captions;
 pub use captions::Caption;
 pub mod files;
 pub use files::{FileHandleInfo, FilePick, FileRequest, FileWrite, PickKind};
+pub mod media;
+pub use media::{CallEvent, MediaBatch, MediaItem};
 pub mod notification_hook;
 pub mod pages;
 pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
@@ -203,6 +205,9 @@ pub enum Capability {
 	/// Read and write files in a private folder, and in folders and files the user picks,
 	/// through `serein.file_request` and `serein.file_write`.
 	Files,
+	/// Keep one instance loaded during calls that receives call events, and with media taps
+	/// call media, in batches through a `media` action.
+	MediaWorker,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -283,6 +288,9 @@ pub enum Surface {
 	/// Runs before each desktop alert with it in `notification`; the result's `notification`
 	/// rewords or hides it. Requires `notifications`.
 	Notification,
+	/// Runs in an instance kept loaded during a call, once per batch in `media`. Requires
+	/// `media_worker`.
+	Media,
 }
 
 impl Surface {
@@ -567,6 +575,9 @@ pub struct Invocation {
 	/// The rows a page's list needs, on its `rows_action`. Requires `pages`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub page_request: Option<Box<PageRequest>>,
+	/// A batch for a `media` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media: Option<Box<MediaBatch>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1060,6 +1071,7 @@ impl Manifest {
 			Surface::Send,
 			Surface::Annotate,
 			Surface::Notification,
+			Surface::Media,
 		] {
 			if self
 				.actions
@@ -1097,6 +1109,7 @@ impl Manifest {
 				Surface::Send => Some(Capability::SendHook),
 				Surface::Annotate => Some(Capability::MessageAnnotations),
 				Surface::Notification => Some(Capability::Notifications),
+				Surface::Media => Some(Capability::MediaWorker),
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1446,6 +1459,11 @@ impl Invocation {
 			(None, false) => {}
 			_ => return Err(Error::Capability),
 		}
+		match (&self.media, action.surface == Surface::Media) {
+			(Some(batch), true) => batch.validate()?,
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
 		if let Some(request) = &self.page_request {
 			if action.surface != Surface::Panel
 				|| !manifest.capabilities.contains(&Capability::Pages)
@@ -1502,6 +1520,7 @@ impl Invocation {
 				| Surface::Send
 				| Surface::Annotate
 				| Surface::Notification
+				| Surface::Media
 		) && (!self.values.is_empty()
 			|| self.message_event.is_some()
 			|| self.app.is_some()
@@ -1680,7 +1699,9 @@ impl Output {
 				| Surface::Send
 				| Surface::Annotate
 				| Surface::Notification
-		) && (self.rich_presence.is_some()
+				| Surface::Media
+		) && (self.storage.is_some() && surface == Surface::Media
+			|| self.rich_presence.is_some()
 			|| self.api_proxy.is_some()
 			|| self.image_sharing
 			|| self.preserve_deleted_messages

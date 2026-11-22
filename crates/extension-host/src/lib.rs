@@ -15,6 +15,7 @@ pub mod files;
 pub mod forum_data;
 pub mod hooks;
 pub mod journal;
+pub mod media;
 pub mod member_details;
 pub mod message_content;
 pub mod message_events;

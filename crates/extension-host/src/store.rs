@@ -729,6 +729,64 @@ impl ExtensionHost {
 	}
 
 	/// The broker plugin broadcasts go through; the front end sets its subscriptions.
+	/// Starts `id`'s media worker for `account`. The worker thread loads the plugin, which
+	/// must hold the `media_worker` grant and declare a `media` action. It gets the clock,
+	/// randomness, its files, its network origins and broadcasts; no database, journal or
+	/// topic deliveries.
+	pub fn start_media(
+		&self,
+		id: &str,
+		account: &str,
+		wake: Arc<dyn Fn() + Send + Sync>,
+	) -> crate::media::MediaWorker {
+		let root = self.root.clone();
+		let gate = Gate {
+			epoch: 0,
+			generation: Arc::new(AtomicU64::new(0)),
+			wake_cancel: Arc::clone(&self.wake_cancel),
+			broker: Arc::clone(&self.broker),
+		};
+		let (id, account) = (id.to_owned(), account.to_owned());
+		crate::media::MediaWorker::spawn(
+			Box::new(move || {
+				let parent = scope(&root, ExtensionKind::Plugin, Some(&account))?;
+				let stored = read_stored(&parent.join(&id).join("package.json"))?;
+				if !stored.grants.contains(&Capability::MediaWorker) {
+					return Err("The media worker was not granted".into());
+				}
+				let action = stored
+					.package
+					.manifest
+					.actions
+					.iter()
+					.find(|action| action.surface == Surface::Media)
+					.map(|action| action.id.clone())
+					.ok_or("The plugin has no media action")?;
+				let data = data_dir(&root, &id, Some(&account))?;
+				let (mut imports, _) = SystemImports::for_plugin(&stored, Some(&data), &gate);
+				// Batches have no invocation to commit with, so nothing waits for one.
+				imports.database = None;
+				imports.journal = None;
+				if let Some(topics) = imports.topics.take() {
+					drop(topics);
+					let manifest = &stored.package.manifest;
+					if !manifest.broadcasts.is_empty() {
+						imports.topics = Some(Arc::new(std::sync::Mutex::new(TopicSession::new(
+							Arc::clone(&gate.broker),
+							manifest.id.clone(),
+							manifest.broadcasts.clone(),
+							false,
+						))));
+					}
+				}
+				let instance =
+					extensions::MediaInstance::new(stored.package, &stored.grants, imports)
+						.map_err(|error| error.to_string())?;
+				Ok((instance, action))
+			}),
+			wake,
+		)
+	}
 	pub fn broker(&self) -> Arc<Broker> {
 		self.broker.clone()
 	}
@@ -3440,6 +3498,97 @@ mod tests {
 		assert!(picked.exists(), "removing access leaves the folder alone");
 		delete_data_dir(&data).unwrap();
 		assert!(!data.join(crate::files::PRIVATE_FOLDER).exists());
+	}
+
+	/// A media worker keeps one instance across batches: the plugin's memory counts them,
+	/// each batch's bytes come through `media_read`, and its captions come back. A batch
+	/// the plugin cannot take ends the worker, and a plugin without the grant never starts.
+	#[test]
+	fn media_workers_keep_their_instance_and_read_batch_data() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let gate = gate();
+		let one = r#"{"captions":[{"text":"one"}]}"#;
+		let two = r#"{"captions":[{"text":"two"}]}"#;
+		let wat = |text: &str| text.replace('"', "\\\"");
+		let mut package = database_plugin("{}");
+		package.manifest.id = "media".into();
+		package.manifest.capabilities = vec![Capability::MediaWorker, Capability::CallCaptions];
+		package.manifest.actions[0].surface = Surface::Media;
+		package.wasm = wat::parse_str(format!(
+			r#"(module
+			(import "serein" "media_read" (func $read (param i32 i32 i32) (result i32)))
+			(memory (export "memory") 2)
+			(global $n (mut i32) (i32.const 0))
+			(data (i32.const 1024) "{}")
+			(data (i32.const 2048) "{}")
+			(func (export "serein_alloc") (param i32) (result i32) (i32.const 8192))
+			(func (export "serein_invoke") (param i32 i32) (result i64)
+				(if (i32.ne (call $read (i32.const 60000) (i32.const 0) (i32.const 5)) (i32.const 5))
+					(then (return (i64.const 0))))
+				(if (i32.ne (i32.load8_u (i32.const 60000)) (i32.const 104))
+					(then (return (i64.const 0))))
+				(global.set $n (i32.add (global.get $n) (i32.const 1)))
+				(if (result i64) (i32.eq (global.get $n) (i32.const 1))
+					(then (i64.const {}))
+					(else (i64.const {})))))"#,
+			wat(one),
+			wat(two),
+			(1024_u64 << 32) | one.len() as u64,
+			(2048_u64 << 32) | two.len() as u64,
+		))
+		.unwrap();
+		let grants = package.manifest.capabilities.clone();
+		enable(
+			&root,
+			source(&profile, &package),
+			grants,
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		let plain = topic_plugin("plain", true, "", "", "");
+		enable(
+			&root,
+			source(&profile, &plain),
+			Vec::new(),
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		let host = ExtensionHost::new(root);
+		let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+		let chunk = |length| extensions::MediaItem::Chunk {
+			stream: "user:1".into(),
+			codec: "opus".into(),
+			time_us: 0,
+			offset: 0,
+			length,
+		};
+		let worker = host.start_media("media", "account", Arc::clone(&wake));
+		worker.push(vec![chunk(5)], b"hello".to_vec());
+		worker.push(vec![chunk(5)], b"hello".to_vec());
+		let text = |event| match event {
+			Some(crate::media::MediaEvent::Captions(lines)) => lines[0].text.clone(),
+			other => panic!("{other:?}"),
+		};
+		assert_eq!(text(worker.wait_event()), "one");
+		assert_eq!(
+			text(worker.wait_event()),
+			"two",
+			"the instance kept its count"
+		);
+		// A chunk past the batch's data is refused before the plugin runs, ending the worker.
+		worker.push(vec![chunk(5)], b"hi".to_vec());
+		assert!(matches!(
+			worker.wait_event(),
+			Some(crate::media::MediaEvent::Failed(_))
+		));
+		let refused = host.start_media("plain", "account", wake);
+		assert!(matches!(
+			refused.wait_event(),
+			Some(crate::media::MediaEvent::Failed(error)) if error.contains("not granted")
+		));
 	}
 
 	#[test]

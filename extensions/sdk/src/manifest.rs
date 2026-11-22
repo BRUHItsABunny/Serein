@@ -140,6 +140,9 @@ pub enum Capability {
 	CallCaptions,
 	/// Use [`crate::host::files`]: a private folder and folders or files the user picks.
 	Files,
+	/// Stay loaded during calls and receive [`crate::MediaBatch`]es in a
+	/// [`Surface::Media`] action.
+	MediaWorker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +172,9 @@ pub enum Surface {
 	/// Runs before each desktop alert; decode [`crate::NotificationInvocation`] and return
 	/// [`crate::NotificationOutput`].
 	Notification,
+	/// Runs once per batch in an instance kept loaded during a call; decode
+	/// [`crate::MediaInvocation`]. It may return only captions.
+	Media,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.

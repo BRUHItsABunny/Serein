@@ -278,7 +278,22 @@ pub struct Bridge {
 		extensions::FilePick,
 		mpsc::Receiver<Option<PathBuf>>,
 	)>,
+	/// Media workers of the current call, by plugin.
+	media: BTreeMap<String, MediaSession>,
+	/// Plugins whose media worker failed, and when one may start again.
+	media_retry: BTreeMap<String, Instant>,
 }
+
+/// A plugin's media worker for one call.
+struct MediaSession {
+	worker: extension_host::media::MediaWorker,
+	channel: model::Id,
+	participants: BTreeSet<model::Id>,
+	started: Instant,
+}
+
+/// How long a failed media worker waits before it starts again in the same call.
+const MEDIA_RETRY: Duration = Duration::from_secs(10);
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
 		self.pending
@@ -941,6 +956,8 @@ impl Bridge {
 			self.notify_running = None;
 			self.pick_request = None;
 			self.file_pick = None;
+			self.media.clear();
+			self.media_retry.clear();
 			messaging.extensions.channel_hooks.clear();
 			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
@@ -2010,6 +2027,7 @@ impl Bridge {
 			messaging.call_captions.clear();
 		}
 		self.notifications(&account, state, ctx, messaging);
+		self.media_workers(&account, state, ctx, messaging);
 		self.journal(&account, state, ctx, messaging);
 		self.topics(&account, state.generation, ctx, messaging);
 		self.annotate(&account, state, ctx, messaging);
@@ -2146,6 +2164,150 @@ impl Bridge {
 			ctx,
 			messaging,
 		);
+	}
+	/// Runs a media worker per enabled `media` plugin during a call: it hears the call start,
+	/// who joins and leaves, and the end, and its captions show in the call.
+	fn media_workers(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let call = state
+			.voice
+			.active
+			.as_ref()
+			.map(|call| call.channel)
+			.filter(|_| account.is_some() && self.start_screen_loaded);
+		let wanted: Vec<String> = match call {
+			Some(_) => self
+				.installed
+				.iter()
+				.filter(|entry| {
+					entry.error.is_none()
+						&& !self.disabled.contains(&entry.manifest.id)
+						&& entry
+							.manifest
+							.capabilities
+							.contains(&Capability::MediaWorker)
+						&& entry
+							.manifest
+							.actions
+							.iter()
+							.any(|action| action.surface == Surface::Media)
+				})
+				.map(|entry| entry.manifest.id.clone())
+				.collect(),
+			None => Vec::new(),
+		};
+		self.media.retain(|id, session| {
+			let keep = wanted.contains(id) && Some(session.channel) == call;
+			if !keep {
+				session.worker.push(
+					vec![extensions::MediaItem::Event {
+						time_us: session.started.elapsed().as_micros() as u64,
+						event: extensions::CallEvent::Ended,
+					}],
+					Vec::new(),
+				);
+			}
+			keep
+		});
+		if call.is_none() {
+			self.media_retry.clear();
+		}
+		let (Some(channel), Some(account)) = (call, account) else {
+			return;
+		};
+		let present: BTreeSet<model::Id> = state
+			.voice
+			.roster
+			.iter()
+			.filter(|entry| entry.channel == channel)
+			.map(|entry| entry.participant.user)
+			.collect();
+		let now = Instant::now();
+		self.media_retry.retain(|_, at| *at > now);
+		for id in &wanted {
+			if self.media.contains_key(id) || self.media_retry.contains_key(id) {
+				continue;
+			}
+			let repaint = ctx.clone();
+			let worker = self.host.as_ref().unwrap().start_media(
+				id,
+				account,
+				Arc::new(move || repaint.request_repaint()),
+			);
+			let guild = state.channel(channel).and_then(|channel| channel.guild);
+			worker.push(
+				vec![extensions::MediaItem::Event {
+					time_us: 0,
+					event: extensions::CallEvent::Started {
+						channel_id: channel.0.to_string(),
+						guild_id: guild.map(|guild| guild.0.to_string()),
+					},
+				}],
+				Vec::new(),
+			);
+			self.media.insert(
+				id.clone(),
+				MediaSession {
+					worker,
+					channel,
+					participants: BTreeSet::new(),
+					started: now,
+				},
+			);
+		}
+		let mut failed = Vec::new();
+		for (id, session) in &mut self.media {
+			let time_us = session.started.elapsed().as_micros() as u64;
+			let event = |event| extensions::MediaItem::Event { time_us, event };
+			let mut items: Vec<_> = present
+				.difference(&session.participants)
+				.map(|user| {
+					event(extensions::CallEvent::Joined {
+						user_id: user.0.to_string(),
+					})
+				})
+				.chain(session.participants.difference(&present).map(|user| {
+					event(extensions::CallEvent::Left {
+						user_id: user.0.to_string(),
+					})
+				}))
+				.collect();
+			items.truncate(extensions::media::MAX_MEDIA_ITEMS);
+			if !items.is_empty() {
+				session.worker.push(items, Vec::new());
+				session.participants.clone_from(&present);
+			}
+			while let Some(event) = session.worker.try_event() {
+				match event {
+					extension_host::media::MediaEvent::Captions(captions) => {
+						if let Some(entry) =
+							self.installed.iter().find(|entry| entry.manifest.id == *id)
+						{
+							messaging.call_captions.set(
+								id,
+								&entry.manifest.name,
+								captions,
+								Instant::now(),
+							);
+						}
+					}
+					extension_host::media::MediaEvent::Failed(error) => {
+						messaging.extensions.status =
+							format!("{id} stopped handling the call and restarts shortly. {error}");
+						failed.push(id.clone());
+					}
+				}
+			}
+		}
+		for id in failed {
+			self.media.remove(&id);
+			self.media_retry.insert(id, now + MEDIA_RETRY);
+		}
 	}
 	/// Opens the picker a plugin asked for, and saves what the user picked.
 	fn file_picker(

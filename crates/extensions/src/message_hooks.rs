@@ -205,6 +205,7 @@ pub(crate) fn validate(manifest: &Manifest) -> Result<(), Error> {
 		(Surface::Send, Capability::SendHook),
 		(Surface::Annotate, Capability::MessageAnnotations),
 		(Surface::Notification, Capability::Notifications),
+		(Surface::Media, Capability::MediaWorker),
 	] {
 		let has_action = manifest
 			.actions

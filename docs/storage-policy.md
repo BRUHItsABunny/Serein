@@ -2186,6 +2186,13 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin media workers (preview, November 22, 2026)
+
+Nothing is written to disk by the host. Each running media worker holds its plugin
+instance (at most 64 MiB of Wasm memory) and a queue of at most 32 batches or 16 MiB, the
+oldest dropped first, plus the call's participant IDs. All of it ends with the call, the
+plugin or the account.
+
 ## Plugin files (preview, November 21, 2026)
 
 A `files` plugin's private folder is `extensions/plugin-data/<account key>/<id>/files/`,

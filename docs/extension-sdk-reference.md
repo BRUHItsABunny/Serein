@@ -27,6 +27,7 @@ instance. Local variables do not survive the call. Use the separately granted
 | `AnnotateInvocation` | Preview `annotate` actions: a batch of messages to add notes under | `input.invocation.action` |
 | `NotificationInvocation` | Preview `notification` actions: a desktop alert to reword or hide | `input.invocation.action` |
 | `PageInvocation` | Preview panel actions that may answer a page list's row request | `input.page_request.as_ref()` |
+| `MediaInvocation` | Preview `media` actions in an instance kept loaded during a call | `input.media.as_ref().map(\|b\| &b.items)` |
 
 The wrappers keep the original `Invocation` fields unchanged. Their `invocation`
 field is a Rust convenience: JSON stays flat. There is no JSON object named
@@ -105,6 +106,7 @@ common optional fields above may instead be serialized as `null`.
 | `send_target` | `Option<SendTarget>` / object or absent | Preview. `channel_id` and, in servers, `guild_id` the draft in `composer` is being sent to. Present only on `send` actions, with `send_hook`, through `SendInvocation`. Return the text to send in `Output::replacement`, or `None` to send the draft unchanged. | `input.send_target.as_ref().map(\|t\| &t.channel_id)` |
 | `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. `histories` and `deleted_messages` add earlier versions and kept deleted rows the same way. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
 | `notification` | `Option<Notification>` / object or absent | Preview. The desktop alert about to be shown: `source` (`gateway` or `push`), `message_id`, `channel_id`, `guild_id`, `author_id`, `direct`, `title`, `body` and `upgrade`. Present only on `notification` actions, with `notifications`, through `NotificationInvocation`. Answer with `NotificationOutput::notification` (`hide`, or a new `title`/`body`); the original shows if you fail or take longer than 1.5 s. | `input.notification.as_ref().map(\|n\| &n.body)` |
+| `media` | `Option<MediaBatch>` / object or absent | Preview. `seq`, `dropped`, `data_bytes` and up to 256 `items`: call `event`s (`started`, `joined`, `left`, `ended`) and binary `chunk`s at `offset`/`length` of the batch's data, copied with `host::media::read`. Present only on `media` actions, with `media_worker`. Unknown items decode as `Other`. | `input.media.iter().flat_map(\|b\| &b.items)` |
 | `page_request` | `Option<PageRequest>` / object or absent | Preview. `version`, `start` and `count` (1–100) of the rows a page list needs. Present only on the list's `rows_action`, a panel action, with `pages`, through `PageInvocation`. Answer with `PageOutput::page_rows` for the same version and start, at most `count` rows. | `input.page_request.as_ref().map(\|r\| r.start)` |
 
 A tick is completion-paced with a 250 ms minimum delay and runs only when the shared
@@ -213,7 +215,8 @@ account snapshot or grant-dependent data:
       "notifications",
       "pages",
       "call_captions",
-      "files"
+      "files",
+      "media_worker"
     ],
     "app_events": [
       "ready",
@@ -238,7 +241,7 @@ account snapshot or grant-dependent data:
       "typing",
       "polls"
     ],
-    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write"]
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write", "media_read"]
   }
 }
 ```

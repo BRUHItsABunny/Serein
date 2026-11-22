@@ -37,6 +37,7 @@ mod raw {
 			data: *const u8,
 			data_length: i32,
 		) -> i32;
+		pub fn media_read(pointer: *mut u8, offset: i32, length: i32) -> i32;
 	}
 }
 
@@ -1157,5 +1158,36 @@ pub mod files {
 	#[cfg(not(target_arch = "wasm32"))]
 	fn call_write(_: &[u8], _: &[u8]) -> Result<(), FileError> {
 		Err(FileError::Host(HostError::Unavailable))
+	}
+}
+
+/// The current media batch's binary data. Requires the `media_worker` capability.
+pub mod media {
+	use super::HostError;
+
+	/// Copies `length` bytes of the batch's data from `offset`, such as one
+	/// [`crate::MediaItem::Chunk`]. Fails outside a `media` action or past the data.
+	pub fn read(offset: u32, length: u32) -> Result<Vec<u8>, HostError> {
+		let mut bytes = vec![0_u8; length as usize];
+		#[cfg(target_arch = "wasm32")]
+		{
+			// SAFETY: the host writes at most `length` bytes into this exclusive buffer.
+			let code =
+				unsafe { super::raw::media_read(bytes.as_mut_ptr(), offset as i32, length as i32) };
+			if code < 0 {
+				return Err(if code == -1 {
+					HostError::Invalid
+				} else {
+					HostError::Unavailable
+				});
+			}
+			bytes.truncate(code as usize);
+			Ok(bytes)
+		}
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let _ = (offset, &mut bytes);
+			Err(HostError::Unavailable)
+		}
 	}
 }

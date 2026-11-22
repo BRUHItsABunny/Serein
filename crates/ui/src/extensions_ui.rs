@@ -3951,6 +3951,9 @@ fn capability_label(capability: Capability) -> &'static str {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
 		Capability::Pages => "Show its own pages in the main area",
+		Capability::MediaWorker => {
+			"Stay running during your calls and hear who joins and leaves, and call media once available"
+		}
 		Capability::Files => {
 			"Keep files in its own folder, and use folders and files you pick for it"
 		}
