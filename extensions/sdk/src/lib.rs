@@ -217,6 +217,62 @@ pub enum Element {
 		max: i32,
 		value: i32,
 	},
+	/// Preview. A search box over the servers, conversations and people Serein has loaded.
+	/// Serein shows the names; the action receives only the choice in `values`, as
+	/// `<kind>:<id>` (see [`PickerKind::parse`]), or an empty string, and in `<id>-name` the
+	/// name Serein showed for it. `value` is the current choice in the same form.
+	Picker {
+		id: String,
+		label: String,
+		kinds: Vec<PickerKind>,
+		#[serde(default)]
+		value: String,
+	},
+}
+
+/// What an [`Element::Picker`] offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerKind {
+	Server,
+	/// A server channel or thread.
+	Channel,
+	Dm,
+	Group,
+	User,
+}
+
+impl PickerKind {
+	pub const ALL: [Self; 5] = [
+		Self::Server,
+		Self::Channel,
+		Self::Dm,
+		Self::Group,
+		Self::User,
+	];
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Server => "server",
+			Self::Channel => "channel",
+			Self::Dm => "dm",
+			Self::Group => "group",
+			Self::User => "user",
+		}
+	}
+
+	/// Reads a picker value such as `user:42`; `None` for an empty or invalid one.
+	pub fn parse(value: &str) -> Option<(Self, u64)> {
+		let (kind, text) = value.split_once(':')?;
+		let kind = Self::ALL.into_iter().find(|k| k.as_str() == kind)?;
+		let id = text.parse::<u64>().ok().filter(|id| *id != 0)?;
+		(id.to_string() == text).then_some((kind, id))
+	}
+
+	/// The picker value for `id`.
+	pub fn value(self, id: u64) -> String {
+		format!("{}:{id}", self.as_str())
+	}
 }
 
 /// Local SDK errors. The Wasm ABI still reports failure with a zero-length response.

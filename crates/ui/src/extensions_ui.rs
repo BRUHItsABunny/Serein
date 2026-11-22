@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 mod hooks;
 mod pages;
+mod picker;
 mod sources;
 pub(crate) use hooks::Outcome as SendOutcome;
 
@@ -3412,7 +3413,13 @@ impl ExtensionUi {
 						});
 						return;
 					}
-					render_elements(ui, &result.output.panel, &mut result.values, &mut action);
+					render_elements(
+						ui,
+						state,
+						&result.output.panel,
+						&mut result.values,
+						&mut action,
+					);
 					if proxy {
 						ui.separator();
 						self.proxy_auth.show(
@@ -4173,6 +4180,7 @@ fn capability_label(capability: Capability) -> &'static str {
 }
 pub(crate) fn render_elements(
 	ui: &mut egui::Ui,
+	state: &State,
 	elements: &[Element],
 	values: &mut BTreeMap<String, String>,
 	action: &mut Option<String>,
@@ -4192,7 +4200,7 @@ pub(crate) fn render_elements(
 				ui.separator();
 			}
 			Element::Row { children } => {
-				ui.horizontal_wrapped(|ui| render_elements(ui, children, values, action));
+				ui.horizontal_wrapped(|ui| render_elements(ui, state, children, values, action));
 			}
 			Element::Button { id, label } => {
 				if ui.push_id(id, |ui| ui.button(label)).inner.clicked() {
@@ -4262,6 +4270,14 @@ pub(crate) fn render_elements(
 				{
 					*stored = value.to_string();
 				}
+			}
+			Element::Picker {
+				id,
+				label,
+				kinds,
+				value,
+			} => {
+				picker::show(ui, state, id, label, kinds, value, values);
 			}
 		}
 	}

@@ -137,6 +137,29 @@ fn diagnostics_distinguish_safe_runtime_input_and_output_failures() {
 		invoke(&returning(&panel.to_string()), &input()),
 		Err(Error::OutputLimit)
 	));
+	// A picker offers at least one kind, each once, and its value is empty or one canonical
+	// choice of an offered kind.
+	let picker = |kinds: &str, value: &str| {
+		returning(&format!(
+			r#"{{"panel":[{{"type":"picker","id":"who","label":"Who","kinds":{kinds},"value":"{value}"}}]}}"#
+		))
+	};
+	for (kinds, value) in [(r#"["user","server"]"#, ""), (r#"["user"]"#, "user:42")] {
+		invoke(&picker(kinds, value), &input()).unwrap();
+	}
+	for (kinds, value) in [
+		("[]", ""),
+		(r#"["user","user"]"#, ""),
+		(r#"["user"]"#, "server:42"),
+		(r#"["user"]"#, "user:042"),
+		(r#"["user"]"#, "user:0"),
+		(r#"["user"]"#, "user:Alice"),
+	] {
+		assert!(
+			invoke(&picker(kinds, value), &input()).is_err(),
+			"{kinds} {value}"
+		);
+	}
 }
 
 /// Checks that a menu action without its target, or with another kind of target, is

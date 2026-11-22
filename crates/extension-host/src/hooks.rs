@@ -72,6 +72,7 @@ impl ChannelHooks {
 	pub fn validate(&self) -> Result<(), &'static str> {
 		let mut seen = std::collections::BTreeSet::new();
 		if self.channel.0 == 0
+			|| (self.channel == EVERYWHERE && self.send.is_some())
 			|| self.annotate.len() > MAX_ANNOTATORS
 			|| !self.annotate.iter().all(|plugin| seen.insert(plugin))
 		{
@@ -91,9 +92,31 @@ impl ChannelHooks {
 	}
 }
 
+/// The saved entry whose notes run in every conversation. It holds annotators only: a send
+/// hook rewrites what the user sends, so it stays a choice per channel. No Discord ID is
+/// this large.
+pub const EVERYWHERE: Id = Id(u64::MAX);
+
 /// Finds `id`'s hooks in a saved list.
 pub fn for_channel(hooks: &[ChannelHooks], id: Id) -> Option<&ChannelHooks> {
 	hooks.iter().find(|hooks| hooks.channel == id)
+}
+
+/// The plugins whose notes run in `channel`: its own, then those on in every conversation,
+/// at most [`MAX_ANNOTATORS`].
+pub fn annotators(hooks: &[ChannelHooks], channel: Id) -> Vec<String> {
+	let mut plugins: Vec<String> = Vec::new();
+	for entry in [channel, EVERYWHERE]
+		.into_iter()
+		.filter_map(|id| for_channel(hooks, id))
+	{
+		for plugin in &entry.annotate {
+			if plugins.len() < MAX_ANNOTATORS && !plugins.contains(plugin) {
+				plugins.push(plugin.clone());
+			}
+		}
+	}
+	plugins
 }
 
 fn content_key(message: &Message) -> u64 {
@@ -452,6 +475,31 @@ mod tests {
 		let again = tracker.due(&state, "translator").unwrap();
 		assert_eq!(again.messages.len(), 1);
 		assert!(again.messages[0].edited && again.messages[0].content == "edited text");
+	}
+
+	/// Notes on in every conversation join a channel's own, once each and within the
+	/// per-channel cap; the everywhere entry never carries a send hook.
+	#[test]
+	fn everywhere_notes_join_each_channel_within_the_cap() {
+		let entry = |channel, plugins: &[&str]| ChannelHooks {
+			channel,
+			send: None,
+			annotate: plugins.iter().map(|p| p.to_string()).collect(),
+		};
+		let saved = [
+			entry(Id(7), &["a", "b", "c"]),
+			entry(EVERYWHERE, &["b", "d", "e"]),
+		];
+		assert_eq!(annotators(&saved, Id(7)), ["a", "b", "c", "d"]);
+		assert_eq!(annotators(&saved, Id(8)), ["b", "d", "e"]);
+		let mut with_send = entry(EVERYWHERE, &[]);
+		with_send.send = Some(SendHook {
+			plugin: "a".into(),
+			mode: SendMode::Auto,
+			fallback: Fallback::SendOriginal,
+		});
+		assert!(with_send.validate().is_err());
+		assert!(entry(EVERYWHERE, &["a"]).validate().is_ok());
 	}
 
 	#[test]

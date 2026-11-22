@@ -530,11 +530,15 @@ impl ExtensionUi {
 				});
 			}
 		}
+		let everywhere_before = self.hooks_in(extension_host::hooks::EVERYWHERE);
+		let mut everywhere = everywhere_before.clone();
 		for (id, name) in &annotators {
-			let mut on = hooks.annotate.contains(id);
+			let global = everywhere.annotate.contains(id);
+			let mut on = global || hooks.annotate.contains(id);
+			let room = |list: &[String]| list.len() < extension_host::hooks::MAX_ANNOTATORS;
 			if ui
 				.add_enabled(
-					on || hooks.annotate.len() < extension_host::hooks::MAX_ANNOTATORS,
+					!global && (on || room(&hooks.annotate)),
 					egui::Checkbox::new(
 						&mut on,
 						crate::i18n::translate_args(
@@ -552,10 +556,34 @@ impl ExtensionUi {
 					self.notes.push(NoteUpdate::Forget(id.clone()));
 				}
 			}
+			let mut all = global;
+			ui.indent(("annotate-everywhere", id), |ui| {
+				if ui
+					.add_enabled(
+						all || room(&everywhere.annotate),
+						egui::Checkbox::new(
+							&mut all,
+							crate::i18n::translate("extensions-ui-hook-annotate-everywhere"),
+						),
+					)
+					.changed()
+				{
+					everywhere.annotate.retain(|plugin| plugin != id);
+					if all {
+						everywhere.annotate.push(id.clone());
+					} else if !hooks.annotate.contains(id) {
+						self.notes.push(NoteUpdate::Forget(id.clone()));
+					}
+				}
+			});
 		}
-		if hooks != before {
+		for (hooks, before) in [(hooks, before), (everywhere, everywhere_before)] {
+			if hooks == before {
+				continue;
+			}
 			// Shown at once; the saved list from the host replaces it.
-			self.channel_hooks.retain(|saved| saved.channel != channel);
+			self.channel_hooks
+				.retain(|saved| saved.channel != hooks.channel);
 			if !hooks.is_empty() {
 				self.channel_hooks.push(hooks.clone());
 			}

@@ -2078,9 +2078,10 @@ impl Bridge {
 		let (Some(account), Some(channel)) = (account, state.selected) else {
 			return;
 		};
-		let Some(hooks) = extension_host::hooks::for_channel(&self.channel_hooks, channel) else {
+		let annotators = extension_host::hooks::annotators(&self.channel_hooks, channel);
+		if annotators.is_empty() {
 			return;
-		};
+		}
 		if self.host.as_ref().unwrap().busy()
 			|| !self.pending.is_empty()
 			|| !self.message_events.is_empty()
@@ -2095,7 +2096,7 @@ impl Bridge {
 			ctx.request_repaint_after(wait);
 			return;
 		}
-		let due = hooks.annotate.iter().find_map(|id| {
+		let due = annotators.iter().find_map(|id| {
 			let entry = self.installed.iter().find(|entry| {
 				entry.manifest.id == *id && entry.error.is_none() && !self.disabled.contains(id)
 			})?;

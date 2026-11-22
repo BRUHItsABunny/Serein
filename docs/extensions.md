@@ -206,7 +206,7 @@ supports 73 capabilities, with at most 96 distinct declarations per manifest.
 | `network` | Make HTTPS requests to the exact origins in the manifest's `network` list | Preview; [network](#network-preview); the consent dialog lists the origins and warns that readable data may be sent there |
 | `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
 | `send_hook` | Rewrite the user's draft in one `send` action before it is sent | Preview; [message hooks](#message-hooks-preview); only in channels where the user switches it on, with preview or automatic sending and a chosen fallback |
-| `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on; notes are shown, never sent |
+| `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on, or from every channel when they choose *In every conversation*; notes are shown, never sent |
 | `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
 | `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
 | `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
@@ -414,7 +414,15 @@ for package compatibility; successful activation with the granted capability ena
 retention, including existing protector packages with no-op activation. Input is
 restricted to the granted context and bounded form values.
 Results can propose a composer replacement or return native headings, text, rows,
-separators, buttons, text inputs, checkboxes, dropdowns and integer sliders. Standalone
+separators, buttons, text inputs, checkboxes, dropdowns, integer sliders and pickers.
+A picker (Preview) is `{"type": "picker", "id", "label", "kinds", "value"}` with `kinds`
+from `server`, `channel` (server channels and threads), `dm`, `group` and `user`: a search
+box over the servers, conversations and people Serein has loaded (sidebar, DM and group
+recipients, the open conversation's authors and member list). Only the choice reaches
+the plugin: its form value is `<kind>:<id>`, such as `user:42`, or empty, and
+`<id>-name` holds the name Serein showed for that choice (at most 128 bytes, when that key
+is a valid ID).
+`value` must be empty or such a choice of an offered kind. Standalone
 panel actions are available from Settings > Extensions. Composer actions appear in the composer Tools menu. Composer proposals require Apply, retain
 the ordinary Send action and are discarded when their originating context is
 stale. Account/session changes invalidate outstanding results.
@@ -824,7 +832,9 @@ messages in its batch, at most 4 KiB each; empty text removes the plugin's note.
 `message` action of a plugin with this grant may annotate the message it was chosen on
 the same way. Notes appear in small muted text under the message with the plugin's name,
 are kept in memory only (2,000 messages, 2 MiB) and are never sent to Discord. Up to
-four plugins may annotate one channel.
+four plugins may annotate one channel. Under each plugin's switch in the composer's
+Extensions menu, **In every conversation** runs its notes in every channel the user opens,
+alongside that channel's own switches and within the same four.
 
 ```json
 {"annotations": [{"message_id": "1300000000000000000", "text": "Hi everyone"}]}

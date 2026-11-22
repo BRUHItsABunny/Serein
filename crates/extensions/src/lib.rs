@@ -958,6 +958,57 @@ pub enum Element {
 		max: i32,
 		value: i32,
 	},
+	/// A search box over the servers, conversations and people Serein has loaded. Names stay
+	/// in Serein; the plugin receives only the choice, as `<kind>:<id>` such as `user:42`, or
+	/// an empty value when nothing is chosen, and the chosen name in `<id>-name`.
+	Picker {
+		id: String,
+		label: String,
+		kinds: Vec<PickerKind>,
+		#[serde(default)]
+		value: String,
+	},
+}
+
+/// What a [`Element::Picker`] offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerKind {
+	Server,
+	/// A server channel or thread.
+	Channel,
+	Dm,
+	Group,
+	User,
+}
+
+impl PickerKind {
+	pub const ALL: [Self; 5] = [
+		Self::Server,
+		Self::Channel,
+		Self::Dm,
+		Self::Group,
+		Self::User,
+	];
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Server => "server",
+			Self::Channel => "channel",
+			Self::Dm => "dm",
+			Self::Group => "group",
+			Self::User => "user",
+		}
+	}
+
+	/// Reads a picker value; `None` for anything but `<kind>:<snowflake>`.
+	pub fn parse(value: &str) -> Option<(Self, u64)> {
+		let (kind, text) = value.split_once(':')?;
+		let kind = Self::ALL.into_iter().find(|k| k.as_str() == kind)?;
+		let id = text.parse::<u64>().ok().filter(|id| *id != 0)?;
+		// One spelling per choice: no sign or leading zeros.
+		(id.to_string() == text).then_some((kind, id))
+	}
 }
 
 pub fn valid_id(value: &str) -> bool {
@@ -1945,6 +1996,22 @@ fn validate_elements(
 				value,
 			} => {
 				if min >= max || !(*min..=*max).contains(value) {
+					return Err(Error::Invalid);
+				}
+				(id, label)
+			}
+			Element::Picker {
+				id,
+				label,
+				kinds,
+				value,
+			} => {
+				let unique: BTreeSet<_> = kinds.iter().collect();
+				if kinds.is_empty()
+					|| unique.len() != kinds.len()
+					|| !(value.is_empty()
+						|| PickerKind::parse(value).is_some_and(|(kind, _)| kinds.contains(&kind)))
+				{
 					return Err(Error::Invalid);
 				}
 				(id, label)

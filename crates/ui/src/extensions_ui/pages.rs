@@ -203,7 +203,7 @@ impl ExtensionUi {
 				if !open.page.elements.is_empty() {
 					ui.add_space(6.0);
 					let elements = open.page.elements.clone();
-					render_elements(ui, &elements, &mut open.values, &mut action);
+					render_elements(ui, state, &elements, &mut open.values, &mut action);
 				}
 				ui.add_space(8.0);
 				ui.separator();
