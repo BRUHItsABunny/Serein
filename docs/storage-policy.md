@@ -2186,6 +2186,17 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin files (preview, November 21, 2026)
+
+A `files` plugin's private folder is `extensions/plugin-data/<account key>/<id>/files/`,
+bounded by the plugin's data limit (64 MiB by default, up to 16 GiB) and measured with a
+scan of at most 100,000 entries. It is kept on disable or logout like other plugin data
+and removed when the user deletes the data. Picked folders and files are recorded in
+the plugin's `settings.json` (at most 16, with their full paths, kinds, write flag and
+purpose; the file is read up to 64 KiB). Removing a pick deletes only the record; the
+user's files stay. Files the plugin writes into picked folders are the user's and are
+not bounded or removed by Serein.
+
 ## Plugin call captions and message history (preview, November 21, 2026)
 
 Nothing is written to disk. Earlier versions and kept deleted rows plugins return share

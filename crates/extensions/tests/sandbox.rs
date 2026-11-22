@@ -1507,3 +1507,66 @@ fn annotators_add_history_and_deleted_rows_only_around_their_messages_and_captio
 	ungranted.capabilities = vec![Capability::MessageAnnotations];
 	assert!(captions("hello").validate(&ungranted, &open).is_err());
 }
+
+#[test]
+fn picks_need_the_files_grant_a_declared_action_and_come_from_the_foreground() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Files, Capability::MessageEvents];
+	manifest.actions = vec![
+		Action {
+			id: "picked".into(),
+			label: "Picked".into(),
+			surface: Surface::Panel,
+		},
+		Action {
+			id: "event".into(),
+			label: "Event".into(),
+			surface: Surface::MessageEvent,
+		},
+	];
+	manifest.validate().unwrap();
+	let pick = |pick: FilePick| Output {
+		pick: Some(pick),
+		..Default::default()
+	};
+	let export = FilePick {
+		kind: PickKind::SaveFile,
+		write: true,
+		purpose: "Export the archive".into(),
+		name: Some("archive.json".into()),
+		action: "picked".into(),
+	};
+	let panel = Invocation {
+		action: "picked".into(),
+		..Default::default()
+	};
+	pick(export.clone()).validate(&manifest, &panel).unwrap();
+	for (invalid, why) in [
+		(
+			FilePick {
+				action: "missing".into(),
+				..export.clone()
+			},
+			"undeclared action",
+		),
+		(
+			FilePick {
+				kind: PickKind::Folder,
+				..export.clone()
+			},
+			"a name only for save pickers",
+		),
+		(
+			FilePick {
+				name: Some("../x.json".into()),
+				..export.clone()
+			},
+			"a name, not a path",
+		),
+	] {
+		assert!(pick(invalid).validate(&manifest, &panel).is_err(), "{why}");
+	}
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities = vec![Capability::MessageEvents];
+	assert!(pick(export.clone()).validate(&ungranted, &panel).is_err());
+}

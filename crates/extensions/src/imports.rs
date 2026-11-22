@@ -70,6 +70,12 @@ pub(crate) enum Kind {
 	/// `(max: i32) -> i32`: reads up to `max` messages from approved providers; the pending
 	/// reply's length, or a [`status`] code.
 	TopicRead,
+	/// `(ptr: i32, len: i32) -> i32`: runs one JSON [`crate::FileRequest`]; the pending
+	/// reply's length, or a [`status`] code.
+	FileRequest,
+	/// `(ptr: i32, len: i32, data: i32, data_len: i32) -> i32`: writes raw bytes as a JSON
+	/// [`crate::FileWrite`] header says; [`status::OK`] or a [`status`] code.
+	FileWrite,
 }
 
 /// One importable host function.
@@ -130,6 +136,16 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 		capability: None,
 		kind: Kind::TopicRead,
 	},
+	HostImport {
+		name: "file_request",
+		capability: Some(Capability::Files),
+		kind: Kind::FileRequest,
+	},
+	HostImport {
+		name: "file_write",
+		capability: Some(Capability::Files),
+		kind: Kind::FileWrite,
+	},
 ];
 
 pub(crate) fn find(name: &str) -> Option<&'static HostImport> {
@@ -185,6 +201,15 @@ pub trait HostImports: Send {
 	/// `{"messages": [...], "more": bool}` JSON. They leave its queue only when the host
 	/// accepts the invocation.
 	fn topic_read(&mut self, _max: u32) -> Reply {
+		Reply::Unavailable
+	}
+	/// Runs one [`crate::FileRequest`] in the plugin's private folder or a folder or file the
+	/// user gave it. `read` replies with raw bytes, the others with JSON.
+	fn file_request(&mut self, _request: &[u8]) -> Reply {
+		Reply::Unavailable
+	}
+	/// Writes `data` as the [`crate::FileWrite`] header says; an empty reply on success.
+	fn file_write(&mut self, _header: &[u8], _data: &[u8]) -> Reply {
 		Reply::Unavailable
 	}
 }

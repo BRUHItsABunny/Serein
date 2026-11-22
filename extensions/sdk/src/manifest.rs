@@ -138,6 +138,8 @@ pub enum Capability {
 	Pages,
 	/// Show caption lines above the call controls; see [`crate::CaptionOutput`].
 	CallCaptions,
+	/// Use [`crate::host::files`]: a private folder and folders or files the user picks.
+	Files,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

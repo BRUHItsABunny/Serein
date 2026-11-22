@@ -137,6 +137,21 @@ pub enum Job {
 		secret: String,
 		value: Option<zeroize::Zeroizing<String>>,
 	},
+	/// Gives a plugin with `files` the folder or file the user picked at `path` for `pick`.
+	AddFileHandle {
+		id: String,
+		account: Option<String>,
+		connection: bool,
+		pick: extensions::FilePick,
+		path: PathBuf,
+	},
+	/// Takes a picked folder or file away from a plugin.
+	RemoveFileHandle {
+		id: String,
+		account: Option<String>,
+		connection: bool,
+		root: String,
+	},
 	/// Sets a plugin's database quota to one of [`database::QUOTAS`].
 	SetDatabaseQuota {
 		id: String,
@@ -386,8 +401,12 @@ pub struct PluginData {
 	pub database_quota: u64,
 	/// Secret IDs the user has set; values stay in the secret store.
 	pub secrets: Vec<String>,
+	/// Folders and files the user picked for the plugin.
+	pub handles: Vec<extensions::FileHandleInfo>,
 }
 
+// Events reach the front end one at a time; boxing the output would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
 	ThemeSelected {
 		id: Option<String>,
@@ -438,6 +457,13 @@ pub enum Event {
 	Subscriptions(Vec<Subscription>),
 	/// The message hooks switched on in the account's channels.
 	ChannelHooks(Vec<ChannelHooks>),
+	/// The user's pick was saved as `root`; the plugin's `action` hears about it.
+	FileHandleAdded {
+		id: String,
+		root: String,
+		action: String,
+		usage: Vec<PluginData>,
+	},
 	/// A `journal` action finished; `more` when entries remain for another delivery.
 	JournalDelivered {
 		id: String,
@@ -453,6 +479,7 @@ pub struct SystemImports {
 	journal: Option<SharedJournal>,
 	network: Option<PluginNetwork>,
 	topics: Option<SharedTopics>,
+	files: Option<crate::files::PluginFiles>,
 }
 
 type SharedTopics = Arc<std::sync::Mutex<TopicSession>>;
@@ -549,6 +576,15 @@ impl SystemImports {
 				database: database.clone(),
 				journal: journal.clone(),
 				topics: topics.clone(),
+				files: directory
+					.filter(|_| stored.grants.contains(&Capability::Files))
+					.map(|directory| {
+						crate::files::PluginFiles::new(
+							directory,
+							database_quota(directory),
+							read_settings(directory).handles,
+						)
+					}),
 				network: stored.grants.contains(&Capability::Network).then(|| {
 					let mut network =
 						PluginNetwork::new(&stored.package.manifest.network, gate.clone());
@@ -608,6 +644,18 @@ impl extensions::HostImports for SystemImports {
 		match self.topics.as_ref().and_then(|topics| topics.lock().ok()) {
 			Some(topics) => topics.has_subscribers(topic),
 			None => extensions::imports::status::UNAVAILABLE,
+		}
+	}
+	fn file_request(&mut self, request: &[u8]) -> extensions::Reply {
+		match &mut self.files {
+			Some(files) => files.request(request),
+			None => extensions::Reply::Unavailable,
+		}
+	}
+	fn file_write(&mut self, header: &[u8], data: &[u8]) -> extensions::Reply {
+		match &mut self.files {
+			Some(files) => files.write(header, data),
+			None => extensions::Reply::Unavailable,
 		}
 	}
 	fn topic_read(&mut self, max: u32) -> extensions::Reply {
@@ -1022,6 +1070,11 @@ fn validate_job(job: &Job) -> Result<(), String> {
 				return Err("Invalid subscription".into());
 			}
 		}
+		Job::AddFileHandle { id, pick, .. } => {
+			valid_id(id)?;
+			pick.validate(|_| true).map_err(|error| error.to_string())?;
+		}
+		Job::RemoveFileHandle { id, .. } => valid_id(id)?,
 		Job::SetDatabaseQuota { id, bytes, .. } => {
 			valid_id(id)?;
 			if !database::QUOTAS.contains(bytes) {
@@ -1294,6 +1347,65 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				return Err("Sign in to manage this account's plugin data".into());
 			}
 			delete_data_dir(&data_dir(root, &id, account.as_deref())?)?;
+			data_usage(root, account.as_deref()).map(Event::DataUsage)
+		}
+		Job::AddFileHandle {
+			id,
+			account,
+			connection,
+			pick,
+			path,
+		} => {
+			let account = if connection { None } else { account };
+			let parent = scope(root, ExtensionKind::Plugin, account.as_deref())?;
+			let stored = read_stored(&parent.join(&id).join("package.json"))?;
+			if !stored.grants.contains(&Capability::Files) {
+				return Err("File access was not granted".into());
+			}
+			let picked = match pick.kind {
+				extensions::PickKind::Folder => path.is_dir(),
+				extensions::PickKind::File => path.is_file(),
+				extensions::PickKind::SaveFile => {
+					path.parent().is_some_and(Path::is_dir) && !path.is_dir()
+				}
+			};
+			if !path.is_absolute()
+				|| !picked || fs::symlink_metadata(&path)
+				.is_ok_and(|meta| meta.file_type().is_symlink())
+			{
+				return Err("Pick a folder or file on this device".into());
+			}
+			let directory = data_dir(root, &id, account.as_deref())?;
+			let mut settings = read_settings(&directory);
+			let handle = crate::files::FileHandle {
+				id: crate::files::new_handle_id(&settings.handles)
+					.ok_or("This plugin already has 16 folders and files; remove one first")?,
+				kind: pick.kind,
+				write: pick.write || pick.kind == extensions::PickKind::SaveFile,
+				path,
+				purpose: pick.purpose,
+			};
+			let handle_root = handle.id.clone();
+			settings.handles.push(handle);
+			write_settings(&directory, &settings, gate)?;
+			Ok(Event::FileHandleAdded {
+				id,
+				root: handle_root,
+				action: pick.action,
+				usage: data_usage(root, account.as_deref())?,
+			})
+		}
+		Job::RemoveFileHandle {
+			id,
+			account,
+			connection,
+			root: handle,
+		} => {
+			let account = if connection { None } else { account };
+			let directory = data_dir(root, &id, account.as_deref())?;
+			let mut settings = read_settings(&directory);
+			settings.handles.retain(|saved| saved.id != handle);
+			write_settings(&directory, &settings, gate)?;
 			data_usage(root, account.as_deref()).map(Event::DataUsage)
 		}
 		Job::SetDatabaseQuota {
@@ -1694,10 +1806,13 @@ struct DataSettings {
 	/// Secret IDs saved in the secret store, so deleting the data can forget them.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	secrets: Vec<String>,
+	/// Folders and files the user picked for the plugin.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	handles: Vec<crate::files::FileHandle>,
 }
 
 fn read_settings(directory: &Path) -> DataSettings {
-	read_bounded(&directory.join(SETTINGS_FILE), 4096)
+	read_bounded(&directory.join(SETTINGS_FILE), 64 * 1024)
 		.ok()
 		.and_then(|bytes| serde_json::from_slice(&bytes).ok())
 		.unwrap_or_default()
@@ -1795,10 +1910,19 @@ fn data_usage(root: &Path, account: Option<&str>) -> Result<Vec<PluginData>, Str
 			if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || valid_id(&id).is_err() {
 				continue;
 			}
+			let settings = read_settings(&entry.path());
 			usage.push(PluginData {
-				bytes: directory_bytes(&entry.path()),
+				bytes: directory_bytes(&entry.path()).saturating_add(
+					crate::files::folder_bytes(&entry.path().join(crate::files::PRIVATE_FOLDER))
+						.unwrap_or(0),
+				),
 				database_quota: database_quota(&entry.path()),
-				secrets: read_settings(&entry.path()).secrets,
+				handles: settings
+					.handles
+					.iter()
+					.map(crate::files::FileHandle::info)
+					.collect(),
+				secrets: settings.secrets,
 				id,
 				connection,
 			});
@@ -3201,6 +3325,121 @@ mod tests {
 		))
 		.unwrap();
 		package
+	}
+
+	/// A plugin writes to its private folder through the real worker and import, a pick
+	/// needs the `files` grant, a saved pick is listed with its name and can be removed,
+	/// and deleting the plugin's data removes the folder with it.
+	#[test]
+	fn plugins_write_their_folder_and_picks_need_the_grant() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let gate = gate();
+		let header = r#"{"root":"private","path":"out.txt"}"#;
+		let escaped: String = header.bytes().map(|b| format!("\\{b:02x}")).collect();
+		let mut filer = topic_plugin(
+			"filer",
+			true,
+			r#"(import "serein" "file_write" (func $write (param i32 i32 i32 i32) (result i32)))"#,
+			&format!(r#"(data (i32.const 1024) "{escaped}") (data (i32.const 2048) "hello")"#),
+			&format!(
+				"(drop (call $write (i32.const 1024) (i32.const {}) (i32.const 2048) (i32.const 5)))",
+				header.len()
+			),
+		);
+		filer.manifest.broadcasts.clear();
+		filer.manifest.capabilities = vec![Capability::Files];
+		let plain = topic_plugin("plain", true, "", "", "");
+		enable(
+			&root,
+			source(&profile, &filer),
+			vec![Capability::Files],
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		enable(
+			&root,
+			source(&profile, &plain),
+			Vec::new(),
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		let Ok(Event::Invoked { .. }) = run(
+			&root,
+			Job::Invoke {
+				id: "filer".into(),
+				account: "account".into(),
+				invocation: Invocation {
+					action: "run".into(),
+					..Default::default()
+				},
+			},
+			&gate,
+		) else {
+			panic!("not invoked")
+		};
+		let data = data_dir(&root, "filer", Some("account")).unwrap();
+		assert_eq!(
+			fs::read(data.join(crate::files::PRIVATE_FOLDER).join("out.txt")).unwrap(),
+			b"hello"
+		);
+
+		let picked = profile.0.join("Exports");
+		fs::create_dir_all(&picked).unwrap();
+		let pick = |id: &str| Job::AddFileHandle {
+			id: id.into(),
+			account: Some("account".into()),
+			connection: false,
+			pick: extensions::FilePick {
+				kind: extensions::PickKind::Folder,
+				write: true,
+				purpose: "Exports".into(),
+				name: None,
+				action: "run".into(),
+			},
+			path: picked.clone(),
+		};
+		assert!(run(&root, pick("plain"), &gate).is_err(), "no files grant");
+		let Ok(Event::FileHandleAdded {
+			root: handle,
+			usage,
+			..
+		}) = run(&root, pick("filer"), &gate)
+		else {
+			panic!("pick not saved")
+		};
+		let listed = &usage.iter().find(|data| data.id == "filer").unwrap();
+		assert_eq!(listed.handles[0].root, handle);
+		assert_eq!(listed.handles[0].name, "Exports");
+		assert_eq!(
+			listed.bytes,
+			5 + fs::metadata(data.join(SETTINGS_FILE)).unwrap().len()
+		);
+		let Ok(Event::DataUsage(usage)) = run(
+			&root,
+			Job::RemoveFileHandle {
+				id: "filer".into(),
+				account: Some("account".into()),
+				connection: false,
+				root: handle,
+			},
+			&gate,
+		) else {
+			panic!("not removed")
+		};
+		assert!(
+			usage
+				.iter()
+				.find(|data| data.id == "filer")
+				.unwrap()
+				.handles
+				.is_empty()
+		);
+		assert!(picked.exists(), "removing access leaves the folder alone");
+		delete_data_dir(&data).unwrap();
+		assert!(!data.join(crate::files::PRIVATE_FOLDER).exists());
 	}
 
 	#[test]

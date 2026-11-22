@@ -30,6 +30,13 @@ mod raw {
 		pub fn broadcast(pointer: *const u8, length: i32) -> i32;
 		pub fn has_subscribers(pointer: *const u8, length: i32) -> i32;
 		pub fn topic_read(max: i32) -> i32;
+		pub fn file_request(pointer: *const u8, length: i32) -> i32;
+		pub fn file_write(
+			pointer: *const u8,
+			length: i32,
+			data: *const u8,
+			data_length: i32,
+		) -> i32;
 	}
 }
 
@@ -946,5 +953,209 @@ pub mod topics {
 			);
 			assert_eq!(read(0), Err(TopicError::Host(HostError::Invalid)));
 		}
+	}
+}
+
+/// Files in this plugin's private folder and in folders or files the user picked for it.
+/// Requires the `files` capability.
+///
+/// Every call names a root, [`PRIVATE`](files::PRIVATE) or a picked root id from
+/// [`handles`](files::handles), and a relative `/`-separated path; the host refuses `..`,
+/// absolute paths and symbolic links. The private folder counts against the plugin's data
+/// limit. Changes apply at once, even if the invocation later fails. Ask the user for a
+/// folder or file with [`crate::FilePick`].
+pub mod files {
+	use super::HostError;
+	use serde::{Deserialize, Serialize};
+
+	/// The root naming the plugin's own folder.
+	pub const PRIVATE: &str = "private";
+	/// Largest data one host write sends; [`write`] splits larger data.
+	pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
+	/// Largest data one [`read`] returns.
+	pub const MAX_READ_BYTES: u32 = 256 * 1024;
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub enum FileError {
+		Host(HostError),
+		/// The host refused or could not do it, such as a missing file, a read-only root or
+		/// the data limit; at most 1 KiB.
+		Failed(String),
+		/// The host's reply could not be decoded.
+		Reply,
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+	pub struct Entry {
+		pub name: String,
+		pub folder: bool,
+		pub size: u64,
+		#[serde(default)]
+		pub modified_ms: Option<i64>,
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+	pub struct Listing {
+		pub entries: Vec<Entry>,
+		pub more: bool,
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+	pub struct Stat {
+		pub exists: bool,
+		#[serde(default)]
+		pub folder: bool,
+		#[serde(default)]
+		pub size: u64,
+		#[serde(default)]
+		pub modified_ms: Option<i64>,
+	}
+
+	#[derive(Deserialize)]
+	struct Handles {
+		handles: Vec<crate::FileHandleInfo>,
+	}
+
+	/// The folders and files the user gave this plugin.
+	pub fn handles() -> Result<Vec<crate::FileHandleInfo>, FileError> {
+		decode::<Handles>(request(&serde_json::json!({"op": "handles"}))?).map(|h| h.handles)
+	}
+	/// Up to `limit` (at most 512) entries of a folder after the first `offset`, by name.
+	pub fn list(root: &str, path: &str, offset: u32, limit: u32) -> Result<Listing, FileError> {
+		decode(request(&serde_json::json!({
+			"op": "list", "root": root, "path": path, "offset": offset, "limit": limit,
+		}))?)
+	}
+	pub fn stat(root: &str, path: &str) -> Result<Stat, FileError> {
+		decode(request(
+			&serde_json::json!({"op": "stat", "root": root, "path": path}),
+		)?)
+	}
+	/// Up to `length` bytes (at most [`MAX_READ_BYTES`]) from `offset`.
+	pub fn read(root: &str, path: &str, offset: u64, length: u32) -> Result<Vec<u8>, FileError> {
+		request(&serde_json::json!({
+			"op": "read", "root": root, "path": path, "offset": offset, "length": length,
+		}))
+	}
+	/// Creates a folder and its missing parents.
+	pub fn create_folder(root: &str, path: &str) -> Result<(), FileError> {
+		request(&serde_json::json!({"op": "create_folder", "root": root, "path": path})).map(drop)
+	}
+	/// Removes a file or an empty folder.
+	pub fn delete(root: &str, path: &str) -> Result<(), FileError> {
+		request(&serde_json::json!({"op": "delete", "root": root, "path": path})).map(drop)
+	}
+	/// Moves within one root, never over an existing entry.
+	pub fn rename(root: &str, path: &str, to: &str) -> Result<(), FileError> {
+		request(&serde_json::json!({"op": "rename", "root": root, "path": path, "to": to}))
+			.map(drop)
+	}
+	/// Writes `data` at `offset`, or appends with `None`; `truncate` empties the file first.
+	pub fn write(
+		root: &str,
+		path: &str,
+		offset: Option<u64>,
+		truncate: bool,
+		data: &[u8],
+	) -> Result<(), FileError> {
+		let mut at = offset;
+		let mut truncate = truncate;
+		let empty: &[u8] = &[];
+		let chunks = data
+			.chunks(MAX_WRITE_BYTES)
+			.chain(data.is_empty().then_some(empty));
+		for chunk in chunks {
+			let header = Header {
+				root,
+				path,
+				offset: at,
+				truncate,
+			};
+			let header = serde_json::to_vec(&header).map_err(|_| FileError::Reply)?;
+			call_write(&header, chunk)?;
+			at = at.map(|at| at + chunk.len() as u64);
+			truncate = false;
+		}
+		Ok(())
+	}
+	/// Appends `data` to the end of the file, creating it.
+	pub fn append(root: &str, path: &str, data: &[u8]) -> Result<(), FileError> {
+		write(root, path, None, false, data)
+	}
+
+	#[derive(Serialize)]
+	struct Header<'a> {
+		root: &'a str,
+		path: &'a str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		offset: Option<u64>,
+		#[serde(skip_serializing_if = "std::ops::Not::not")]
+		truncate: bool,
+	}
+
+	fn decode<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T, FileError> {
+		serde_json::from_slice(&bytes).map_err(|_| FileError::Reply)
+	}
+
+	fn request(value: &serde_json::Value) -> Result<Vec<u8>, FileError> {
+		let bytes = serde_json::to_vec(value).map_err(|_| FileError::Reply)?;
+		if bytes.len() > 4096 {
+			return Err(FileError::Host(HostError::Invalid));
+		}
+		call(&bytes)
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn reply(code: i32) -> Result<Vec<u8>, FileError> {
+		let (capacity, failed) = match code {
+			0.. => (code as usize, false),
+			-3 => (1024, true),
+			-1 => return Err(FileError::Host(HostError::Invalid)),
+			_ => return Err(FileError::Host(HostError::Unavailable)),
+		};
+		let mut reply = vec![0_u8; capacity];
+		// SAFETY: the host writes at most `capacity` bytes into this exclusive buffer.
+		let read = unsafe { super::raw::result_read(reply.as_mut_ptr(), capacity as i32) };
+		if read < 0 {
+			return Err(FileError::Reply);
+		}
+		reply.truncate(read as usize);
+		if failed {
+			Err(FileError::Failed(
+				String::from_utf8_lossy(&reply).into_owned(),
+			))
+		} else {
+			Ok(reply)
+		}
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn call(request: &[u8]) -> Result<Vec<u8>, FileError> {
+		// SAFETY: the host reads `request.len()` bytes from this live buffer.
+		reply(unsafe { super::raw::file_request(request.as_ptr(), request.len() as i32) })
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn call_write(header: &[u8], data: &[u8]) -> Result<(), FileError> {
+		// SAFETY: the host reads both live buffers, `header.len()` and `data.len()` bytes.
+		let code = unsafe {
+			super::raw::file_write(
+				header.as_ptr(),
+				header.len() as i32,
+				data.as_ptr(),
+				data.len() as i32,
+			)
+		};
+		reply(code).map(drop)
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn call(_: &[u8]) -> Result<Vec<u8>, FileError> {
+		Err(FileError::Host(HostError::Unavailable))
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn call_write(_: &[u8], _: &[u8]) -> Result<(), FileError> {
+		Err(FileError::Host(HostError::Unavailable))
 	}
 }

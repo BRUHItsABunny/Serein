@@ -55,7 +55,9 @@ fn required_capabilities(module: &Module) -> Result<BTreeSet<Capability>, Error>
 			| Kind::ResultRead
 			| Kind::HttpsRequest
 			| Kind::Broadcast
-			| Kind::HasSubscribers => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+			| Kind::HasSubscribers
+			| Kind::FileRequest => FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
+			Kind::FileWrite => FuncType::new([ValType::I32; 4], [ValType::I32]),
 			Kind::JournalRead | Kind::TopicRead => FuncType::new([ValType::I32], [ValType::I32]),
 		};
 		if !matches!(import.ty(), ExternType::Func(ty) if *ty == expected) {
@@ -235,6 +237,58 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					.read(&caller, pointer, &mut request)
 					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
 				let reply = caller.data_mut().services.https_request(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"file_request",
+			|mut caller: Caller<'_, HostState>, pointer: i32, length: i32| {
+				caller.data_mut().pending = None;
+				let Some((pointer, length)) =
+					span(pointer, length, crate::files::MAX_FILE_REQUEST_BYTES)
+				else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, length as u64)?;
+				let mut request = vec![0; length];
+				exported_memory(&caller)?
+					.read(&caller, pointer, &mut request)
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let reply = caller.data_mut().services.file_request(&request);
+				hold(&mut caller, reply)
+			},
+		)
+		.map_err(|_| Error::Execution)?;
+	linker
+		.func_wrap(
+			module,
+			"file_write",
+			|mut caller: Caller<'_, HostState>,
+			 pointer: i32,
+			 length: i32,
+			 data: i32,
+			 data_length: i32| {
+				caller.data_mut().pending = None;
+				let (Some((pointer, length)), Some((data, data_length))) = (
+					span(pointer, length, crate::files::MAX_FILE_REQUEST_BYTES),
+					span(data, data_length, crate::files::MAX_FILE_WRITE_BYTES),
+				) else {
+					charge(&mut caller, 0)?;
+					return Ok(status::INVALID);
+				};
+				charge(&mut caller, (length + data_length) as u64)?;
+				let memory = exported_memory(&caller)?;
+				let mut header = vec![0; length];
+				let mut bytes = vec![0; data_length];
+				memory
+					.read(&caller, pointer, &mut header)
+					.and_then(|()| memory.read(&caller, data, &mut bytes))
+					.map_err(|_| wasmi::Error::from(TrapCode::MemoryOutOfBounds))?;
+				let reply = caller.data_mut().services.file_write(&header, &bytes);
 				hold(&mut caller, reply)
 			},
 		)

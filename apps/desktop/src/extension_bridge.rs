@@ -270,6 +270,14 @@ pub struct Bridge {
 	notify: extension_host::notify::Pipeline<(String, Option<String>)>,
 	/// The plugin and message the running notification invocation is for.
 	notify_running: Option<(String, String)>,
+	/// A pick a plugin asked for, waiting for the picker to open.
+	pick_request: Option<(String, extensions::FilePick)>,
+	/// The open picker, for that plugin and pick.
+	file_pick: Option<(
+		String,
+		extensions::FilePick,
+		mpsc::Receiver<Option<PathBuf>>,
+	)>,
 }
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
@@ -931,6 +939,8 @@ impl Bridge {
 			messaging.call_captions.clear();
 			self.notify.dismiss(true);
 			self.notify_running = None;
+			self.pick_request = None;
+			self.file_pick = None;
 			messaging.extensions.channel_hooks.clear();
 			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
@@ -1126,6 +1136,15 @@ impl Bridge {
 					}
 				}
 				Ok(Event::DataUsage(data)) => messaging.extensions.plugin_data = data,
+				Ok(Event::FileHandleAdded {
+					id,
+					root,
+					action,
+					usage,
+				}) => {
+					messaging.extensions.plugin_data = usage;
+					Self::pick_answer(state, messaging, id, action, ("root", root));
+				}
 				Ok(Event::ChannelHooks(hooks)) => {
 					messaging.extensions.channel_hooks.clone_from(&hooks);
 					self.channel_hooks = hooks;
@@ -1415,6 +1434,7 @@ impl Bridge {
 				Err(mpsc::TryRecvError::Empty) => {}
 			}
 		}
+		self.file_picker(&account, state, ctx, runtime, window, messaging);
 		if let Some(receiver) = &self.theme_picker {
 			match receiver.try_recv() {
 				Ok(result) => {
@@ -1670,6 +1690,24 @@ impl Bridge {
 							connection,
 							secret,
 							value,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::RemoveFileHandle {
+					id,
+					connection,
+					root,
+				} => {
+					self.submit(
+						Job::RemoveFileHandle {
+							id,
+							account: account.clone(),
+							connection,
+							root,
 						},
 						None,
 						state.generation,
@@ -2108,6 +2146,106 @@ impl Bridge {
 			ctx,
 			messaging,
 		);
+	}
+	/// Opens the picker a plugin asked for, and saves what the user picked.
+	fn file_picker(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		runtime: &tokio::runtime::Runtime,
+		window: &Arc<winit::window::Window>,
+		messaging: &mut ui::MessagingUi,
+	) {
+		if self.file_pick.is_none()
+			&& let Some((id, pick)) = self.pick_request.take()
+		{
+			let Some(name) = self
+				.installed
+				.iter()
+				.find(|entry| entry.manifest.id == id && !self.disabled.contains(&id))
+				.map(|entry| entry.manifest.name.clone())
+			else {
+				return;
+			};
+			let kind = match pick.kind {
+				extensions::PickKind::Folder => platform::save::Pick::Folder,
+				extensions::PickKind::File => platform::save::Pick::File,
+				extensions::PickKind::SaveFile => {
+					platform::save::Pick::Save(pick.name.clone().unwrap_or_default())
+				}
+			};
+			let (send, receive) = mpsc::sync_channel(1);
+			let future = platform::save::plugin_pick(
+				window.clone(),
+				kind,
+				format!("{name}: {}", pick.purpose),
+			);
+			let repaint = ctx.clone();
+			runtime.spawn(async move {
+				let _ = send.send(future.await);
+				repaint.request_repaint();
+			});
+			self.file_pick = Some((id, pick, receive));
+		}
+		let picked = match self
+			.file_pick
+			.as_ref()
+			.map(|(_, _, receive)| receive.try_recv())
+		{
+			Some(Ok(picked)) => picked,
+			Some(Err(mpsc::TryRecvError::Disconnected)) => None,
+			_ => return,
+		};
+		let Some((id, pick, _)) = self.file_pick.take() else {
+			return;
+		};
+		let connection = self.installed.iter().any(|entry| {
+			entry.manifest.id == id && entry.manifest.capabilities.contains(&Capability::ApiProxy)
+		});
+		match picked {
+			Some(path) => self.submit(
+				Job::AddFileHandle {
+					id,
+					account: account.clone(),
+					connection,
+					pick,
+					path,
+				},
+				None,
+				state.generation,
+				ctx,
+				messaging,
+			),
+			None => Self::pick_answer(
+				state,
+				messaging,
+				id,
+				pick.action,
+				("cancelled", "true".into()),
+			),
+		}
+	}
+	/// Runs the plugin's pick action with what became of its pick.
+	fn pick_answer(
+		state: &State,
+		messaging: &mut ui::MessagingUi,
+		id: String,
+		action: String,
+		value: (&str, String),
+	) {
+		messaging
+			.extensions
+			.requests
+			.push(ExtensionRequest::Invoke {
+				id,
+				invocation: Invocation {
+					action,
+					values: [(value.0.to_owned(), value.1)].into(),
+					..Default::default()
+				},
+				context: ExtensionContext::panel(state),
+			});
 	}
 	/// Shows a running plugin's caption lines while the user is in a call.
 	fn show_captions(
@@ -2591,6 +2729,13 @@ impl Bridge {
 	) {
 		let (invocation, context) = invocation;
 		self.show_captions(state, messaging, id, output.captions.take());
+		if let Some(pick) = output.pick.take() {
+			if self.file_pick.is_some() || self.pick_request.is_some() {
+				messaging.extensions.status = "Finish the open folder or file picker first.".into();
+			} else {
+				self.pick_request = Some((id.to_owned(), pick));
+			}
+		}
 		if context.is_current(state)
 			&& let Some(appearance) = &output.appearance
 		{

@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 68 capabilities, with at most 96 distinct declarations per manifest.
+supports 69 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -186,6 +186,7 @@ supports 68 capabilities, with at most 96 distinct declarations per manifest.
 | `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
 | `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
 | `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
+| `files` | Read and write files in a private folder, and in folders and files the user picks for it, with `serein.file_request` and `serein.file_write` | Preview; [files](#files-preview); the private folder counts against the data limit; picks are listed in the plugin's details and can be removed |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -507,7 +508,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 68 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 69 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -555,6 +556,8 @@ granted by the user:
 | `broadcast` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | Sends `{"topic", "payload"}` (payload at most 16 KiB); the number of approved subscribers reached, or `-1` invalid / `-2` limit |
 | `has_subscribers` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | `1` when the topic has an approved subscriber, else `0` |
 | `topic_read` | `(max: i32) -> i32` | manifest `subscribes` | Reads 1-64 delivered messages in a `topic` action; the pending reply's length |
+| `file_request` | `(ptr, len) -> i32` | `files` | Runs one JSON file request of at most 4 KiB; the pending reply's length (raw bytes for `read`, JSON otherwise) |
+| `file_write` | `(ptr, len, data, data_len) -> i32` | `files` | Writes up to 1 MiB of raw bytes as a JSON header says; `0`, or `-3` with a message pending |
 | `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
 
 Installation rejects a module that imports an unknown name, uses a different
@@ -880,11 +883,46 @@ with revisions has an **(edited) · history** button that opens its versions.
    "revisions": [{"time_ms": 1763699000000, "text": "See you at 5"}]}]}}
 ```
 
+## Files (preview)
+
+With `files`, a plugin reads and writes files through two imports. Every call names a
+`root` and a relative `path` (`/`-separated, at most 1 KiB):
+
+- `"private"` is the plugin's own folder, `files/` in its data directory. It counts
+  against the plugin's data limit (the size chosen in its details, 64 MiB by default),
+  is kept and removed with the rest of its data, and needs no pick.
+- Any other root is the id of a folder or file the user picked for the plugin. An
+  activation or panel action asks with `pick`: `kind` (`folder`, `file` or `save_file`),
+  `write`, a `purpose` (at most 128 bytes, shown in the picker title) and, for
+  `save_file`, a suggested `name`. The host shows the system picker and then runs the
+  declared panel `action` with the new root in `values["root"]`, or with
+  `values["cancelled"] = "true"`. A `save_file` pick may always be written; other picks
+  only with `write`. A plugin keeps at most 16 picks, saved with its data settings, and
+  the user removes them from **Folders and files you gave it** in its details.
+
+`file_request` takes JSON tagged by `op`: `handles` (the picks, with each one's own name
+but never its full path), `list` (`offset`, `limit` up to 512, sorted by name, links left
+out), `stat`, `read` (`offset`, `length` up to 256 KiB, raw bytes back),
+`create_folder`, `delete` (a file or an empty folder) and `rename` (`to`, within the same
+root, never over an existing entry). `file_write` takes a header `{root, path, offset?,
+truncate?}` and up to 1 MiB of raw data; without `offset` it appends. A picked file has
+no paths inside it.
+
+The host refuses absolute paths, `..`, `.`, empty parts, backslashes, `:` and other
+characters Windows reserves, reserved device names, and any symbolic link under the
+root. Changes apply at once, even if the invocation later fails. One invocation may write
+and read at most 512 MiB each.
+
+```json
+{"pick": {"kind": "save_file", "purpose": "Export the archive", "name": "archive.json", "action": "exported"}}
+```
+
 ## Plugin data (preview)
 
 Plugin data lives apart from packages in `extensions/plugin-data/<account>/<plugin id>/`
 (`connection/` for connection plugins): `data.json` (`storage`), `data.sqlite`
-(`database`) and `settings.json` (the chosen database size). The account's message
+(`database`), `files/` (`files`) and `settings.json` (the chosen data size and the
+folders and files the user picked). The account's message
 journal, approved connections (`subscriptions.json`) and message hooks (`hooks.json`)
 sit beside them. Data from older versions inside package directories moves
 there on first use.

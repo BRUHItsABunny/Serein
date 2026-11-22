@@ -13,6 +13,8 @@ pub use message_hooks::{
 };
 pub mod captions;
 pub use captions::Caption;
+pub mod files;
+pub use files::{FileHandleInfo, FilePick, FileRequest, FileWrite, PickKind};
 pub mod notification_hook;
 pub mod pages;
 pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
@@ -198,6 +200,9 @@ pub enum Capability {
 	Pages,
 	/// Show a few caption lines above the call controls during a call.
 	CallCaptions,
+	/// Read and write files in a private folder, and in folders and files the user picks,
+	/// through `serein.file_request` and `serein.file_write`.
+	Files,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -869,6 +874,10 @@ pub struct Output {
 	/// `call_captions`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub captions: Option<Vec<Caption>>,
+	/// Asks the user to pick a folder or file for this plugin. Requires `files`; activation
+	/// and panel actions only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pick: Option<FilePick>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1614,6 +1623,20 @@ impl Output {
 				|| !matches!(surface, Surface::Activation | Surface::Panel))
 		{
 			return Err(Error::Capability);
+		}
+		if let Some(pick) = &self.pick {
+			if !manifest.capabilities.contains(&Capability::Files)
+				|| !matches!(surface, Surface::Activation | Surface::Panel)
+				|| input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			pick.validate(|id| {
+				manifest
+					.actions
+					.iter()
+					.any(|action| action.id == id && action.surface == Surface::Panel)
+			})?;
 		}
 		if let Some(captions) = &self.captions {
 			if !manifest.capabilities.contains(&Capability::CallCaptions)

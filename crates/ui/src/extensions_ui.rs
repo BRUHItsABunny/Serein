@@ -136,6 +136,12 @@ pub enum ExtensionRequest {
 	SetChannelHooks {
 		hooks: extension_host::hooks::ChannelHooks,
 	},
+	/// Take a picked folder or file away from a plugin.
+	RemoveFileHandle {
+		id: String,
+		connection: bool,
+		root: String,
+	},
 	/// Change how large a plugin's database may grow.
 	SetDatabaseQuota {
 		id: String,
@@ -2082,6 +2088,7 @@ impl ExtensionUi {
 		let data = self.data_of(&id).cloned();
 		let quota_editable = usable && entry.manifest.capabilities.contains(&Capability::Database);
 		let mut quota = None;
+		let mut remove_handle = None;
 		let mut secret_request: Option<(String, Option<zeroize::Zeroizing<String>>)> = None;
 		let set_secrets: Vec<String> = data
 			.as_ref()
@@ -2235,6 +2242,43 @@ impl ExtensionUi {
 											}
 										}
 									});
+							});
+						}
+					}
+					if let Some(handles) = data
+						.as_ref()
+						.map(|data| &data.handles)
+						.filter(|handles| !handles.is_empty())
+					{
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-files-section"),
+							colors.muted,
+						));
+						for handle in handles {
+							ui.horizontal_wrapped(|ui| {
+								ui.label(egui::RichText::new(&handle.name).color(colors.text));
+								ui.label(
+									egui::RichText::new(format!(
+										"{} · {}",
+										handle.purpose,
+										crate::i18n::translate(if handle.write {
+											"extensions-ui-files-read-write"
+										} else {
+											"extensions-ui-files-read-only"
+										})
+									))
+									.color(colors.muted),
+								);
+								if ui
+									.small_button(crate::i18n::translate(
+										"extensions-ui-files-remove",
+									))
+									.clicked()
+								{
+									remove_handle = Some(handle.root.clone());
+								}
 							});
 						}
 					}
@@ -2421,6 +2465,16 @@ impl ExtensionUi {
 					},
 				);
 			}
+		}
+		if let Some(root) = remove_handle {
+			self.queue(
+				ctx,
+				ExtensionRequest::RemoveFileHandle {
+					id: id.clone(),
+					connection: entry.manifest.capabilities.contains(&Capability::ApiProxy),
+					root,
+				},
+			);
 		}
 		if let Some(bytes) = quota {
 			let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
@@ -3435,6 +3489,7 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			| ExtensionRequest::DeleteData { id, .. }
 			| ExtensionRequest::SetDatabaseQuota { id, .. }
 			| ExtensionRequest::Preview { id } => id.len(),
+			ExtensionRequest::RemoveFileHandle { id, root, .. } => id.len() + root.len(),
 			ExtensionRequest::SetSecret {
 				id, secret, value, ..
 			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),
@@ -3896,6 +3951,9 @@ fn capability_label(capability: Capability) -> &'static str {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
 		Capability::Pages => "Show its own pages in the main area",
+		Capability::Files => {
+			"Keep files in its own folder, and use folders and files you pick for it"
+		}
 		Capability::CallCaptions => "Show caption lines above the call controls during calls",
 		Capability::Notifications => {
 			"See every desktop notification, including its message preview, and reword or hide it"
@@ -4402,6 +4460,7 @@ pub(crate) mod tests {
 			connection: false,
 			bytes: 3 * 1024 * 1024,
 			database_quota: extension_host::database::DEFAULT_QUOTA,
+			handles: Vec::new(),
 			secrets: Vec::new(),
 		}];
 		let ask = |shop: &mut ExtensionUi| {
@@ -5216,6 +5275,7 @@ pub(crate) mod tests {
 			connection: false,
 			bytes: 0,
 			database_quota: extension_host::database::DEFAULT_QUOTA,
+			handles: Vec::new(),
 			secrets: vec!["api_key".into()],
 		}];
 		shop.open_details(&plugin.manifest.id);

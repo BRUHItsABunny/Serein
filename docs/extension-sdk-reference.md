@@ -212,7 +212,8 @@ account snapshot or grant-dependent data:
       "message_annotations",
       "notifications",
       "pages",
-      "call_captions"
+      "call_captions",
+      "files"
     ],
     "app_events": [
       "ready",
@@ -237,7 +238,7 @@ account snapshot or grant-dependent data:
       "typing",
       "polls"
     ],
-    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read"]
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write"]
   }
 }
 ```

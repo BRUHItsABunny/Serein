@@ -92,6 +92,7 @@ impl HostInfo {
 				Capability::Notifications,
 				Capability::Pages,
 				Capability::CallCaptions,
+				Capability::Files,
 			],
 			app_events: &[
 				AppEventKind::Ready,
