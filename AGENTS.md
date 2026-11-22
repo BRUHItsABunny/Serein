@@ -84,6 +84,9 @@ the `upstream` remote, `ViceVerse-cz/Serein`, for fetching only; its push URL is
 
 - Never push to upstream or open, edit or comment on its PRs, issues or wiki. PRs target
   `origin` only, with base `main` or the branch a stacked PR builds on.
+- With an `upstream` remote, `gh` can pick the upstream repository. Keep
+  `gh repo set-default BRUHItsABunny/Serein` and pass `--repo BRUHItsABunny/Serein` to
+  every `gh pr` and `gh api` call that targets a repository.
 - Bring upstream changes in by fetching `upstream` and merging them on a fork task branch
   through an ordinary fork PR.
 - The plugin host's fork-only features (host imports, plugin networking, files, media taps,
