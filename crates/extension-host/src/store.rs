@@ -68,6 +68,8 @@ pub enum InstallSource {
 	},
 }
 
+// One job crosses to the worker at a time; boxing the invocation would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum Job {
 	EditTheme {
 		id: String,

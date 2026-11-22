@@ -12,6 +12,7 @@ const MAX_SETTINGS_BYTES: usize = 32 * 1024 * 1024;
 pub struct Notification {
 	pub channel: Id,
 	pub message: Id,
+	pub author: Id,
 	pub sender: String,
 	pub preview: String,
 	pub avatar_key: String,
@@ -1176,6 +1177,7 @@ impl State {
 		let notification = Notification {
 			channel: message.channel,
 			message: message.id,
+			author: message.author.id,
 			sender,
 			preview,
 			avatar_key: message.author.avatar_key(),

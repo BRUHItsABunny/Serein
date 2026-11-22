@@ -5581,6 +5581,7 @@ impl Desktop {
 						})
 				)) {
 				self.notifications.dismiss();
+				self.extensions.dismiss_notifications();
 			}
 			let data_changes = extension_host::data_events::Changes::capture(&self.state, &event);
 			let journal_records = self.extensions.journal_capture(&self.state, &event);
@@ -6473,6 +6474,7 @@ impl eframe::App for Desktop {
 		};
 		if self.state.auth != AuthState::Authenticated && !self.state.demo {
 			self.notifications.clear();
+			self.extensions.dismiss_notifications();
 		}
 		if let Some(channel) = self.notifications.take_activation()
 			&& self.state.auth == AuthState::Authenticated
@@ -6489,22 +6491,18 @@ impl eframe::App for Desktop {
 			ctx,
 			self.fixture_only,
 		) {
-			match alert {
-				notification_runtime::Alert::Message {
-					channel,
-					title,
-					body,
-					avatar_key,
-					image_path,
-				} => {
-					if self
-						.notifications
-						.notify_channel(channel, title, body, image_path)
-						&& let Some(worker) = &self.avatars
-					{
-						worker.request(avatar_key);
-					}
-				}
+			// Enabled `notification` plugins may reword or hide it first.
+			self.extensions.offer_notification(&self.state, alert);
+		}
+		while let Some(ready) = self.extensions.take_notification(ctx) {
+			let alert = ready.alert;
+			let (avatar_key, image_path) = alert.extra;
+			if self
+				.notifications
+				.notify_channel(alert.channel, alert.title, alert.body, image_path)
+				&& let Some(worker) = &self.avatars
+			{
+				worker.request(avatar_key);
 			}
 		}
 		let talking = self.messaging.voice_push_to_talk && self.state.voice.active.is_some();

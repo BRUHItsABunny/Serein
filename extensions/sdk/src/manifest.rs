@@ -130,6 +130,9 @@ pub enum Capability {
 	SendHook,
 	/// Return [`crate::Annotation`]s from [`Surface::Annotate`] and [`Surface::Message`] actions.
 	MessageAnnotations,
+	/// Reword or hide desktop alerts in a [`Surface::Notification`] action; see
+	/// [`crate::NotificationInvocation`].
+	Notifications,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +159,9 @@ pub enum Surface {
 	/// Host-scheduled batches of messages to annotate; decode [`crate::AnnotateInvocation`]
 	/// and return [`crate::AnnotationOutput`].
 	Annotate,
+	/// Runs before each desktop alert; decode [`crate::NotificationInvocation`] and return
+	/// [`crate::NotificationOutput`].
+	Notification,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.

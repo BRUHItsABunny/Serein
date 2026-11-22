@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 63 capabilities, with at most 64 distinct declarations per manifest.
+supports 66 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -183,6 +183,7 @@ supports 63 capabilities, with at most 64 distinct declarations per manifest.
 | `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
 | `send_hook` | Rewrite the user's draft in one `send` action before it is sent | Preview; [message hooks](#message-hooks-preview); only in channels where the user switches it on, with preview or automatic sending and a chosen fallback |
 | `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on; notes are shown, never sent |
+| `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -504,7 +505,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 63 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 66 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -778,6 +779,40 @@ four plugins may annotate one channel.
 
 ```json
 {"annotations": [{"message_id": "1300000000000000000", "text": "Hi everyone"}]}
+```
+
+## Notification hook (preview)
+
+With `notifications`, one action with `surface: "notification"` sees each desktop alert
+before the operating system shows it. It runs only after Serein's own checks (mutes, Do
+Not Disturb, the focused channel and your notification settings) picked the alert, so it
+cannot add alerts. The action receives `notification`:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `gateway` (the live connection) or `push` (a mobile push message; desktop sends only `gateway`) |
+| `message_id`, `channel_id`, `guild_id`, `author_id` | The message; `guild_id` is absent in direct and group messages |
+| `direct` | From a direct or group conversation |
+| `title`, `body` | What the alert would show: sender name and preview, at most 256 and 512 bytes |
+| `upgrade` | The alert was already shown, and a reworded one replaces it |
+
+It returns `notification`: `{"hide": true}` to skip the alert, or `title` and/or `body` to
+reword it, within the same limits and without control characters or line breaks. Leaving
+it out shows the alert unchanged. It may also save `storage`, nothing else. Hiding affects
+only the alert; message sounds and unread badges stay as they are.
+
+- **Order.** Several enabled plugins run one after another in the order they are listed;
+  each sees the previous one's wording. A plugin that hides the alert ends the chain.
+- **Fails open.** A plugin that fails is skipped. An alert still waiting after 1.5 s is
+  shown as it stands; a plugin answering within 10 s after that replaces it with the
+  reworded one, unless a newer alert was shown since or the alert was read. At most 16
+  alerts wait at a time; more are shown without plugins.
+- **One alert per message.** The host remembers the last 512 alerted messages. A message
+  reported by both sources alerts once; when a `push` alert is followed by its `gateway`
+  copy, the gateway copy replaces it.
+
+```json
+{"notification": {"body": "Hello, how are you?"}}
 ```
 
 ## Plugin data (preview)

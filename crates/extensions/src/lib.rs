@@ -8,6 +8,8 @@ pub use runtime::{invoke, invoke_with};
 pub mod imports;
 pub mod message_hooks;
 pub use message_hooks::{AnnotateBatch, AnnotateMessage, Annotation, SendTarget};
+pub mod notification_hook;
+pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
 pub mod network;
 pub mod topics;
 pub use imports::{HostImports, NoHostImports, Reply};
@@ -45,7 +47,7 @@ pub const MAX_EVENT_CONTENT_BYTES: usize = 16 * 1024;
 pub const MAX_STORAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_PLUGINS: usize = 8;
 pub const MAX_PANEL_ELEMENTS: usize = 64;
-pub const MAX_CAPABILITIES: usize = 64;
+pub const MAX_CAPABILITIES: usize = 96;
 /// Minimum delay between completed host-scheduled appearance ticks.
 pub const TICK_MIN_INTERVAL_MS: u64 = 250;
 
@@ -181,6 +183,9 @@ pub enum Capability {
 	/// Add notes under messages from an `annotate` action, in channels where the user
 	/// switched it on, and under the message a `message` action was chosen on.
 	MessageAnnotations,
+	/// See each desktop alert, with its message preview, before it is shown and reword or
+	/// hide it from a `notification` action.
+	Notifications,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -258,6 +263,9 @@ pub enum Surface {
 	/// Host-scheduled batches of messages in channels where the user switched annotations on;
 	/// the result's `annotations` are shown under them. Requires `message_annotations`.
 	Annotate,
+	/// Runs before each desktop alert with it in `notification`; the result's `notification`
+	/// rewords or hides it. Requires `notifications`.
+	Notification,
 }
 
 impl Surface {
@@ -536,6 +544,9 @@ pub struct Invocation {
 	/// Messages for an `annotate` action.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub annotate: Option<Box<AnnotateBatch>>,
+	/// The alert for a `notification` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notification: Option<Box<NotificationInput>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,6 +828,9 @@ pub struct Output {
 	/// `message` action; empty text removes this plugin's note. Requires `message_annotations`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub annotations: Vec<Annotation>,
+	/// How a `notification` action wants the alert shown. Requires `notifications`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notification: Option<NotificationDecision>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -998,6 +1012,7 @@ impl Manifest {
 			Surface::Topic,
 			Surface::Send,
 			Surface::Annotate,
+			Surface::Notification,
 		] {
 			if self
 				.actions
@@ -1034,6 +1049,7 @@ impl Manifest {
 				Surface::Topic => None,
 				Surface::Send => Some(Capability::SendHook),
 				Surface::Annotate => Some(Capability::MessageAnnotations),
+				Surface::Notification => Some(Capability::Notifications),
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1376,6 +1392,13 @@ impl Invocation {
 			(None, false) => {}
 			_ => return Err(Error::Capability),
 		}
+		match (&self.notification, action.surface == Surface::Notification) {
+			(Some(alert), true) if manifest.capabilities.contains(&Capability::Notifications) => {
+				alert.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
 		let composer_grant = if action.surface == Surface::Send {
 			Capability::SendHook
 		} else {
@@ -1418,7 +1441,12 @@ impl Invocation {
 		}
 		if matches!(
 			action.surface,
-			Surface::Tick | Surface::Journal | Surface::Topic | Surface::Send | Surface::Annotate
+			Surface::Tick
+				| Surface::Journal
+				| Surface::Topic
+				| Surface::Send
+				| Surface::Annotate
+				| Surface::Notification
 		) && (!self.values.is_empty()
 			|| self.message_event.is_some()
 			|| self.app.is_some()
@@ -1506,11 +1534,20 @@ impl Output {
 			}
 			message_hooks::validate_annotations(&self.annotations, &allowed)?;
 		}
+		match (&self.notification, surface == Surface::Notification) {
+			(Some(decision), true) => decision.validate()?,
+			(None, _) => {}
+			_ => return Err(Error::Capability),
+		}
 		// Background deliveries and hooks may only save storage, and a send hook its rewrite;
 		// database writes go through imports.
 		if matches!(
 			surface,
-			Surface::Journal | Surface::Topic | Surface::Send | Surface::Annotate
+			Surface::Journal
+				| Surface::Topic
+				| Surface::Send
+				| Surface::Annotate
+				| Surface::Notification
 		) && (self.rich_presence.is_some()
 			|| self.api_proxy.is_some()
 			|| self.image_sharing

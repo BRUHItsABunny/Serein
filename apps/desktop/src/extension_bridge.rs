@@ -265,6 +265,11 @@ pub struct Bridge {
 	/// Which messages each annotating plugin was given.
 	annotated: extension_host::hooks::AnnotateTracker,
 	annotate_at: Option<Instant>,
+	/// Desktop alerts on their way to the OS through the enabled `notification` plugins, with
+	/// each alert's avatar key and image.
+	notify: extension_host::notify::Pipeline<(String, Option<String>)>,
+	/// The plugin and message the running notification invocation is for.
+	notify_running: Option<(String, String)>,
 }
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
@@ -923,6 +928,8 @@ impl Bridge {
 			self.message_events.clear();
 			self.channel_hooks.clear();
 			self.annotated.clear();
+			self.notify.dismiss(true);
+			self.notify_running = None;
 			messaging.extensions.channel_hooks.clear();
 			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
@@ -1035,6 +1042,20 @@ impl Bridge {
 					if more {
 						self.journal_due.insert(id);
 					}
+				}
+				Err(error)
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| input.notification.is_some()) =>
+				{
+					// The alert shows without this plugin's say.
+					let (id, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					let message = invocation.notification.map(|alert| alert.message_id);
+					self.notify
+						.failed(&id, message.as_deref().unwrap_or_default());
+					self.notify_running = None;
+					messaging.extensions.status = format!("{id}: {error}");
 				}
 				Err(error)
 					if pending
@@ -1313,6 +1334,22 @@ impl Bridge {
 							self.apply_theme(ctx);
 						}
 					}
+				}
+				Ok(Event::Invoked { id, output })
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| input.notification.is_some()) =>
+				{
+					let (_, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					let message = invocation.notification.map(|alert| alert.message_id);
+					let message = message.as_deref().unwrap_or_default();
+					if self.disabled.contains(&id) {
+						self.notify.failed(&id, message);
+					} else {
+						self.notify.answer(&id, message, output.notification);
+					}
+					self.notify_running = None;
 				}
 				Ok(Event::Invoked { id, mut output }) => {
 					if let Some((requested, invocation, context)) =
@@ -1920,6 +1957,7 @@ impl Bridge {
 			}
 		}
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
+		self.notifications(&account, state, ctx, messaging);
 		self.journal(&account, state, ctx, messaging);
 		self.topics(&account, state.generation, ctx, messaging);
 		self.annotate(&account, state, ctx, messaging);
@@ -1986,6 +2024,117 @@ impl Bridge {
 			messaging,
 		);
 		self.annotate_at = Some(Instant::now());
+	}
+	/// Hands the enabled `notification` plugins to the pipeline and runs the next one on a
+	/// waiting alert, ahead of other background work.
+	fn notifications(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let handlers = if account.is_some() && self.start_screen_loaded {
+			self.installed
+				.iter()
+				.filter(|entry| {
+					entry.error.is_none() && !self.disabled.contains(&entry.manifest.id)
+				})
+				.filter_map(|entry| {
+					let action = entry
+						.manifest
+						.actions
+						.iter()
+						.find(|action| action.surface == Surface::Notification)?;
+					Some((entry.manifest.id.clone(), action.id.clone()))
+				})
+				.collect()
+		} else {
+			Vec::new()
+		};
+		self.notify.set_handlers(handlers);
+		// A run whose job was cancelled or belonged to an earlier session fails open.
+		if let Some((plugin, message)) = &self.notify_running
+			&& !self.pending.values().any(|pending| {
+				pending
+					.invocation
+					.as_ref()
+					.is_some_and(|(_, input, _)| input.notification.is_some())
+			}) {
+			self.notify.failed(plugin, message);
+			self.notify_running = None;
+		}
+		let Some(account) = account else {
+			return;
+		};
+		if self.notify_running.is_some() || self.host.as_ref().unwrap().busy() {
+			return;
+		}
+		let Some(request) = self.notify.next_request() else {
+			return;
+		};
+		self.notify_running = Some((request.plugin.clone(), request.input.message_id.clone()));
+		let invocation = Invocation {
+			action: request.action,
+			notification: Some(Box::new(request.input)),
+			..Default::default()
+		};
+		self.submit(
+			Job::Invoke {
+				id: request.plugin.clone(),
+				account: account.clone(),
+				invocation: invocation.clone(),
+			},
+			Some((
+				request.plugin,
+				invocation,
+				ExtensionContext::capture(state, false),
+			)),
+			state.generation,
+			ctx,
+			messaging,
+		);
+	}
+	/// Takes in a desktop alert for the enabled `notification` plugins.
+	pub fn offer_notification(&mut self, state: &State, alert: crate::notification_runtime::Alert) {
+		let crate::notification_runtime::Alert::Message {
+			channel,
+			message,
+			author,
+			direct,
+			title,
+			body,
+			avatar_key,
+			image_path,
+		} = alert;
+		self.notify.offer(
+			extension_host::notify::Alert {
+				source: extensions::NotificationSource::Gateway,
+				message,
+				channel,
+				guild: state.channel(channel).and_then(|channel| channel.guild),
+				author: Some(author),
+				direct,
+				title,
+				body,
+				extra: (avatar_key, image_path),
+			},
+			Instant::now(),
+		);
+	}
+	/// The next alert to show: shaped by its plugins, or as it stands once they were too slow.
+	pub fn take_notification(
+		&mut self,
+		ctx: &egui::Context,
+	) -> Option<extension_host::notify::Ready<(String, Option<String>)>> {
+		if let Some(wait) = self.notify.expire(Instant::now()) {
+			ctx.request_repaint_after(wait);
+		}
+		self.notify.take_ready()
+	}
+	/// Drops alerts still waiting for plugins after a read, mute or connection change.
+	pub fn dismiss_notifications(&mut self) {
+		self.notify.dismiss(false);
 	}
 	fn topic_action(entry: &InstalledExtension) -> Option<&str> {
 		entry

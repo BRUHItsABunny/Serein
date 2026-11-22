@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 pub enum Alert {
 	Message {
 		channel: Id,
+		message: Id,
+		author: Id,
+		direct: bool,
 		title: String,
 		body: String,
 		avatar_key: String,
@@ -260,6 +263,9 @@ impl Runtime {
 				});
 				alert = Some(Alert::Message {
 					channel: notification.channel,
+					message: notification.message,
+					author: notification.author,
+					direct: notification.is_direct(),
 					title: notification.sender,
 					body: notification.preview,
 					avatar_key: notification.avatar_key,

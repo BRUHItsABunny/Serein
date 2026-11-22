@@ -17,6 +17,7 @@ pub mod member_details;
 pub mod message_content;
 pub mod message_events;
 pub mod network;
+pub mod notify;
 pub mod secrets;
 pub mod snapshot;
 pub mod store;

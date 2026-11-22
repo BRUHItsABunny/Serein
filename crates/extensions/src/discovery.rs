@@ -89,6 +89,7 @@ impl HostInfo {
 				Capability::Network,
 				Capability::SendHook,
 				Capability::MessageAnnotations,
+				Capability::Notifications,
 			],
 			app_events: &[
 				AppEventKind::Ready,

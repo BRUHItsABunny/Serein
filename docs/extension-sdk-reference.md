@@ -25,6 +25,7 @@ instance. Local variables do not survive the call. Use the separately granted
 | `MessageActionInvocation` | `AppInvocation` plus the IDs of the message a `message` action was chosen on | `input.invocation.invocation.action` |
 | `SendInvocation` | Preview `send` hooks: the draft in `composer` plus its `send_target` | `input.invocation.action` |
 | `AnnotateInvocation` | Preview `annotate` actions: a batch of messages to add notes under | `input.invocation.action` |
+| `NotificationInvocation` | Preview `notification` actions: a desktop alert to reword or hide | `input.invocation.action` |
 
 The wrappers keep the original `Invocation` fields unchanged. Their `invocation`
 field is a Rust convenience: JSON stays flat. There is no JSON object named
@@ -102,6 +103,7 @@ common optional fields above may instead be serialized as `null`.
 | `tick_ms` | `Option<u64>` / integer or absent | Elapsed milliseconds since this plugin was enabled for the session. Present only on preview `tick` calls through `TickInvocation`. | `input.tick_ms` |
 | `send_target` | `Option<SendTarget>` / object or absent | Preview. `channel_id` and, in servers, `guild_id` the draft in `composer` is being sent to. Present only on `send` actions, with `send_hook`, through `SendInvocation`. Return the text to send in `Output::replacement`, or `None` to send the draft unchanged. | `input.send_target.as_ref().map(\|t\| &t.channel_id)` |
 | `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
+| `notification` | `Option<Notification>` / object or absent | Preview. The desktop alert about to be shown: `source` (`gateway` or `push`), `message_id`, `channel_id`, `guild_id`, `author_id`, `direct`, `title`, `body` and `upgrade`. Present only on `notification` actions, with `notifications`, through `NotificationInvocation`. Answer with `NotificationOutput::notification` (`hide`, or a new `title`/`body`); the original shows if you fail or take longer than 1.5 s. | `input.notification.as_ref().map(\|n\| &n.body)` |
 
 A tick is completion-paced with a 250 ms minimum delay and runs only when the shared
 extension worker is idle. It receives the flattened base invocation plus `tick_ms`;
@@ -205,7 +207,8 @@ account snapshot or grant-dependent data:
       "message_journal",
       "network",
       "send_hook",
-      "message_annotations"
+      "message_annotations",
+      "notifications"
     ],
     "app_events": [
       "ready",

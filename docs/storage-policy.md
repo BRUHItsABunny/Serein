@@ -2186,6 +2186,13 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin notification hook (preview, November 21, 2026)
+
+Nothing is written to disk. Alerts waiting for `notification` plugins stay in RAM, at most
+16 and only for 1.5 s before they are shown; a late answer can replace one for 10 s more.
+Deduplication remembers the IDs and sources of the last 512 alerted messages in RAM,
+cleared on logout or an account switch.
+
 ## Plugin data lifecycle (preview, November 21, 2026)
 
 Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`

@@ -17,7 +17,9 @@ broadcasts can leave the device through a subscriber with `network`, which the
 Connections list warns about. Message hooks run only in channels where the user switched
 them on: a send hook reads and may rewrite drafts there, and, with automatic sending
 chosen, its rewrite is sent without review; an annotating plugin reads that channel's
-messages and can only add notes the host renders as plain text. Only explicitly granted, user-selected context crosses that boundary.
+messages and can only add notes the host renders as plain text. A notification plugin
+sees the sender and preview of every alert Serein would show and may reword or hide it,
+but cannot create alerts, silence sounds or delay one past 1.5 s. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

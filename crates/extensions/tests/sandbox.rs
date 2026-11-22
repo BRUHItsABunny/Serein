@@ -1141,3 +1141,103 @@ fn message_hooks_get_only_their_draft_or_batch_and_annotate_only_what_they_were_
 		"a send hook cannot annotate"
 	);
 }
+
+#[test]
+fn notification_hooks_get_only_their_alert_and_may_only_reword_or_hide_it() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Notifications];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions = vec![Action {
+		id: "alert".into(),
+		label: "Alert".into(),
+		surface: Surface::Notification,
+	}];
+	manifest.validate().unwrap();
+
+	let alert = NotificationInput {
+		source: NotificationSource::Gateway,
+		message_id: "1".into(),
+		channel_id: "20".into(),
+		guild_id: None,
+		author_id: Some("5".into()),
+		direct: true,
+		title: "Ada".into(),
+		body: "hola".into(),
+		upgrade: false,
+	};
+	let input = Invocation {
+		action: "alert".into(),
+		notification: Some(Box::new(alert.clone())),
+		..Default::default()
+	};
+	input.validate(&manifest).unwrap();
+	for invalid in [
+		Invocation {
+			notification: None,
+			..input.clone()
+		},
+		Invocation {
+			composer: Some("draft".into()),
+			..input.clone()
+		},
+		Invocation {
+			notification: Some(Box::new(NotificationInput {
+				body: "x".repeat(513),
+				..alert.clone()
+			})),
+			..input.clone()
+		},
+	] {
+		assert!(invalid.validate(&manifest).is_err());
+	}
+
+	let decide = |decision: NotificationDecision| Output {
+		notification: Some(decision),
+		..Default::default()
+	};
+	decide(NotificationDecision {
+		body: Some("hello".into()),
+		..Default::default()
+	})
+	.validate(&manifest, &input)
+	.unwrap();
+	// Line breaks could fake extra lines in the alert, and hiding takes no text.
+	for invalid in [
+		NotificationDecision {
+			body: Some("hello\nfrom your bank".into()),
+			..Default::default()
+		},
+		NotificationDecision {
+			title: Some(" ".into()),
+			..Default::default()
+		},
+		NotificationDecision {
+			hide: true,
+			body: Some("x".into()),
+			..Default::default()
+		},
+	] {
+		assert!(decide(invalid).validate(&manifest, &input).is_err());
+	}
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..decide(NotificationDecision::default())
+	};
+	assert!(matches!(
+		with_panel.validate(&manifest, &input),
+		Err(Error::Capability)
+	));
+
+	// The SDK's output decodes into the host's.
+	let sdk_output = serde_json::to_value(serein_extension_sdk::NotificationOutput {
+		notification: Some(serein_extension_sdk::NotificationDecision {
+			hide: true,
+			..Default::default()
+		}),
+		..Default::default()
+	})
+	.unwrap();
+	let output: Output = serde_json::from_value(sdk_output).unwrap();
+	output.validate(&manifest, &input).unwrap();
+	assert!(output.notification.unwrap().hide);
+}

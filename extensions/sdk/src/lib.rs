@@ -45,13 +45,15 @@ mod start_screen;
 pub use start_screen::*;
 mod message_hooks;
 pub use message_hooks::*;
+mod notification_hook;
+pub use notification_hook::*;
 
 /// Maximum serialized size of either ABI buffer, in UTF-8 bytes.
 pub const MAX_IO_BYTES: usize = 256 * 1024;
 /// Maximum message-event content size, in UTF-8 bytes.
 pub const MAX_EVENT_CONTENT_BYTES: usize = 16 * 1024;
 /// Maximum distinct capabilities requested by one manifest.
-pub const MAX_CAPABILITIES: usize = 64;
+pub const MAX_CAPABILITIES: usize = 96;
 /// Version of the unchanged Wasm buffer and JSON contract.
 pub const API_VERSION: u32 = 1;
 

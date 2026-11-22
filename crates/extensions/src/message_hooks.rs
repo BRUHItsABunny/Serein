@@ -105,17 +105,20 @@ pub(crate) fn validate_annotations(
 }
 
 /// A hook action needs its capability, and its capability needs the action.
+/// The notification hook is checked here too.
 pub(crate) fn validate(manifest: &Manifest) -> Result<(), Error> {
 	use crate::{Capability, Surface};
 	for (surface, capability) in [
 		(Surface::Send, Capability::SendHook),
 		(Surface::Annotate, Capability::MessageAnnotations),
+		(Surface::Notification, Capability::Notifications),
 	] {
 		let has_action = manifest
 			.actions
 			.iter()
 			.any(|action| action.surface == surface);
-		if surface == Surface::Send && has_action != manifest.capabilities.contains(&capability) {
+		if surface != Surface::Annotate && has_action != manifest.capabilities.contains(&capability)
+		{
 			return Err(Error::Capability);
 		}
 		// `message_annotations` also lets `message` actions annotate the chosen message.
