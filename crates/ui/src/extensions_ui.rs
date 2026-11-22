@@ -3883,6 +3883,9 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::MessageAnnotations => {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
+		Capability::Notifications => {
+			"See every desktop notification, including its message preview, and reword or hide it"
+		}
 		Capability::MessageJournal => {
 			"Receive every message, edit and deletion in all your conversations, including earlier text of edited and deleted messages"
 		}
