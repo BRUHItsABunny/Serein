@@ -2176,6 +2176,16 @@ Broadcast payloads exist only in RAM: one queue per subscriber of at most 64 mes
 disk, journaled or replayed; scope changes, logout and revoked connections discard queued
 messages, and disabling either plugin removes its saved connections.
 
+## Plugin message hooks (preview, November 21, 2026)
+
+The channels where the user switched on a plugin's send hook or annotations are saved per
+account in `extensions/plugin-data/<account key>/hooks.json`: channel IDs, plugin IDs and
+the chosen mode and fallback, at most 512 channels and 256 KiB. Disabling a plugin removes
+it from the file. Drafts and messages handed to hooks are not stored by the host. Notes
+plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with the
+oldest dropped first, and are cleared on logout or an account switch; which messages each
+plugin was given is remembered in RAM for at most 4,096 messages.
+
 ## Plugin data lifecycle (preview, November 21, 2026)
 
 Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`

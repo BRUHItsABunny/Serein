@@ -3408,6 +3408,10 @@ impl MessagingUi {
 		if self.upload_busy || self.image_share_requested.is_some() || !state.can_send(channel) {
 			return;
 		}
+		// A send hook switched on here gets the draft first; its result sends it later.
+		if self.extensions.intercept_send(state, channel) {
+			return;
+		}
 		let draft = state.drafts.get(&channel).map_or("", String::as_str);
 		if self.selected_files().is_empty()
 			&& let Some(assets) = model::ImageShare::markdown_only(draft)
@@ -3688,6 +3692,22 @@ impl MessagingUi {
 			self.emoji_picker.reset();
 		}
 		let mut cancel_edit = false;
+		if !editing_here {
+			if let Some(outcome) = self.extensions.take_send_outcome(state, channel) {
+				use crate::extensions_ui::SendOutcome;
+				match outcome {
+					SendOutcome::Replace { text, send } => {
+						state.drafts.insert(channel, text);
+						if send {
+							self.submit_composer(state, ctx, commands);
+						}
+					}
+					SendOutcome::Send => self.submit_composer(state, ctx, commands),
+					SendOutcome::Keep(reason) => self.toasts.push(design::Level::Warning, reason),
+				}
+			}
+			self.extensions.send_hook_bar(ui, state, channel);
+		}
 		if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
 			let available = state.can_attach(channel) && !self.attach_busy && !editing_here;
 			egui::Frame::new()
@@ -6033,6 +6053,7 @@ impl MessagingUi {
 					.then_some(self.reading_preferences.double_click_emoji());
 				self.timeline.instant_scrolling = !self.reading_preferences.smooth_scrolling;
 				self.timeline.extension_actions = self.extensions.message_actions();
+				self.extensions.drain_notes(&mut self.timeline.notes);
 				self.timeline.quick_reactions = Some(self.reaction_picker.quick_reactions(state));
 				let mut seen = std::collections::BTreeSet::new();
 				let author_lookup: Vec<_> = state
@@ -7452,6 +7473,137 @@ mod composer_tests {
 			assert_eq!(view.editing.as_ref().unwrap().2, kept);
 			assert!(view.edit_sent.is_none());
 		}
+	}
+
+	#[test]
+	fn send_hooks_hold_the_draft_until_the_plugin_answers_and_fall_back_as_chosen() {
+		use crate::extensions_ui::ExtensionRequest;
+		use extension_host::hooks::{ChannelHooks, Fallback, SendHook, SendMode};
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let channel = Id(10);
+		let mut view = MessagingUi::default();
+		let mut entry = crate::extensions_ui::tests::entry();
+		entry.enabled = true;
+		entry.manifest.id = "translator".into();
+		entry.manifest.capabilities = vec![extensions::Capability::SendHook];
+		entry.manifest.actions = vec![extensions::Action {
+			id: "send".into(),
+			label: "Translate".into(),
+			surface: extensions::Surface::Send,
+		}];
+		view.extensions.set_entries(vec![entry]);
+		let hook = |view: &mut MessagingUi, state: &mut State, mode, fallback, draft: &str| {
+			view.extensions.channel_hooks = vec![ChannelHooks {
+				channel,
+				send: Some(SendHook {
+					plugin: "translator".into(),
+					mode,
+					fallback,
+				}),
+				annotate: Vec::new(),
+			}];
+			state.drafts.insert(channel, draft.into());
+			let mut commands = Vec::new();
+			view.submit_composer(state, &ctx, &mut commands);
+			assert!(
+				commands.is_empty(),
+				"nothing is sent before the hook answers"
+			);
+			let mut requests = std::mem::take(&mut view.extensions.requests);
+			let Some(ExtensionRequest::Invoke {
+				id,
+				invocation,
+				context,
+			}) = requests.pop()
+			else {
+				panic!("the draft goes to the hook")
+			};
+			assert_eq!(invocation.composer.as_deref(), Some(draft));
+			assert_eq!(invocation.send_target.as_ref().unwrap().channel_id, "10");
+			(id, invocation, context)
+		};
+		let frame = |view: &mut MessagingUi, state: &mut State| {
+			let mut commands = Vec::new();
+			ctx.run_ui(Default::default(), |ui| {
+				view.composer(ui, state, channel, &ctx, &mut commands);
+			})
+			.drop_without_applying_deltas();
+			commands
+		};
+		let sent = |commands: &[Command]| match commands {
+			[Command::Send { content, .. }] => Some(content.clone()),
+			_ => None,
+		};
+		// Preview: the rewrite replaces the draft, and Enter then sends it without asking again.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Preview,
+			Fallback::KeepDraft,
+			"hallo",
+		);
+		let rewrite = extensions::Output {
+			replacement: Some("hello".into()),
+			..Default::default()
+		};
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite.clone(), &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "hello");
+		let mut commands = Vec::new();
+		view.submit_composer(&mut state, &ctx, &mut commands);
+		assert_eq!(sent(&commands).as_deref(), Some("hello"));
+		assert!(view.extensions.requests.is_empty());
+		state.pending.clear();
+		// Automatic: the rewrite is sent at once.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"zwei",
+		);
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite.clone(), &state);
+		assert_eq!(
+			sent(&frame(&mut view, &mut state)).as_deref(),
+			Some("hello")
+		);
+		state.pending.clear();
+		// A draft edited while the hook ran is neither replaced nor sent.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"drei",
+		);
+		state.drafts.insert(channel, "drei!".into());
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite, &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "drei!");
+		// Failures follow the channel's fallback.
+		let (id, invocation, _) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"vier",
+		);
+		view.extensions.send_failed(&id, &invocation);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "vier");
+		let (id, invocation, _) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::SendOriginal,
+			"fünf",
+		);
+		view.extensions.send_failed(&id, &invocation);
+		assert_eq!(sent(&frame(&mut view, &mut state)).as_deref(), Some("fünf"));
 	}
 
 	fn edit_state() -> State {

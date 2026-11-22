@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::broker::{Broker, Subscription, TopicSession};
 use crate::database::{self, PluginDatabase};
+use crate::hooks::ChannelHooks;
 use crate::journal::{self, JournalSession};
 use crate::network::PluginNetwork;
 use crate::secrets;
@@ -120,6 +121,11 @@ pub enum Job {
 		account: String,
 		subscription: Subscription,
 		approved: bool,
+	},
+	/// Replaces the message hooks switched on in one channel of the account.
+	SetChannelHooks {
+		account: String,
+		hooks: ChannelHooks,
 	},
 	/// Saves or, with `None`, removes a secret the plugin's manifest declares.
 	SetSecret {
@@ -399,6 +405,7 @@ pub enum Event {
 		starters: Vec<Starter>,
 		data: Vec<PluginData>,
 		subscriptions: Vec<Subscription>,
+		hooks: Vec<ChannelHooks>,
 	},
 	Catalog(Catalog),
 	Preview {
@@ -425,6 +432,8 @@ pub enum Event {
 	},
 	/// The account's approved plugin subscriptions.
 	Subscriptions(Vec<Subscription>),
+	/// The message hooks switched on in the account's channels.
+	ChannelHooks(Vec<ChannelHooks>),
 	/// A `journal` action finished; `more` when entries remain for another delivery.
 	JournalDelivered {
 		id: String,
@@ -994,6 +1003,12 @@ fn validate_job(job: &Job) -> Result<(), String> {
 				return Err("Secrets are 1 to 4,096 characters without line breaks".into());
 			}
 		}
+		Job::SetChannelHooks { hooks, .. } => {
+			hooks.validate()?;
+			for plugin in hooks.plugins() {
+				valid_id(plugin)?;
+			}
+		}
 		Job::SetSubscription { subscription, .. } => {
 			valid_id(&subscription.subscriber)?;
 			valid_id(&subscription.provider)?;
@@ -1135,6 +1150,10 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				Some(account) => read_subscriptions(root, account),
 				None => Vec::new(),
 			},
+			hooks: match account.as_deref() {
+				Some(account) => read_hooks(root, account),
+				None => Vec::new(),
+			},
 		}),
 		Job::RefreshCatalog => {
 			let bytes = download(CATALOG_URL, MAX_CATALOG, gate, Duration::from_secs(15))?;
@@ -1181,6 +1200,15 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 				if subscriptions.len() != before {
 					write_subscriptions(root, account, &subscriptions, gate)?;
 				}
+				// And switches its hooks off everywhere.
+				let mut hooks = read_hooks(root, account);
+				let changed = hooks
+					.iter_mut()
+					.fold(false, |changed, hooks| hooks.remove(&id) | changed);
+				if changed {
+					hooks.retain(|hooks| !hooks.is_empty());
+					write_hooks(root, account, &hooks, gate)?;
+				}
 			}
 			if delete_data && kind == ExtensionKind::Plugin {
 				delete_data_dir(&data_dir(root, &id, account.as_deref())?)?;
@@ -1216,6 +1244,41 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			}
 			write_subscriptions(root, &account, &subscriptions, gate)?;
 			Ok(Event::Subscriptions(subscriptions))
+		}
+		Job::SetChannelHooks { account, hooks } => {
+			let parent = scope(root, ExtensionKind::Plugin, Some(&account))?;
+			let has = |id: &str, surface: Surface, capability: Capability| {
+				read_stored(&parent.join(id).join("package.json")).is_ok_and(|stored| {
+					stored.grants.contains(&capability)
+						&& stored
+							.package
+							.manifest
+							.actions
+							.iter()
+							.any(|action| action.surface == surface)
+				})
+			};
+			if hooks
+				.send
+				.as_ref()
+				.is_some_and(|hook| !has(&hook.plugin, Surface::Send, Capability::SendHook))
+				|| hooks
+					.annotate
+					.iter()
+					.any(|plugin| !has(plugin, Surface::Annotate, Capability::MessageAnnotations))
+			{
+				return Err("That plugin has no hook for messages".into());
+			}
+			let mut saved = read_hooks(root, &account);
+			saved.retain(|existing| existing.channel != hooks.channel);
+			if !hooks.is_empty() {
+				if saved.len() >= crate::hooks::MAX_CHANNELS {
+					return Err("Too many channels with plugin hooks; switch some off first".into());
+				}
+				saved.push(hooks);
+			}
+			write_hooks(root, &account, &saved, gate)?;
+			Ok(Event::ChannelHooks(saved))
 		}
 		Job::DeleteData {
 			id,
@@ -1582,6 +1645,32 @@ fn write_subscriptions(
 	fs::create_dir_all(&scope).map_err(|_| "Cannot create plugin data directory")?;
 	let bytes = serde_json::to_vec(subscriptions).map_err(|_| "Cannot encode subscriptions")?;
 	atomic_write(&scope.join(SUBSCRIPTIONS_FILE), &bytes, gate)
+}
+
+const HOOKS_FILE: &str = "hooks.json";
+
+fn read_hooks(root: &Path, account: &str) -> Vec<ChannelHooks> {
+	data_scope(root, Some(account))
+		.ok()
+		.and_then(|scope| read_bounded(&scope.join(HOOKS_FILE), 256 * 1024).ok())
+		.and_then(|bytes| serde_json::from_slice::<Vec<ChannelHooks>>(&bytes).ok())
+		.unwrap_or_default()
+		.into_iter()
+		.filter(|hooks| hooks.validate().is_ok() && !hooks.is_empty())
+		.take(crate::hooks::MAX_CHANNELS)
+		.collect()
+}
+
+fn write_hooks(
+	root: &Path,
+	account: &str,
+	hooks: &[ChannelHooks],
+	gate: &Gate,
+) -> Result<(), String> {
+	let scope = data_scope(root, Some(account))?;
+	fs::create_dir_all(&scope).map_err(|_| "Cannot create plugin data directory")?;
+	let bytes = serde_json::to_vec(hooks).map_err(|_| "Cannot encode message hooks")?;
+	atomic_write(&scope.join(HOOKS_FILE), &bytes, gate)
 }
 
 /// Plugin data lives apart from packages, so disabling, updating, reinstalling or logging
@@ -3001,6 +3090,87 @@ mod tests {
 				.unwrap();
 			}
 		}
+	}
+
+	#[test]
+	fn channel_hooks_need_the_plugins_hook_and_disabling_switches_them_off() {
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let gate = gate();
+		let mut hooker = topic_plugin("hooker", true, "", "", "");
+		hooker.manifest.broadcasts.clear();
+		hooker.manifest.capabilities = vec![Capability::SendHook, Capability::MessageAnnotations];
+		hooker.manifest.actions[0].surface = Surface::Send;
+		hooker.manifest.actions.push(extensions::Action {
+			id: "notes".into(),
+			label: "Notes".into(),
+			surface: Surface::Annotate,
+		});
+		let plain = topic_plugin("plain", true, "", "", "");
+		let grants = hooker.manifest.capabilities.clone();
+		enable(
+			&root,
+			source(&profile, &hooker),
+			grants,
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		enable(
+			&root,
+			source(&profile, &plain),
+			Vec::new(),
+			Some("account"),
+			&gate,
+		)
+		.unwrap();
+		let set = |send: &str, annotate: &[&str]| {
+			run(
+				&root,
+				Job::SetChannelHooks {
+					account: "account".into(),
+					hooks: ChannelHooks {
+						channel: model::Id(20),
+						send: Some(crate::hooks::SendHook {
+							plugin: send.into(),
+							mode: crate::hooks::SendMode::Auto,
+							fallback: crate::hooks::Fallback::SendOriginal,
+						}),
+						annotate: annotate.iter().map(|id| id.to_string()).collect(),
+					},
+				},
+				&gate,
+			)
+		};
+		// Only a plugin with that hook can be switched on.
+		assert!(set("plain", &[]).is_err());
+		assert!(set("hooker", &["plain"]).is_err());
+		let Ok(Event::ChannelHooks(saved)) = set("hooker", &["hooker"]) else {
+			panic!("hooks not saved")
+		};
+		assert_eq!(saved.len(), 1);
+		let Ok(Event::Loaded { hooks, .. }) = run(
+			&root,
+			Job::Load {
+				account: Some("account".into()),
+			},
+			&gate,
+		) else {
+			panic!("not loaded")
+		};
+		assert_eq!(hooks, saved, "hooks survive a restart");
+		run(
+			&root,
+			Job::Disable {
+				id: "hooker".into(),
+				kind: ExtensionKind::Plugin,
+				account: Some("account".into()),
+				delete_data: false,
+			},
+			&gate,
+		)
+		.unwrap();
+		assert!(read_hooks(&root, "account").is_empty());
 	}
 
 	/// A plugin `id` whose one action runs `body`; with `broadcasts` it is a panel action,

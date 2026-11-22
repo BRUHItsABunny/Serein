@@ -147,6 +147,8 @@ const MESSAGE_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 const JOURNAL_INTERVAL: Duration = Duration::from_millis(100);
 /// Pause before a subscriber whose topic delivery failed receives messages again.
 const TOPIC_RETRY: Duration = Duration::from_secs(10);
+/// Minimum delay between `annotate` deliveries.
+const ANNOTATE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// `interface` is the plugin's last restated interface; with the invocation it picks the
 /// channel directory's focus server.
@@ -258,6 +260,11 @@ pub struct Bridge {
 	live_subscriptions: BTreeSet<extension_host::broker::Subscription>,
 	/// Subscribers whose last topic delivery failed, and when they may try again.
 	topic_retry: BTreeMap<String, Instant>,
+	/// Message hooks switched on in this account's channels, as saved.
+	channel_hooks: Vec<extension_host::hooks::ChannelHooks>,
+	/// Which messages each annotating plugin was given.
+	annotated: extension_host::hooks::AnnotateTracker,
+	annotate_at: Option<Instant>,
 }
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
@@ -820,6 +827,8 @@ impl Bridge {
 	pub fn logout(&mut self, ctx: &egui::Context) -> Result<(), String> {
 		self.close_journal();
 		self.message_events.clear();
+		self.channel_hooks.clear();
+		self.annotated.clear();
 		self.app_key = None;
 		self.app_context_changed = false;
 		self.data_changes = Default::default();
@@ -912,6 +921,10 @@ impl Bridge {
 		if self.scope.as_ref() != Some(&scope) {
 			self.close_journal();
 			self.message_events.clear();
+			self.channel_hooks.clear();
+			self.annotated.clear();
+			messaging.extensions.channel_hooks.clear();
+			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
 			self.app_context_changed = false;
 			self.data_changes = Default::default();
@@ -1023,6 +1036,20 @@ impl Bridge {
 						self.journal_due.insert(id);
 					}
 				}
+				Err(error)
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| {
+							input.send_target.is_some() || input.annotate.is_some()
+						}) =>
+				{
+					// A hook failing on one message leaves the plugin running; its fallback
+					// decides what happens to the draft.
+					let (id, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					messaging.extensions.send_failed(&id, &invocation);
+					messaging.extensions.status = format!("{id}: {error}");
+				}
 				Err(error) => {
 					if let Some(id) = pending.as_ref().and_then(|pending| pending.tick.as_ref()) {
 						if let Some(schedule) = self.ticks.get_mut(id) {
@@ -1074,6 +1101,10 @@ impl Bridge {
 					}
 				}
 				Ok(Event::DataUsage(data)) => messaging.extensions.plugin_data = data,
+				Ok(Event::ChannelHooks(hooks)) => {
+					messaging.extensions.channel_hooks.clone_from(&hooks);
+					self.channel_hooks = hooks;
+				}
 				Ok(Event::Subscriptions(subscriptions)) => {
 					messaging
 						.extensions
@@ -1090,7 +1121,10 @@ impl Bridge {
 					starters,
 					data,
 					subscriptions,
+					hooks,
 				}) => {
+					messaging.extensions.channel_hooks.clone_from(&hooks);
+					self.channel_hooks = hooks;
 					messaging.extensions.plugin_data = data;
 					messaging
 						.extensions
@@ -1208,6 +1242,18 @@ impl Bridge {
 					self.refresh_data_usage(&account, state.generation, ctx, messaging);
 				}
 				Ok(Event::Disabled(id)) => {
+					// The host switched its hooks off everywhere.
+					for hooks in [
+						&mut self.channel_hooks,
+						&mut messaging.extensions.channel_hooks,
+					] {
+						for channel in hooks.iter_mut() {
+							channel.remove(&id);
+						}
+						hooks.retain(|channel| !channel.is_empty());
+					}
+					self.annotated.forget(&id);
+					messaging.extensions.forget_annotations(Some(&id));
 					self.ticks.remove(&id);
 					self.transitions.remove(&id);
 					let theme = self.installed.iter().any(|entry| {
@@ -1553,6 +1599,20 @@ impl Bridge {
 						);
 					}
 				}
+				ExtensionRequest::SetChannelHooks { hooks } => {
+					if let Some(account) = &account {
+						self.submit(
+							Job::SetChannelHooks {
+								account: account.clone(),
+								hooks,
+							},
+							None,
+							state.generation,
+							ctx,
+							messaging,
+						);
+					}
+				}
 				ExtensionRequest::SetSecret {
 					id,
 					connection,
@@ -1630,9 +1690,13 @@ impl Bridge {
 					if !context.is_current(state)
 						|| self.disabled.contains(&id)
 						|| !self.installed.iter().any(|e| e.manifest.id == id)
+						|| invocation.send_target.is_some() && account.is_none()
 					{
+						// A draft waiting for its hook falls back instead of waiting forever.
+						messaging.extensions.send_failed(&id, &invocation);
 						continue;
 					}
+					let hook = invocation.send_target.is_some();
 					let connection_plugin = self.installed.iter().any(|entry| {
 						entry.manifest.id == id
 							&& entry.manifest.capabilities.contains(&Capability::ApiProxy)
@@ -1640,7 +1704,7 @@ impl Bridge {
 					if account.is_some() || connection_plugin {
 						let entry = self.installed.iter().find(|e| e.manifest.id == id).unwrap();
 						let manifest = &entry.manifest;
-						if !connection_plugin {
+						if !connection_plugin && !hook {
 							attach_app_data(
 								&mut invocation,
 								state,
@@ -1858,6 +1922,70 @@ impl Bridge {
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
 		self.journal(&account, state, ctx, messaging);
 		self.topics(&account, state.generation, ctx, messaging);
+		self.annotate(&account, state, ctx, messaging);
+	}
+	/// Hands the open channel's new and edited messages to the plugins annotating it, one
+	/// batch at a time after everything else.
+	fn annotate(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let (Some(account), Some(channel)) = (account, state.selected) else {
+			return;
+		};
+		let Some(hooks) = extension_host::hooks::for_channel(&self.channel_hooks, channel) else {
+			return;
+		};
+		if self.host.as_ref().unwrap().busy()
+			|| !self.pending.is_empty()
+			|| !self.message_events.is_empty()
+			|| !self.start_screen_loaded
+		{
+			return;
+		}
+		let wait = self.annotate_at.map_or(Duration::ZERO, |at| {
+			ANNOTATE_INTERVAL.saturating_sub(at.elapsed())
+		});
+		if !wait.is_zero() {
+			ctx.request_repaint_after(wait);
+			return;
+		}
+		let due = hooks.annotate.iter().find_map(|id| {
+			let entry = self.installed.iter().find(|entry| {
+				entry.manifest.id == *id && entry.error.is_none() && !self.disabled.contains(id)
+			})?;
+			let action = entry
+				.manifest
+				.actions
+				.iter()
+				.find(|action| action.surface == Surface::Annotate)?;
+			let batch = self.annotated.due(state, id)?;
+			Some((id.clone(), action.id.clone(), batch))
+		});
+		let Some((id, action, batch)) = due else {
+			return;
+		};
+		self.annotated.given(state, &id, &batch);
+		let invocation = Invocation {
+			action,
+			annotate: Some(Box::new(batch)),
+			..Default::default()
+		};
+		self.submit(
+			Job::Invoke {
+				id: id.clone(),
+				account: account.clone(),
+				invocation: invocation.clone(),
+			},
+			Some((id, invocation, ExtensionContext::capture(state, false))),
+			state.generation,
+			ctx,
+			messaging,
+		);
+		self.annotate_at = Some(Instant::now());
 	}
 	fn topic_action(entry: &InstalledExtension) -> Option<&str> {
 		entry
@@ -2312,11 +2440,13 @@ impl Bridge {
 			installed.interface_tweaks.clone_from(tweaks);
 		}
 		// Every result restates the plugin's interface: a tree replaces the one shown, and
-		// its absence restores the normal layout.
-		if let Some(installed) = self
-			.installed
-			.iter_mut()
-			.find(|entry| entry.manifest.id == id)
+		// its absence restores the normal layout. Hooks cannot return one, so keep it.
+		let hook = invocation.send_target.is_some() || invocation.annotate.is_some();
+		if !hook
+			&& let Some(installed) = self
+				.installed
+				.iter_mut()
+				.find(|entry| entry.manifest.id == id)
 		{
 			installed.interface_ui.clone_from(&output.interface_ui);
 		}

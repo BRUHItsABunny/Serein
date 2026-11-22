@@ -43,6 +43,8 @@ mod interface_ui;
 pub use interface_ui::*;
 mod start_screen;
 pub use start_screen::*;
+mod message_hooks;
+pub use message_hooks::*;
 
 /// Maximum serialized size of either ABI buffer, in UTF-8 bytes.
 pub const MAX_IO_BYTES: usize = 256 * 1024;

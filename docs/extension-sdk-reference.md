@@ -23,6 +23,8 @@ instance. Local variables do not survive the call. Use the separately granted
 | `TickInvocation` | Preview `tick` actions, or a mixed tick/panel handler | `input.invocation.action` |
 | `MenuInvocation` | `AppInvocation` plus the user, channel or server a context-menu action was chosen on | `input.invocation.invocation.action` |
 | `MessageActionInvocation` | `AppInvocation` plus the IDs of the message a `message` action was chosen on | `input.invocation.invocation.action` |
+| `SendInvocation` | Preview `send` hooks: the draft in `composer` plus its `send_target` | `input.invocation.action` |
+| `AnnotateInvocation` | Preview `annotate` actions: a batch of messages to add notes under | `input.invocation.action` |
 
 The wrappers keep the original `Invocation` fields unchanged. Their `invocation`
 field is a Rust convenience: JSON stays flat. There is no JSON object named
@@ -98,6 +100,8 @@ common optional fields above may instead be serialized as `null`.
 | `selected_message_ref` | `Option<SelectedMessageRef>` / object or absent | `channel_id`, `message_id`, `author_id` and, in servers, `guild_id` of the message a `message` action was chosen on. Sent with `selected_message` under the same grant; absent on older hosts and on panel callbacks. Available through `MessageActionInvocation`. Use it to propose actions on that exact message, such as `send_reply`, `set_message_pinned` or `delete_message`. | `input.selected_message_ref.as_ref().map(\|m\| &m.message_id)` |
 | `menu_target` | `Option<MenuTarget>` / object tagged by `kind` or absent | For `user`, `channel`, `server` and `role` actions only, and always present for them: `{"kind":"user","user_id","guild_id"?,"channel_id"?}`, `{"kind":"channel","channel_id","guild_id"?}`, `{"kind":"server","guild_id"}` or `{"kind":"role","guild_id","role_id","user_id"?,"name","color"}`. Role actions appear when a role in a member's profile is right-clicked; `user_id` is that member, and `name` and `color` (`0xRRGGBB`, `0` for none) are what its chip shows. Requires `context_menus`. Other targets carry IDs only; read details through your other grants. Available through `MenuInvocation`. | `match &input.menu_target { Some(MenuTarget::User { user_id, .. }) => …, _ => … }` |
 | `tick_ms` | `Option<u64>` / integer or absent | Elapsed milliseconds since this plugin was enabled for the session. Present only on preview `tick` calls through `TickInvocation`. | `input.tick_ms` |
+| `send_target` | `Option<SendTarget>` / object or absent | Preview. `channel_id` and, in servers, `guild_id` the draft in `composer` is being sent to. Present only on `send` actions, with `send_hook`, through `SendInvocation`. Return the text to send in `Output::replacement`, or `None` to send the draft unchanged. | `input.send_target.as_ref().map(\|t\| &t.channel_id)` |
+| `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
 
 A tick is completion-paced with a 250 ms minimum delay and runs only when the shared
 extension worker is idle. It receives the flattened base invocation plus `tick_ms`;
@@ -199,7 +203,9 @@ account snapshot or grant-dependent data:
       "random",
       "database",
       "message_journal",
-      "network"
+      "network",
+      "send_hook",
+      "message_annotations"
     ],
     "app_events": [
       "ready",
@@ -224,7 +230,7 @@ account snapshot or grant-dependent data:
       "typing",
       "polls"
     ],
-    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request"]
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read"]
   }
 }
 ```

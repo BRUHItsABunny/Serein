@@ -1021,3 +1021,123 @@ fn topics_are_named_versioned_and_subscribers_declare_a_delivery_action() {
 	);
 	importing_topics.validate().unwrap();
 }
+
+#[test]
+fn message_hooks_get_only_their_draft_or_batch_and_annotate_only_what_they_were_given() {
+	let mut manifest = plugin("(module)").manifest;
+	let action = |id: &str, surface| Action {
+		id: id.into(),
+		label: id.into(),
+		surface,
+	};
+	manifest.capabilities = vec![Capability::SendHook, Capability::MessageAnnotations];
+	manifest.actions = vec![action("send", Surface::Send)];
+	// A send hook needs its action and the action its capability; annotations alone are a
+	// valid grant for `message` actions.
+	assert!(matches!(manifest.validate(), Ok(())));
+	manifest.capabilities = vec![Capability::MessageAnnotations];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.capabilities = vec![Capability::SendHook, Capability::MessageAnnotations];
+	manifest.actions = vec![action("notes", Surface::Annotate)];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions.push(action("send", Surface::Send));
+	manifest.validate().unwrap();
+
+	let target = || {
+		Some(Box::new(SendTarget {
+			channel_id: "20".into(),
+			guild_id: None,
+		}))
+	};
+	let send = Invocation {
+		action: "send".into(),
+		composer: Some("hallo".into()),
+		send_target: target(),
+		..Default::default()
+	};
+	// The draft is the hook's own grant; no `composer` capability is needed.
+	send.validate(&manifest).unwrap();
+	for invalid in [
+		Invocation {
+			send_target: None,
+			..send.clone()
+		},
+		Invocation {
+			composer: None,
+			..send.clone()
+		},
+		Invocation {
+			action: "notes".into(),
+			..send.clone()
+		},
+	] {
+		assert!(invalid.validate(&manifest).is_err());
+	}
+	let rewrite = Output {
+		replacement: Some("hello".into()),
+		..Default::default()
+	};
+	rewrite.validate(&manifest, &send).unwrap();
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..rewrite.clone()
+	};
+	assert!(matches!(
+		with_panel.validate(&manifest, &send),
+		Err(Error::Capability)
+	));
+
+	let message = |id: &str| AnnotateMessage {
+		message_id: id.into(),
+		author_id: "2".into(),
+		content: "hola".into(),
+		edited: false,
+	};
+	let batch = Invocation {
+		action: "notes".into(),
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: vec![message("1"), message("3")],
+		})),
+		..Default::default()
+	};
+	batch.validate(&manifest).unwrap();
+	let oversized = Invocation {
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: (0..26).map(|id| message(&(id + 1).to_string())).collect(),
+		})),
+		..batch.clone()
+	};
+	assert!(matches!(oversized.validate(&manifest), Err(Error::Limit)));
+	let note = |id: &str, text: &str| Annotation {
+		message_id: id.into(),
+		text: text.into(),
+	};
+	let notes = |annotations| Output {
+		annotations,
+		..Default::default()
+	};
+	notes(vec![note("1", "hello"), note("3", "")])
+		.validate(&manifest, &batch)
+		.unwrap();
+	// Only messages the plugin was given, once each, within the size limit.
+	for (invalid, error) in [
+		(vec![note("2", "hello")], "unrelated message"),
+		(vec![note("1", "a"), note("1", "b")], "duplicate"),
+		(vec![note("1", &"x".repeat(4097))], "oversized"),
+	] {
+		assert!(
+			notes(invalid).validate(&manifest, &batch).is_err(),
+			"{error}"
+		);
+	}
+	assert!(
+		notes(vec![note("1", "hello")])
+			.validate(&manifest, &send)
+			.is_err(),
+		"a send hook cannot annotate"
+	);
+}

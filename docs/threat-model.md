@@ -14,7 +14,10 @@ responses, though a declared origin that is hostile receives the value by design
 Plugins exchange data only through topics the user approved per provider, subscriber and
 topic; a subscriber sees only what a provider broadcasts, but data a reading plugin
 broadcasts can leave the device through a subscriber with `network`, which the
-Connections list warns about. Only explicitly granted, user-selected context crosses that boundary.
+Connections list warns about. Message hooks run only in channels where the user switched
+them on: a send hook reads and may rewrite drafts there, and, with automatic sending
+chosen, its rewrite is sent without review; an annotating plugin reads that channel's
+messages and can only add notes the host renders as plain text. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

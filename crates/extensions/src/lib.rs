@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 mod runtime;
 pub use runtime::{invoke, invoke_with};
 pub mod imports;
+pub mod message_hooks;
+pub use message_hooks::{AnnotateBatch, AnnotateMessage, Annotation, SendTarget};
 pub mod network;
 pub mod topics;
 pub use imports::{HostImports, NoHostImports, Reply};
@@ -173,6 +175,12 @@ pub enum Capability {
 	/// Make HTTPS requests with `serein.https_request` to the origins in the manifest's
 	/// `network` list.
 	Network,
+	/// Rewrite the user's draft in a `send` action before it is sent, in channels where the
+	/// user switched the hook on.
+	SendHook,
+	/// Add notes under messages from an `annotate` action, in channels where the user
+	/// switched it on, and under the message a `message` action was chosen on.
+	MessageAnnotations,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -244,6 +252,12 @@ pub enum Surface {
 	/// Host-scheduled delivery of broadcasts from approved providers; the plugin pulls them
 	/// with `serein.topic_read`. Requires a `subscribes` list.
 	Topic,
+	/// Runs when the user sends a message in a channel where they switched this hook on; the
+	/// draft arrives in `composer` and `replacement` rewrites it. Requires `send_hook`.
+	Send,
+	/// Host-scheduled batches of messages in channels where the user switched annotations on;
+	/// the result's `annotations` are shown under them. Requires `message_annotations`.
+	Annotate,
 }
 
 impl Surface {
@@ -516,6 +530,12 @@ pub struct Invocation {
 	/// Panel button activations leave it false.
 	#[serde(default, skip_serializing_if = "interface_ui::is_false")]
 	pub double_clicked: bool,
+	/// Where the draft of a `send` action is going.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub send_target: Option<Box<SendTarget>>,
+	/// Messages for an `annotate` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotate: Option<Box<AnnotateBatch>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +813,10 @@ pub struct Output {
 		deserialize_with = "start_screen::present"
 	)]
 	pub start_screen: Option<Option<StartScreen>>,
+	/// Notes under messages from an `annotate` action, or under the chosen message of a
+	/// `message` action; empty text removes this plugin's note. Requires `message_annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub annotations: Vec<Annotation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -941,6 +965,7 @@ impl Manifest {
 		}
 		network::validate_secrets(&self.secrets, &origins)?;
 		topics::validate(self)?;
+		message_hooks::validate(self)?;
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)
 		{
@@ -971,6 +996,8 @@ impl Manifest {
 			Surface::Tick,
 			Surface::Journal,
 			Surface::Topic,
+			Surface::Send,
+			Surface::Annotate,
 		] {
 			if self
 				.actions
@@ -1005,6 +1032,8 @@ impl Manifest {
 				Surface::Tick => Some(Capability::Appearance),
 				Surface::Journal => Some(Capability::MessageJournal),
 				Surface::Topic => None,
+				Surface::Send => Some(Capability::SendHook),
+				Surface::Annotate => Some(Capability::MessageAnnotations),
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1325,9 +1354,36 @@ impl Invocation {
 		} else if self.message_event.is_some() {
 			return Err(Error::Capability);
 		}
+		// A `send` action's draft arrives with its target, under the hook's own grant.
+		match (&self.send_target, action.surface == Surface::Send) {
+			(Some(target), true)
+				if self.composer.is_some()
+					&& manifest.capabilities.contains(&Capability::SendHook) =>
+			{
+				target.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		match (&self.annotate, action.surface == Surface::Annotate) {
+			(Some(batch), true)
+				if manifest
+					.capabilities
+					.contains(&Capability::MessageAnnotations) =>
+			{
+				batch.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		let composer_grant = if action.surface == Surface::Send {
+			Capability::SendHook
+		} else {
+			Capability::Composer
+		};
 		for (data, capability) in [
 			(&self.selected_message, Capability::SelectedMessage),
-			(&self.composer, Capability::Composer),
+			(&self.composer, composer_grant),
 			(&self.storage, Capability::Storage),
 		] {
 			if let Some(data) = data {
@@ -1353,7 +1409,8 @@ impl Invocation {
 			reference.validate()?;
 		}
 		if self.selected_message.is_some() && action.surface != Surface::Message
-			|| self.composer.is_some() && action.surface != Surface::Composer
+			|| self.composer.is_some()
+				&& !matches!(action.surface, Surface::Composer | Surface::Send)
 			|| self.tick_ms.is_some() && action.surface != Surface::Tick
 			|| self.tick_ms.is_none() && action.surface == Surface::Tick
 		{
@@ -1361,7 +1418,7 @@ impl Invocation {
 		}
 		if matches!(
 			action.surface,
-			Surface::Tick | Surface::Journal | Surface::Topic
+			Surface::Tick | Surface::Journal | Surface::Topic | Surface::Send | Surface::Annotate
 		) && (!self.values.is_empty()
 			|| self.message_event.is_some()
 			|| self.app.is_some()
@@ -1431,19 +1488,40 @@ impl Output {
 				screen.validate().map_err(|_| Error::Invalid)?;
 			}
 		}
-		// Journal and topic deliveries may only save storage; database writes go through imports.
-		if matches!(surface, Surface::Journal | Surface::Topic)
-			&& (self.rich_presence.is_some()
-				|| self.api_proxy.is_some()
-				|| self.image_sharing
-				|| self.preserve_deleted_messages
-				|| self.appearance.is_some()
-				|| self.replacement.is_some()
-				|| !self.panel.is_empty()
-				|| !self.effects.is_empty()
-				|| self.interface_tweaks.is_some()
-				|| self.interface_ui.is_some()
-				|| self.start_screen.is_some())
+		if !self.annotations.is_empty() {
+			let allowed: Vec<&str> = match (surface, &input.annotate, &input.selected_message_ref) {
+				(Surface::Annotate, Some(batch), _) => batch
+					.messages
+					.iter()
+					.map(|message| message.message_id.as_str())
+					.collect(),
+				(Surface::Message, _, Some(reference)) => vec![reference.message_id.as_str()],
+				_ => return Err(Error::Capability),
+			};
+			if !manifest
+				.capabilities
+				.contains(&Capability::MessageAnnotations)
+			{
+				return Err(Error::Capability);
+			}
+			message_hooks::validate_annotations(&self.annotations, &allowed)?;
+		}
+		// Background deliveries and hooks may only save storage, and a send hook its rewrite;
+		// database writes go through imports.
+		if matches!(
+			surface,
+			Surface::Journal | Surface::Topic | Surface::Send | Surface::Annotate
+		) && (self.rich_presence.is_some()
+			|| self.api_proxy.is_some()
+			|| self.image_sharing
+			|| self.preserve_deleted_messages
+			|| self.appearance.is_some()
+			|| self.replacement.is_some() && surface != Surface::Send
+			|| !self.panel.is_empty()
+			|| !self.effects.is_empty()
+			|| self.interface_tweaks.is_some()
+			|| self.interface_ui.is_some()
+			|| self.start_screen.is_some())
 		{
 			return Err(Error::Capability);
 		}
@@ -1513,8 +1591,13 @@ impl Output {
 		{
 			return Err(Error::Capability);
 		}
+		let replaces = if surface == Surface::Send {
+			Capability::SendHook
+		} else {
+			Capability::Composer
+		};
 		if self.replacement.is_some()
-			&& (input.composer.is_none() || !manifest.capabilities.contains(&Capability::Composer))
+			&& (input.composer.is_none() || !manifest.capabilities.contains(&replaces))
 		{
 			return Err(Error::Capability);
 		}

@@ -922,6 +922,12 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 		label: "Events".into(),
 		surface: Surface::AppEvent,
 	});
+	// `send_hook` is granted together with its `send` action.
+	supported.actions.push(Action {
+		id: "send".into(),
+		label: "Send".into(),
+		surface: Surface::Send,
+	});
 	// The network capability is declared for specific origins.
 	supported.network = vec!["https://api.example.org".into()];
 	supported.validate().unwrap();
@@ -931,9 +937,9 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 	assert!(host.supports_import("db_execute") && host.supports_import("result_read"));
 	assert!(host.supports_import("journal_read") && host.supports_import("https_request"));
 	assert!(host.supports_import("broadcast") && host.supports_import("topic_read"));
-	assert_eq!(caps.len(), 63);
+	assert_eq!(caps.len(), 65);
 	assert_eq!(HostInfo::current().app_events.len(), 21);
-	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 63);
+	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 65);
 }
 
 #[test]

@@ -181,6 +181,8 @@ supports 63 capabilities, with at most 64 distinct declarations per manifest.
 | `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB by default, up to 16 GiB by user choice |
 | `network` | Make HTTPS requests to the exact origins in the manifest's `network` list | Preview; [network](#network-preview); the consent dialog lists the origins and warns that readable data may be sent there |
 | `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
+| `send_hook` | Rewrite the user's draft in one `send` action before it is sent | Preview; [message hooks](#message-hooks-preview); only in channels where the user switches it on, with preview or automatic sending and a chosen fallback |
+| `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on; notes are shown, never sent |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -739,12 +741,52 @@ subscriber lists them in `subscribes` and declares exactly one action with
   connect later, and logout, an account switch or a revoked connection discards them.
   A plugin that needs history stores what it receives in its own database.
 
+## Message hooks (preview)
+
+Two actions let a plugin take part in conversations the user picks. Both are switched on
+per channel from the composer's **Extensions** menu, under **In this channel**; nothing
+runs anywhere else, and disabling the plugin switches them off everywhere. The settings
+are saved per account (at most 512 channels).
+
+**Send hook.** With `send_hook`, one action with `surface: "send"` receives the draft in
+`composer` and its destination in `send_target` (`channel_id`, `guild_id`) when the user
+sends. It returns the text to send in `replacement`, or nothing to send the draft
+unchanged; it may also save `storage`, nothing else. The user chooses per channel:
+
+- **Show me the rewrite first** (default): the rewrite replaces the draft, a line above
+  the composer names the plugin, and the next Enter sends it, edited or not. **Use my
+  original** puts the original back and sends it unhooked.
+- **Send the rewrite automatically**: the rewrite is sent at once.
+- **If it fails**: keep the message unsent (default) or send it unchanged. A failure,
+  an empty or oversized rewrite, or a plugin that stops running counts as failing; the
+  plugin keeps running for other messages.
+
+A draft edited while the hook runs is neither replaced nor sent. One plugin per channel
+holds the send hook; attachments are sent with the rewritten text, and attachment-only
+messages skip the hook. Only one draft waits for a hook at a time.
+
+**Annotations.** With `message_annotations`, one action with `surface: "annotate"`
+receives `annotate`: `channel_id`, `guild_id` and up to 25 `messages` (`message_id`,
+`author_id`, `content`, `edited`), oldest first, at most 128 KiB of text. The host sends
+the open channel's latest loaded messages when it opens, then new and edited ones, each
+message once per text. The action returns `annotations`: `{"message_id", "text"}` for
+messages in its batch, at most 4 KiB each; empty text removes the plugin's note. A
+`message` action of a plugin with this grant may annotate the message it was chosen on
+the same way. Notes appear in small muted text under the message with the plugin's name,
+are kept in memory only (2,000 messages, 2 MiB) and are never sent to Discord. Up to
+four plugins may annotate one channel.
+
+```json
+{"annotations": [{"message_id": "1300000000000000000", "text": "Hi everyone"}]}
+```
+
 ## Plugin data (preview)
 
 Plugin data lives apart from packages in `extensions/plugin-data/<account>/<plugin id>/`
 (`connection/` for connection plugins): `data.json` (`storage`), `data.sqlite`
 (`database`) and `settings.json` (the chosen database size). The account's message
-journal sits beside them. Data from older versions inside package directories moves
+journal, approved connections (`subscriptions.json`) and message hooks (`hooks.json`)
+sit beside them. Data from older versions inside package directories moves
 there on first use.
 
 - **Updating** a plugin keeps its data.

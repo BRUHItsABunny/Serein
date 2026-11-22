@@ -11,6 +11,7 @@ pub mod broker;
 pub mod data_events;
 pub mod database;
 pub mod forum_data;
+pub mod hooks;
 pub mod journal;
 pub mod member_details;
 pub mod message_content;

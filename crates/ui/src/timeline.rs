@@ -40,6 +40,8 @@ pub struct TimelineView {
 	/// A private command response the reader dismissed this frame.
 	pub(super) dismiss_ephemeral: Option<Id>,
 	pub(super) extension_actions: std::sync::Arc<Vec<crate::extensions_ui::MenuAction>>,
+	/// Notes plugins added under messages.
+	pub(super) notes: extension_host::hooks::Annotations,
 	pub(super) extension_request: Option<(
 		crate::extensions_ui::MenuAction,
 		String,
@@ -1481,8 +1483,9 @@ fn row_height_key(
 	boundary: Option<Id>,
 	state: &State,
 	deleted: bool,
+	notes: &extension_host::hooks::Annotations,
 ) -> u64 {
-	row_key(message, previous, boundary, state) ^ u64::from(deleted)
+	row_key(message, previous, boundary, state) ^ u64::from(deleted) ^ notes.fingerprint(message.id)
 }
 fn divider(
 	ui: &mut egui::Ui,
@@ -2813,7 +2816,8 @@ impl TimelineView {
 				.map(|m| {
 					let prior = previous;
 					let deleted = state.timeline.is_deleted(m.id);
-					let key = row_height_key(m, prior, self.unread_boundary, state, deleted);
+					let key =
+						row_height_key(m, prior, self.unread_boundary, state, deleted, &self.notes);
 					row_keys.insert(m.id, key);
 					previous = Some(m);
 					let lines = m
@@ -3315,6 +3319,7 @@ impl TimelineView {
 							self.unread_boundary,
 							state,
 							state.timeline.is_deleted(id),
+							&self.notes,
 						),
 						response.rect.height(),
 					));
@@ -3356,8 +3361,14 @@ impl TimelineView {
 					&& state.interactions.pending.is_none()
 					&& let Some(&(key, height)) = self.heights.get(&id)
 					&& key
-						== row_height_key(message, previous, self.unread_boundary, state, deleted)
-				{
+						== row_height_key(
+							message,
+							previous,
+							self.unread_boundary,
+							state,
+							deleted,
+							&self.notes,
+						) {
 					ui.add_space(height);
 					// Keep one result per row: visible height updates below zip by index.
 					measurements.push((id, key, height));
@@ -4195,6 +4206,22 @@ impl TimelineView {
 													.small()
 													.color(colors.muted),
 												);
+											}
+											for note in self.notes.get(message.id) {
+												ui.horizontal_wrapped(|ui| {
+													ui.spacing_mut().item_spacing.x = 6.0;
+													ui.label(
+														RichText::new(&note.name)
+															.small()
+															.strong()
+															.color(colors.muted),
+													);
+													ui.label(
+														RichText::new(&note.text)
+															.small()
+															.color(colors.muted),
+													);
+												});
 											}
 											if !message.components.is_empty() {
 												let shown = ui.scope(|ui| {
@@ -5100,7 +5127,14 @@ impl TimelineView {
 				});
 				measurements.push((
 					id,
-					row_height_key(message, previous, self.unread_boundary, state, deleted),
+					row_height_key(
+						message,
+						previous,
+						self.unread_boundary,
+						state,
+						deleted,
+						&self.notes,
+					),
 					response.response.rect.height(),
 				));
 			}

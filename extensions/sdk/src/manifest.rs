@@ -126,6 +126,10 @@ pub enum Capability {
 	MessageJournal,
 	/// Use [`crate::host::https`] for the manifest's `network` origins.
 	Network,
+	/// Rewrite drafts in a [`Surface::Send`] action; see [`crate::SendInvocation`].
+	SendHook,
+	/// Return [`crate::Annotation`]s from [`Surface::Annotate`] and [`Surface::Message`] actions.
+	MessageAnnotations,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +150,12 @@ pub enum Surface {
 	Journal,
 	/// Host-scheduled delivery of approved broadcasts; read them with [`crate::host::topics::read`].
 	Topic,
+	/// The user is sending a message in a channel where they switched this hook on; decode
+	/// [`crate::SendInvocation`] and return the rewritten draft in `replacement`.
+	Send,
+	/// Host-scheduled batches of messages to annotate; decode [`crate::AnnotateInvocation`]
+	/// and return [`crate::AnnotationOutput`].
+	Annotate,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.

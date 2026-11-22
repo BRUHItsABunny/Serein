@@ -5,6 +5,9 @@ use extensions::{Capability, Element, ExtensionKind, Invocation, Manifest, Outpu
 use model::Id;
 use std::{collections::BTreeMap, sync::Arc};
 
+mod hooks;
+pub(crate) use hooks::Outcome as SendOutcome;
+
 #[derive(Clone)]
 pub struct ExtensionEntry {
 	pub description: String,
@@ -73,6 +76,8 @@ impl ExtensionContext {
 	}
 }
 
+// At most a few requests wait per frame, so the inline invocation is cheaper than a box.
+#[allow(clippy::large_enum_variant)]
 pub enum ExtensionRequest {
 	EditTheme {
 		id: String,
@@ -125,6 +130,10 @@ pub enum ExtensionRequest {
 		connection: bool,
 		secret: String,
 		value: Option<zeroize::Zeroizing<String>>,
+	},
+	/// Replace the message hooks switched on in one channel.
+	SetChannelHooks {
+		hooks: extension_host::hooks::ChannelHooks,
 	},
 	/// Change how large a plugin's database may grow.
 	SetDatabaseQuota {
@@ -322,6 +331,11 @@ pub struct ExtensionUi {
 	secret_edit: Option<(String, String, zeroize::Zeroizing<String>)>,
 	/// Subscriptions the user approved in this account.
 	pub subscriptions: Vec<extension_host::broker::Subscription>,
+	/// Message hooks switched on in this account's channels.
+	pub channel_hooks: Vec<extension_host::hooks::ChannelHooks>,
+	send: hooks::SendState,
+	/// Notes that arrived for the timeline.
+	notes: Vec<hooks::NoteUpdate>,
 }
 
 /// "1.5 MiB"-style size for data shown to the user.
@@ -1196,6 +1210,20 @@ impl ExtensionUi {
 		mut output: Output,
 		state: &State,
 	) {
+		if invocation.send_target.is_some() {
+			self.send_result(&id, &invocation, output.replacement);
+			return;
+		}
+		self.receive_annotations(&id, &output.annotations);
+		// Notes need no review: a batch, or a message action that only annotated.
+		if invocation.annotate.is_some()
+			|| !output.annotations.is_empty()
+				&& output.panel.is_empty()
+				&& output.effects.is_empty()
+				&& output.replacement.is_none()
+		{
+			return;
+		}
 		if !context.is_current(state) {
 			self.status = "Result discarded because the conversation or draft changed.".into();
 			return;
@@ -1274,14 +1302,15 @@ impl ExtensionUi {
 		);
 	}
 	pub(crate) fn composer_menu(&mut self, ui: &mut egui::Ui, state: &State) {
-		if !self.entries.iter().any(|entry| {
-			entry.enabled
-				&& entry
-					.manifest
-					.actions
-					.iter()
-					.any(|action| action.surface == Surface::Composer)
-		}) {
+		if !self.has_channel_hooks()
+			&& !self.entries.iter().any(|entry| {
+				entry.enabled
+					&& entry
+						.manifest
+						.actions
+						.iter()
+						.any(|action| action.surface == Surface::Composer)
+			}) {
 			return;
 		}
 		let mut selected = None;
@@ -1314,6 +1343,7 @@ impl ExtensionUi {
 						}
 					}
 				}
+				self.channel_hooks_menu(ui, state);
 			},
 		);
 		if let Some((id, action, composer)) = selected {
@@ -3396,6 +3426,9 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			ExtensionRequest::SetSecret {
 				id, secret, value, ..
 			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),
+			ExtensionRequest::SetChannelHooks { hooks } => {
+				hooks.plugins().map(str::len).sum::<usize>()
+			}
 			ExtensionRequest::SetSubscription { subscription, .. } => {
 				subscription.subscriber.len()
 					+ subscription.provider.len()
@@ -3844,6 +3877,12 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::Random => "Generate random numbers, such as unique IDs",
 		Capability::Database => "Keep a private database on this device (up to 64 MiB)",
 		Capability::Network => "Connect to the internet servers listed below",
+		Capability::SendHook => {
+			"Read and rewrite messages you send in channels where you switch it on"
+		}
+		Capability::MessageAnnotations => {
+			"Read messages in channels where you switch it on and add notes under them"
+		}
 		Capability::MessageJournal => {
 			"Receive every message, edit and deletion in all your conversations, including earlier text of edited and deleted messages"
 		}
@@ -4073,7 +4112,7 @@ fn apply_proposal(state: &mut State, context: &ExtensionContext, replacement: &s
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	#[test]
@@ -4176,7 +4215,7 @@ mod tests {
 		assert!(shop.status.contains("discarded"), "{}", shop.status);
 	}
 
-	fn entry() -> ExtensionEntry {
+	pub(crate) fn entry() -> ExtensionEntry {
 		ExtensionEntry {
 			cover_image: None,
 			local_theme: false,
