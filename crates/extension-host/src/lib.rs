@@ -23,6 +23,7 @@ pub mod network;
 pub mod notify;
 pub mod secrets;
 pub mod snapshot;
+pub mod sources;
 pub mod store;
 
 pub use snapshot::{HostLocal, RosterRow};

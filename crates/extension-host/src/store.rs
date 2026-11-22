@@ -137,6 +137,20 @@ pub enum Job {
 		secret: String,
 		value: Option<zeroize::Zeroizing<String>>,
 	},
+	/// Adds or edits a catalog source; an empty `id` adds one. `token`: `Some(Some)` saves a
+	/// token, `Some(None)` forgets it, `None` keeps it unless the address or token origins
+	/// changed, which forgets it too.
+	SetCatalogSource {
+		source: crate::sources::CatalogSource,
+		token: Option<Option<zeroize::Zeroizing<String>>>,
+	},
+	RemoveCatalogSource {
+		id: String,
+	},
+	/// Refreshes one source now, such as one that does not refresh with the built-in catalog.
+	RefreshCatalogSource {
+		id: String,
+	},
 	/// Gives a plugin with `files` the folder or file the user picked at `path` for `pick`.
 	AddFileHandle {
 		id: String,
@@ -427,8 +441,16 @@ pub enum Event {
 		data: Vec<PluginData>,
 		subscriptions: Vec<Subscription>,
 		hooks: Vec<ChannelHooks>,
+		/// Added catalog sources, as last cached.
+		sources: Vec<crate::sources::SourceStatus>,
 	},
-	Catalog(Catalog),
+	/// The built-in catalog merged with the added sources' catalogs.
+	Catalog {
+		catalog: Option<Catalog>,
+		sources: Vec<crate::sources::SourceStatus>,
+	},
+	/// The added catalog sources changed.
+	CatalogSources(Vec<crate::sources::SourceStatus>),
 	Preview {
 		id: String,
 		image: Option<egui::ColorImage>,
@@ -1255,9 +1277,8 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			})
 		}
 		Job::Load { account } => Ok(Event::Loaded {
-			catalog: read_bounded(&root.join("catalog.json"), MAX_CATALOG)
-				.ok()
-				.and_then(|bytes| extensions::parse_catalog(&bytes).ok()),
+			catalog: merged_catalog(root, cached_official(root)),
+			sources: source_statuses(root, Vec::new()),
 			starters: starters()?,
 			installed: load(root, account.as_deref(), gate)?,
 			data: data_usage(root, account.as_deref())?,
@@ -1271,8 +1292,79 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 			},
 		}),
 		Job::RefreshCatalog => {
-			let bytes = download(CATALOG_URL, MAX_CATALOG, gate, Duration::from_secs(15))?;
-			cache_catalog(root, &bytes, gate).map(Event::Catalog)
+			let bytes = download(
+				CATALOG_URL,
+				MAX_CATALOG,
+				gate,
+				Duration::from_secs(15),
+				None,
+			)?;
+			let official = cache_catalog(root, &bytes, gate)?;
+			let errors = refresh_sources(root, gate, |source| source.auto_refresh);
+			Ok(Event::Catalog {
+				catalog: merged_catalog(root, Some(official)),
+				sources: source_statuses(root, errors),
+			})
+		}
+		Job::RefreshCatalogSource { id } => {
+			let errors = refresh_sources(root, gate, |source| source.id == id);
+			Ok(Event::Catalog {
+				catalog: merged_catalog(root, cached_official(root)),
+				sources: source_statuses(root, errors),
+			})
+		}
+		Job::SetCatalogSource { mut source, token } => {
+			let mut sources = crate::sources::read(root);
+			if source.id.is_empty() {
+				if sources.len() >= crate::sources::MAX_SOURCES {
+					return Err("Remove a catalog source before adding another".into());
+				}
+				source.id = crate::sources::new_id(&source.name, &sources);
+			}
+			source.validate()?;
+			let key = crate::sources::token_key(&source.id);
+			let existing = sources.iter().position(|known| known.id == source.id);
+			let moved = existing.is_some_and(|index| {
+				sources[index].url != source.url
+					|| sources[index].token_origins != source.token_origins
+			});
+			source.has_token = match token {
+				Some(Some(token)) => {
+					if !secrets::valid_value(&token) {
+						return Err("Paste a token of at most 4 KiB without line breaks".into());
+					}
+					secrets::store()?.save(&key, &token)?;
+					true
+				}
+				None if !moved => existing.is_some_and(|index| sources[index].has_token),
+				_ => {
+					if existing.is_some_and(|index| sources[index].has_token) {
+						secrets::store()?.forget(&key)?;
+					}
+					false
+				}
+			};
+			if moved {
+				let _ = fs::remove_file(crate::sources::cache_path(root, &source.id));
+			}
+			match existing {
+				Some(index) => sources[index] = source,
+				None => sources.push(source),
+			}
+			write_sources(root, &sources, gate)?;
+			Ok(Event::CatalogSources(source_statuses(root, Vec::new())))
+		}
+		Job::RemoveCatalogSource { id } => {
+			let mut sources = crate::sources::read(root);
+			if let Some(index) = sources.iter().position(|source| source.id == id) {
+				if sources[index].has_token {
+					secrets::store()?.forget(&crate::sources::token_key(&id))?;
+				}
+				sources.remove(index);
+				let _ = fs::remove_file(crate::sources::cache_path(root, &id));
+				write_sources(root, &sources, gate)?;
+			}
+			Ok(Event::CatalogSources(source_statuses(root, Vec::new())))
 		}
 		Job::Preview { id, preview } => {
 			let image = load_preview(&preview, gate);
@@ -1635,6 +1727,99 @@ fn run(root: &Path, job: Job, gate: &Gate) -> Result<Event, String> {
 	}
 }
 
+fn cached_official(root: &Path) -> Option<Catalog> {
+	read_bounded(&root.join("catalog.json"), MAX_CATALOG)
+		.ok()
+		.and_then(|bytes| extensions::parse_catalog(&bytes).ok())
+}
+
+/// The built-in catalog with every added source's cached catalog.
+fn merged_catalog(root: &Path, official: Option<Catalog>) -> Option<Catalog> {
+	let sources = crate::sources::read(root)
+		.into_iter()
+		.filter_map(|source| Some((source.id.clone(), crate::sources::cached(root, &source.id)?)))
+		.collect();
+	crate::sources::merge(official, sources)
+}
+
+/// Each added source with its cached entry count and the error its refresh just hit.
+fn source_statuses(
+	root: &Path,
+	errors: Vec<(String, String)>,
+) -> Vec<crate::sources::SourceStatus> {
+	crate::sources::read(root)
+		.into_iter()
+		.map(|source| crate::sources::SourceStatus {
+			entries: crate::sources::cached(root, &source.id)
+				.map_or(0, |catalog| catalog.entries.len()),
+			error: errors
+				.iter()
+				.find(|(id, _)| *id == source.id)
+				.map(|(_, error)| error.clone()),
+			source,
+		})
+		.collect()
+}
+
+/// The source's saved token with where it may be sent.
+fn source_auth(source: &crate::sources::CatalogSource) -> Option<crate::sources::Auth> {
+	if !source.has_token {
+		return None;
+	}
+	let token = secrets::store()
+		.ok()?
+		.load(&crate::sources::token_key(&source.id))
+		.ok()??;
+	Some(crate::sources::Auth {
+		token,
+		origins: source.token_scope(),
+	})
+}
+
+/// Fetches the chosen sources' catalogs and caches the ones that parse; a failing source
+/// keeps its last catalog. Returns each failure.
+fn refresh_sources(
+	root: &Path,
+	gate: &Gate,
+	chosen: impl Fn(&crate::sources::CatalogSource) -> bool,
+) -> Vec<(String, String)> {
+	let mut errors = Vec::new();
+	for source in crate::sources::read(root)
+		.into_iter()
+		.filter(|source| chosen(source))
+	{
+		let auth = source_auth(&source);
+		let fetched = download(
+			&source.url,
+			MAX_CATALOG,
+			gate,
+			Duration::from_secs(15),
+			auth.as_ref(),
+		)
+		.and_then(|bytes| {
+			extensions::parse_catalog(&bytes).map_err(|error| error.to_string())?;
+			let path = crate::sources::cache_path(root, &source.id);
+			fs::create_dir_all(path.parent().unwrap_or(root))
+				.map_err(|_| "Cannot create catalog directory")?;
+			atomic_write(&path, &bytes, gate)
+		});
+		if let Err(error) = fetched {
+			errors.push((source.id, error));
+		}
+	}
+	errors
+}
+
+fn write_sources(
+	root: &Path,
+	sources: &[crate::sources::CatalogSource],
+	gate: &Gate,
+) -> Result<(), String> {
+	fs::create_dir_all(root).map_err(|_| "Cannot create catalog directory")?;
+	let bytes = serde_json::to_vec(sources).map_err(|_| "Cannot encode catalog sources")?;
+	atomic_write(&root.join(crate::sources::SOURCES_FILE), &bytes, gate)
+}
+
 fn cache_catalog(root: &Path, bytes: &[u8], gate: &Gate) -> Result<Catalog, String> {
 	let catalog = extensions::parse_catalog(bytes).map_err(|error| error.to_string())?;
 	fs::create_dir_all(root).map_err(|_| "Cannot create catalog directory")?;
@@ -1656,11 +1841,19 @@ fn enable(
 			sha256,
 		} => (bytes.to_vec(), manifest, sha256, true),
 		InstallSource::Catalog(entry) => {
+			// A source's package may need its token; the built-in catalog's never does.
+			let auth = entry.catalog_source.as_deref().and_then(|id| {
+				crate::sources::read(root)
+					.into_iter()
+					.find(|source| source.id == id)
+					.and_then(|source| source_auth(&source))
+			});
 			let bytes = download(
 				&entry.release_url,
 				MAX_PACKAGE,
 				gate,
 				Duration::from_secs(60),
+				auth.as_ref(),
 			)?;
 			if bytes.len() as u64 != entry.download_bytes {
 				return Err("Extension download size changed".into());
@@ -2037,7 +2230,7 @@ pub fn account_key(account: &str) -> Result<String, String> {
 	Ok(digest(account.as_bytes()))
 }
 
-fn valid_id(id: &str) -> Result<(), String> {
+pub(crate) fn valid_id(id: &str) -> Result<(), String> {
 	if !extensions::valid_id(id) {
 		return Err("Invalid extension identifier".into());
 	}
@@ -2405,6 +2598,7 @@ fn load_preview(preview: &Preview, gate: &Gate) -> Option<egui::ColorImage> {
 			preview.download_bytes as usize,
 			gate,
 			Duration::from_secs(5),
+			None,
 		)
 		.ok()?
 	};
@@ -2553,7 +2747,13 @@ fn digest(bytes: &[u8]) -> String {
 	format!("{:x}", Sha256::digest(bytes))
 }
 
-fn download(raw: &str, limit: usize, gate: &Gate, timeout: Duration) -> Result<Vec<u8>, String> {
+fn download(
+	raw: &str,
+	limit: usize,
+	gate: &Gate,
+	timeout: Duration,
+	auth: Option<&crate::sources::Auth>,
+) -> Result<Vec<u8>, String> {
 	tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.build()
@@ -2562,12 +2762,17 @@ fn download(raw: &str, limit: usize, gate: &Gate, timeout: Duration) -> Result<V
 			tokio::select! {
 				biased;
 				_ = gate.wake_cancel.notified() => Err("Extension operation cancelled".into()),
-				result = tokio::time::timeout(timeout, download_https(raw, limit, gate)) => result.map_err(|_| "Extension download timed out")?,
+				result = tokio::time::timeout(timeout, download_https(raw, limit, gate, auth)) => result.map_err(|_| "Extension download timed out")?,
 			}
 		})
 }
 
-async fn download_https(raw: &str, limit: usize, gate: &Gate) -> Result<Vec<u8>, String> {
+async fn download_https(
+	raw: &str,
+	limit: usize,
+	gate: &Gate,
+	auth: Option<&crate::sources::Auth>,
+) -> Result<Vec<u8>, String> {
 	let mut url = url::Url::parse(raw).map_err(|_| "Invalid extension download URL")?;
 	for _ in 0..6 {
 		gate.check()?;
@@ -2597,9 +2802,22 @@ async fn download_https(raw: &str, limit: usize, gate: &Gate) -> Result<Vec<u8>,
 			.timeout(Duration::from_secs(30))
 			.build()
 			.map_err(|_| "Extension downloader unavailable")?;
-		let response = client
+		let mut request = client
 			.get(url.as_str())
-			.header(wreq::header::ACCEPT_ENCODING, "identity")
+			.header(wreq::header::ACCEPT_ENCODING, "identity");
+		// GitHub's API returns file contents and release assets raw only when asked, and
+		// refuses requests without a client name.
+		if host == "api.github.com" {
+			request = request.header(wreq::header::USER_AGENT, "Serein");
+			if let Some(accept) = github_accept(url.path()) {
+				request = request.header(wreq::header::ACCEPT, accept);
+			}
+		}
+		// Each hop decides on its own, so a redirect to another origin never carries it.
+		if let Some(token) = auth.and_then(|auth| auth.for_url(&url)) {
+			request = request.header(wreq::header::AUTHORIZATION, format!("Bearer {token}"));
+		}
+		let response = request
 			.send()
 			.await
 			.map_err(|_| "Extension download failed")?;
@@ -2645,6 +2863,16 @@ async fn download_https(raw: &str, limit: usize, gate: &Gate) -> Result<Vec<u8>,
 		return Ok(bytes);
 	}
 	Err("Too many extension download redirects".into())
+}
+
+fn github_accept(path: &str) -> Option<&'static str> {
+	if path.contains("/releases/assets/") {
+		Some("application/octet-stream")
+	} else if path.contains("/contents/") {
+		Some("application/vnd.github.raw")
+	} else {
+		None
+	}
 }
 
 pub(crate) fn public_ip(ip: IpAddr) -> bool {
@@ -3594,6 +3822,108 @@ mod tests {
 		));
 	}
 
+	/// Catalog sources are saved without their token, which goes to the secret store; an
+	/// edited address forgets it; a cached source catalog is merged into what loads; and
+	/// removing a source forgets its token and cache.
+	#[test]
+	fn catalog_sources_keep_tokens_in_the_secret_store_and_merge_their_entries() {
+		secrets::install(Arc::new(secrets::MemoryStore::default()));
+		let profile = Profile::new();
+		let root = profile.0.join("extensions");
+		let gate = gate();
+		let set = |source: crate::sources::CatalogSource, token: Option<Option<&str>>| {
+			run(
+				&root,
+				Job::SetCatalogSource {
+					source,
+					token: token
+						.map(|token| token.map(|token| zeroize::Zeroizing::new(token.into()))),
+				},
+				&gate,
+			)
+		};
+		let team = |url: &str| crate::sources::CatalogSource {
+			id: String::new(),
+			name: "Team".into(),
+			url: url.into(),
+			token_origins: Vec::new(),
+			auto_refresh: false,
+			has_token: false,
+		};
+		let Ok(Event::CatalogSources(sources)) = set(
+			team("https://example.org/catalog.json"),
+			Some(Some("ghp_secret")),
+		) else {
+			panic!("not saved")
+		};
+		let saved = sources[0].source.clone();
+		assert_eq!((saved.id.as_str(), saved.has_token), ("team", true));
+		let file = fs::read_to_string(root.join(crate::sources::SOURCES_FILE)).unwrap();
+		assert!(
+			!file.contains("ghp_secret"),
+			"the token never reaches the sources file"
+		);
+		let key = crate::sources::token_key("team");
+		assert_eq!(
+			secrets::store()
+				.unwrap()
+				.load(&key)
+				.unwrap()
+				.as_deref()
+				.map(String::as_str),
+			Some("ghp_secret")
+		);
+		// Same address, no new token: kept. A new address: forgotten.
+		let Ok(Event::CatalogSources(sources)) = set(saved.clone(), None) else {
+			panic!()
+		};
+		assert!(sources[0].source.has_token);
+		let moved = crate::sources::CatalogSource {
+			url: "https://elsewhere.example.org/catalog.json".into(),
+			..saved.clone()
+		};
+		let Ok(Event::CatalogSources(sources)) = set(moved.clone(), None) else {
+			panic!()
+		};
+		assert!(!sources[0].source.has_token);
+		assert!(secrets::store().unwrap().load(&key).unwrap().is_none());
+
+		// A cached source catalog loads merged and tagged.
+		let catalog = serde_json::json!({"api_version": 1, "entries": [{
+			"manifest": {
+				"api_version": 1, "id": "private-plugin", "name": "Private", "version": "1.0.0",
+				"author": "team", "license": "MIT", "source": "https://example.org",
+				"kind": "plugin", "capabilities": [],
+				"actions": [{"id": "run", "label": "Run", "surface": "panel"}]
+			},
+			"release_url": "https://elsewhere.example.org/p.serein-extension",
+			"sha256": "a".repeat(64),
+			"download_bytes": 1,
+			"source_commit": "b".repeat(40),
+		}]});
+		let cache = crate::sources::cache_path(&root, "team");
+		fs::create_dir_all(cache.parent().unwrap()).unwrap();
+		fs::write(&cache, serde_json::to_vec(&catalog).unwrap()).unwrap();
+		let Ok(Event::Loaded {
+			catalog, sources, ..
+		}) = run(&root, Job::Load { account: None }, &gate)
+		else {
+			panic!("not loaded")
+		};
+		let entry = &catalog.unwrap().entries[0];
+		assert_eq!(entry.catalog_source.as_deref(), Some("team"));
+		assert_eq!(sources[0].entries, 1);
+
+		set(moved, Some(Some("again"))).unwrap();
+		let Ok(Event::CatalogSources(sources)) =
+			run(&root, Job::RemoveCatalogSource { id: "team".into() }, &gate)
+		else {
+			panic!()
+		};
+		assert!(sources.is_empty() && !cache.exists());
+		assert!(secrets::store().unwrap().load(&key).unwrap().is_none());
+	}
+
 	#[test]
 	fn broadcasts_reach_only_approved_subscribers_and_disabling_ends_the_connection() {
 		let profile = Profile::new();
@@ -4232,7 +4562,8 @@ mod tests {
 				"https://github.com/example",
 				100,
 				&cancelled,
-				Duration::from_secs(60)
+				Duration::from_secs(60),
+				None,
 			)
 			.is_err()
 		);

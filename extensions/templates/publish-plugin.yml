@@ -1,0 +1,74 @@
+# Template for a Serein plugin's own repository. Copy it to .github/workflows/ there, with
+# extensions/pack.py from Serein copied to tools/pack.py, and adjust the names below.
+#
+# Pushing a tag such as v1.2.0 builds the plugin, packages it, attaches the package to a
+# GitHub release, and commits catalog.json on the default branch pointing at that release
+# asset with its SHA-256 and size. The repository, public or private, can then be added in
+# Serein under Settings > Extensions > Catalog sources:
+#
+#   Catalog address  https://api.github.com/repos/OWNER/REPO/contents/catalog.json
+#   Token            a fine-grained token with read access to this repository's contents
+#                    (only needed for a private repository)
+#
+# Serein sends the token only to api.github.com, which serves the catalog and the asset; the
+# asset's redirect to GitHub's download storage goes without it.
+name: Publish Serein plugin
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  # The crate's Wasm file name, the plugin manifest, and the package file name.
+  WASM: target/wasm32-unknown-unknown/release/my_plugin.wasm
+  MANIFEST: manifest.json
+  PACKAGE: my-plugin.serein-extension
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --release --locked --target wasm32-unknown-unknown
+      - name: Package
+        run: python3 tools/pack.py "$MANIFEST" "$WASM" "dist/$PACKAGE" --license LICENSE
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/$PACKAGE" --title "$GITHUB_REF_NAME" --verify-tag
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq ".assets[] | select(.name == \"$PACKAGE\") | .id" > "$RUNNER_TEMP/asset"
+      - name: Write catalog
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          package = pathlib.Path("dist") / os.environ["PACKAGE"]
+          data = package.read_bytes()
+          asset = pathlib.Path(os.environ["RUNNER_TEMP"], "asset").read_text().strip()
+          entry = {
+              "manifest": json.loads(pathlib.Path(os.environ["MANIFEST"]).read_text()),
+              "release_url": f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/releases/assets/{asset}",
+              "sha256": hashlib.sha256(data).hexdigest(),
+              "download_bytes": len(data),
+              "source_commit": os.environ["GITHUB_SHA"],
+          }
+          catalog = {"api_version": 1, "entries": [entry]}
+          pathlib.Path(os.environ["RUNNER_TEMP"], "catalog.json").write_text(json.dumps(catalog, indent=2) + "\n")
+          PY
+      - name: Commit catalog
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name)"
+          git fetch --depth=1 origin "$branch"
+          git checkout --quiet --force -B catalog FETCH_HEAD
+          cp "$RUNNER_TEMP/catalog.json" catalog.json
+          git add catalog.json
+          git diff --cached --quiet && exit 0
+          git commit --quiet -m "chore: catalog for $GITHUB_REF_NAME"
+          git push origin "HEAD:$branch"
+        env:
+          GH_TOKEN: ${{ github.token }}

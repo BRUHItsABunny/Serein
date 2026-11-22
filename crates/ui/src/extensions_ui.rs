@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 mod hooks;
 mod pages;
+mod sources;
 pub(crate) use hooks::Outcome as SendOutcome;
 
 #[derive(Clone)]
@@ -135,6 +136,17 @@ pub enum ExtensionRequest {
 	/// Replace the message hooks switched on in one channel.
 	SetChannelHooks {
 		hooks: extension_host::hooks::ChannelHooks,
+	},
+	/// Add or edit a catalog source; see `Job::SetCatalogSource`.
+	SetCatalogSource {
+		source: extension_host::sources::CatalogSource,
+		token: Option<Option<zeroize::Zeroizing<String>>>,
+	},
+	RemoveCatalogSource {
+		id: String,
+	},
+	RefreshCatalogSource {
+		id: String,
 	},
 	/// Take a picked folder or file away from a plugin.
 	RemoveFileHandle {
@@ -345,6 +357,11 @@ pub struct ExtensionUi {
 	notes: Vec<hooks::NoteUpdate>,
 	/// The plugin page shown in the main area.
 	page: Option<pages::OpenPage>,
+	/// Catalogs the user added, with their last refresh.
+	pub catalog_sources: Vec<extension_host::sources::SourceStatus>,
+	/// Entries found in an added catalog, by ID, with that source's name.
+	pub catalog_origins: BTreeMap<String, String>,
+	source_form: Option<sources::SourceForm>,
 }
 
 /// "1.5 MiB"-style size for data shown to the user.
@@ -1813,6 +1830,7 @@ impl ExtensionUi {
 			self.connections(ui, &colors);
 			self.kept_data(ui, &colors);
 		}
+		self.catalog_sources(ui, &colors);
 		self.preview_modal(ui.ctx());
 		self.details_modal(ui.ctx(), &mut enable, &mut disable, &mut invoke);
 		if let Some(entry) = enable {
@@ -2579,9 +2597,11 @@ impl ExtensionUi {
 						ui.add(
 							egui::Label::new(
 								egui::RichText::new(format!(
-									"{} {}",
+									"{} {}{}",
 									crate::i18n::translate("extensions-ui-card-body-by"),
-									entry.manifest.author
+									entry.manifest.author,
+									self.source_label(&entry.manifest.id)
+										.map_or_else(String::new, |source| format!(" · {source}"))
 								))
 								.size(12.0)
 								.color(colors.muted),
@@ -2636,9 +2656,11 @@ impl ExtensionUi {
 			ui.add(
 				egui::Label::new(
 					egui::RichText::new(format!(
-						"{} {}",
+						"{} {}{}",
 						crate::i18n::translate("extensions-ui-card-body-by"),
-						entry.manifest.author
+						entry.manifest.author,
+						self.source_label(&entry.manifest.id)
+							.map_or_else(String::new, |source| format!(" · {source}"))
 					))
 					.size(12.0)
 					.color(colors.muted),
@@ -3490,6 +3512,17 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			| ExtensionRequest::SetDatabaseQuota { id, .. }
 			| ExtensionRequest::Preview { id } => id.len(),
 			ExtensionRequest::RemoveFileHandle { id, root, .. } => id.len() + root.len(),
+			ExtensionRequest::SetCatalogSource { source, token } => {
+				source.name.len()
+					+ source.url.len()
+					+ source.token_origins.iter().map(String::len).sum::<usize>()
+					+ token
+						.as_ref()
+						.and_then(Option::as_ref)
+						.map_or(0, |token| token.len())
+			}
+			ExtensionRequest::RemoveCatalogSource { id }
+			| ExtensionRequest::RefreshCatalogSource { id } => id.len(),
 			ExtensionRequest::SetSecret {
 				id, secret, value, ..
 			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),

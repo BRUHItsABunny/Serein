@@ -504,6 +504,9 @@ pub struct CatalogEntry {
 	pub sha256: String,
 	pub download_bytes: u64,
 	pub source_commit: String,
+	/// The added catalog source the host found this entry in; never read from a catalog.
+	#[serde(skip)]
+	pub catalog_source: Option<String>,
 }
 
 /// A creator-supplied shop image, pinned independently from executable packages.

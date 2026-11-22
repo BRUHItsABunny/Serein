@@ -1186,7 +1186,9 @@ impl Bridge {
 					data,
 					subscriptions,
 					hooks,
+					sources,
 				}) => {
+					messaging.extensions.catalog_sources = sources;
 					messaging.extensions.channel_hooks.clone_from(&hooks);
 					self.channel_hooks = hooks;
 					messaging.extensions.plugin_data = data;
@@ -1222,16 +1224,25 @@ impl Bridge {
 					self.apply_theme(ctx);
 					self.entries(messaging);
 				}
-				Ok(Event::Catalog(catalog)) => {
-					self.catalog = catalog
-						.entries
-						.into_iter()
-						.filter(|entry| entry.manifest.id != "emoji-sticker-images")
-						.map(|entry| (entry.manifest.id.clone(), entry))
-						.collect();
+				Ok(Event::Catalog { catalog, sources }) => {
+					if let Some(catalog) = catalog {
+						self.catalog = catalog
+							.entries
+							.into_iter()
+							.filter(|entry| entry.manifest.id != "emoji-sticker-images")
+							.map(|entry| (entry.manifest.id.clone(), entry))
+							.collect();
+					}
+					messaging.extensions.catalog_sources = sources;
 					self.entries(messaging);
-					// A finished refresh is visible in the grid; only failures need a status line.
+					// A finished refresh is visible in the grid; only failures need a status line,
+					// and a failing source shows its error beside it.
 					messaging.extensions.status.clear();
+				}
+				Ok(Event::CatalogSources(sources)) => {
+					messaging.extensions.catalog_sources = sources;
+					// A new or edited source shows its packages after the next refresh.
+					self.submit(Job::RefreshCatalog, None, state.generation, ctx, messaging);
 				}
 				Ok(Event::Imported {
 					manifest,
@@ -1716,6 +1727,27 @@ impl Bridge {
 						messaging,
 					);
 				}
+				ExtensionRequest::SetCatalogSource { source, token } => self.submit(
+					Job::SetCatalogSource { source, token },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
+				ExtensionRequest::RemoveCatalogSource { id } => self.submit(
+					Job::RemoveCatalogSource { id },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
+				ExtensionRequest::RefreshCatalogSource { id } => self.submit(
+					Job::RefreshCatalogSource { id },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
 				ExtensionRequest::RemoveFileHandle {
 					id,
 					connection,
@@ -2815,6 +2847,20 @@ impl Bridge {
 	}
 
 	fn entries(&self, messaging: &mut ui::MessagingUi) {
+		messaging.extensions.catalog_origins = self
+			.catalog
+			.iter()
+			.filter_map(|(id, entry)| {
+				let source = entry.catalog_source.as_deref()?;
+				let name = messaging
+					.extensions
+					.catalog_sources
+					.iter()
+					.find(|status| status.source.id == source)
+					.map_or(source, |status| status.source.name.as_str());
+				Some((id.clone(), name.to_owned()))
+			})
+			.collect();
 		messaging.extensions.active_theme = self
 			.installed
 			.iter()
@@ -3875,6 +3921,7 @@ mod tests {
 			source_commit: "c".repeat(40),
 			download_bytes: 100,
 			release_url: "https://example.org/release.json".into(),
+			catalog_source: None,
 		};
 		let starter = Starter {
 			source: InstallSource::Bundled {

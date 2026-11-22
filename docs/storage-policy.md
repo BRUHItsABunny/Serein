@@ -2186,6 +2186,15 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Catalog sources (preview, November 22, 2026)
+
+Added catalog sources are saved device-wide in `extensions/sources.json` (at most 8, read
+up to 64 KiB): ID, name, catalog address, token origins, the refresh choice and whether a
+token is saved. Tokens live only in the OS credential store, under the source's ID, and
+are forgotten when the source is removed or its address changes. Each source's last valid
+catalog is cached in `extensions/sources/<id>.json` within the 1 MiB catalog bound and
+removed with the source.
+
 ## Plugin media taps (preview, November 22, 2026)
 
 Nothing is written to disk by the host. While a `media_packets` or `media_audio` worker

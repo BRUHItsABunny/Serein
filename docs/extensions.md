@@ -42,6 +42,30 @@ Plugin grants and data belong to the signed-in account, except the narrow
 plugin results, drains bounded in-flight work and clears that account's extension data. Theme selection is a device
 preference. There is no periodic background polling or automatic package update.
 
+## Catalog sources (preview)
+
+Settings > Extensions > **Catalog sources** adds up to 8 catalogs beside the built-in one,
+such as a private plugin repository. A source has a name, a catalog address (public
+HTTPS, the same format as `extensions/catalog.json`), an optional token, optional extra
+origins the token may go to, and whether it refreshes with the built-in catalog; one that
+does not refreshes only from its **Refresh** button.
+
+- **Tokens** are saved in the system credential store, never in `sources.json`. A token is
+  sent as `Authorization: Bearer` only to the catalog's own origin and the listed origins,
+  checked on every redirect hop, so a redirect elsewhere, such as GitHub's signed release
+  storage, goes without it. Changing a source's address or token origins forgets its
+  token unless a new one is entered. Preview images are always fetched without a token.
+- **Packages** keep the catalog's pinned SHA-256 and size, and downloads keep the public
+  address and redirect rules of the built-in catalog.
+- **Entries** from a source show "from <source>" on their card. An ID the built-in catalog
+  already lists is skipped, and a catalog cannot claim a source for its entries. Installed
+  packages update from the catalog they came from, like built-in ones.
+- **GitHub**: requests to `api.github.com` ask for raw file contents (`/contents/`) and
+  release assets (`/releases/assets/`). A repository can publish with
+  [`extensions/templates/publish-plugin.yml`](../extensions/templates/publish-plugin.yml),
+  then be added with `https://api.github.com/repos/OWNER/REPO/contents/catalog.json` and,
+  if private, a fine-grained token with read access to its contents.
+
 ## Creator workflow
 
 1. Keep source and license in a public Git repository. Use the standalone Rust

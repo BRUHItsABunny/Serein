@@ -318,6 +318,7 @@ fn validates_themes_catalog_and_path_safe_identifiers() {
 		sha256: "a".repeat(64),
 		download_bytes: 100,
 		source_commit: "a".repeat(40),
+		catalog_source: None,
 	};
 	let catalog = Catalog {
 		api_version: API_VERSION,
