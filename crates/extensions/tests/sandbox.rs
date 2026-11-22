@@ -1241,3 +1241,150 @@ fn notification_hooks_get_only_their_alert_and_may_only_reword_or_hide_it() {
 	output.validate(&manifest, &input).unwrap();
 	assert!(output.notification.unwrap().hide);
 }
+
+#[test]
+fn pages_need_their_grant_and_rows_answer_exactly_the_request() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Pages];
+	manifest.actions = vec![
+		Action {
+			id: "open".into(),
+			label: "Open".into(),
+			surface: Surface::Panel,
+		},
+		Action {
+			id: "rows".into(),
+			label: "Rows".into(),
+			surface: Surface::Panel,
+		},
+	];
+	manifest.validate().unwrap();
+	let row = |id: &str, text: &str| PageRow {
+		id: id.into(),
+		author: Some("Ada".into()),
+		time_ms: Some(1_700_000_000_000),
+		text: text.into(),
+		state: Some(PageRowState::Edited),
+		revisions: vec![PageRevision {
+			time_ms: None,
+			text: "first\nversion".into(),
+		}],
+	};
+	let page = |list: PageList| Output {
+		page: Some(Some(Page {
+			title: "Archive".into(),
+			elements: vec![Element::Button {
+				id: "open".into(),
+				label: "Refresh".into(),
+			}],
+			list: Some(list),
+		})),
+		..Default::default()
+	};
+	let list = PageList {
+		version: "v1".into(),
+		total: 3,
+		rows_action: "rows".into(),
+		click_action: None,
+		rows: vec![row("1", "hello\nthere")],
+		empty_text: None,
+	};
+	let open = Invocation {
+		action: "open".into(),
+		..Default::default()
+	};
+	page(list.clone()).validate(&manifest, &open).unwrap();
+	for (invalid, why) in [
+		(
+			PageList {
+				rows_action: "missing".into(),
+				..list.clone()
+			},
+			"undeclared rows action",
+		),
+		(
+			PageList {
+				total: 0,
+				..list.clone()
+			},
+			"inline rows past the total",
+		),
+		(
+			PageList {
+				rows: vec![row("1", "tab\there")],
+				..list.clone()
+			},
+			"control characters",
+		),
+		(
+			PageList {
+				version: String::new(),
+				..list.clone()
+			},
+			"blank version",
+		),
+	] {
+		assert!(page(invalid).validate(&manifest, &open).is_err(), "{why}");
+	}
+	// Closing needs the grant too, and pages come only from activation and panel actions.
+	let close = Output {
+		page: Some(None),
+		..Default::default()
+	};
+	close.validate(&manifest, &open).unwrap();
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities.clear();
+	assert!(close.validate(&ungranted, &open).is_err());
+
+	let request = PageRequest {
+		version: "v1".into(),
+		start: 1,
+		count: 2,
+	};
+	let fetch = Invocation {
+		action: "rows".into(),
+		page_request: Some(Box::new(request.clone())),
+		..Default::default()
+	};
+	fetch.validate(&manifest).unwrap();
+	assert!(fetch.validate(&ungranted).is_err());
+	let answer = |version: &str, start, count| Output {
+		page_rows: Some(PageRows {
+			version: version.into(),
+			start,
+			rows: (0..count)
+				.map(|id: u32| row(&id.to_string(), "x"))
+				.collect(),
+		}),
+		..Default::default()
+	};
+	answer("v1", 1, 2).validate(&manifest, &fetch).unwrap();
+	for (invalid, why) in [
+		(answer("v0", 1, 2), "another version"),
+		(answer("v1", 0, 2), "another start"),
+		(answer("v1", 1, 3), "more rows than asked"),
+	] {
+		assert!(invalid.validate(&manifest, &fetch).is_err(), "{why}");
+	}
+	assert!(
+		answer("v1", 1, 1).validate(&manifest, &open).is_err(),
+		"rows only answer a request"
+	);
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..answer("v1", 1, 1)
+	};
+	assert!(
+		with_panel.validate(&manifest, &fetch).is_err(),
+		"a fetch opens no window"
+	);
+
+	// The SDK's `null` closes the page.
+	let sdk_close = serde_json::to_value(serein_extension_sdk::PageOutput {
+		page: Some(None),
+		..Default::default()
+	})
+	.unwrap();
+	let output: Output = serde_json::from_value(sdk_close).unwrap();
+	assert!(matches!(output.page, Some(None)));
+}

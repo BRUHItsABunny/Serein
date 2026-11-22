@@ -6,6 +6,7 @@ use model::Id;
 use std::{collections::BTreeMap, sync::Arc};
 
 mod hooks;
+mod pages;
 pub(crate) use hooks::Outcome as SendOutcome;
 
 #[derive(Clone)]
@@ -336,6 +337,8 @@ pub struct ExtensionUi {
 	send: hooks::SendState,
 	/// Notes that arrived for the timeline.
 	notes: Vec<hooks::NoteUpdate>,
+	/// The plugin page shown in the main area.
+	page: Option<pages::OpenPage>,
 }
 
 /// "1.5 MiB"-style size for data shown to the user.
@@ -1126,6 +1129,7 @@ impl ExtensionUi {
 		self.result = None;
 		self.details = None;
 		self.consent = None;
+		self.page = None;
 		self.requests.clear();
 		self.previews.clear();
 		self.enlarged = None;
@@ -1133,6 +1137,9 @@ impl ExtensionUi {
 	pub fn remove_runtime(&mut self, id: &str) {
 		if self.result.as_ref().is_some_and(|result| result.id == id) {
 			self.result = None;
+		}
+		if self.page.as_ref().is_some_and(|page| page.plugin == id) {
+			self.page = None;
 		}
 		if self.details.as_deref() == Some(id) {
 			self.details = None;
@@ -1212,6 +1219,9 @@ impl ExtensionUi {
 	) {
 		if invocation.send_target.is_some() {
 			self.send_result(&id, &invocation, output.replacement);
+			return;
+		}
+		if self.receive_page(&id, &invocation, &mut output, state) {
 			return;
 		}
 		self.receive_annotations(&id, &output.annotations);
@@ -3883,6 +3893,7 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::MessageAnnotations => {
 			"Read messages in channels where you switch it on and add notes under them"
 		}
+		Capability::Pages => "Show its own pages in the main area",
 		Capability::Notifications => {
 			"See every desktop notification, including its message preview, and reword or hide it"
 		}

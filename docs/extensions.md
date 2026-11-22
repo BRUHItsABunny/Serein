@@ -127,7 +127,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 66 capabilities, with at most 96 distinct declarations per manifest.
+supports 67 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -184,6 +184,7 @@ supports 66 capabilities, with at most 96 distinct declarations per manifest.
 | `send_hook` | Rewrite the user's draft in one `send` action before it is sent | Preview; [message hooks](#message-hooks-preview); only in channels where the user switches it on, with preview or automatic sending and a chosen fallback |
 | `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on; notes are shown, never sent |
 | `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
+| `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -505,7 +506,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 96 distinct | Only the 66 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 67 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
 | Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
@@ -813,6 +814,38 @@ only the alert; message sounds and unread badges stay as they are.
 
 ```json
 {"notification": {"body": "Hello, how are you?"}}
+```
+
+## Plugin pages (preview)
+
+With `pages`, an activation or panel action may return `page` to show a page in the main
+area: a `title` (at most 128 bytes), panel `elements` and an optional `list`. A later
+result with `page` replaces it, `"page": null` closes it, and leaving it out keeps it.
+The page also closes when the user closes it, opens another conversation, or the plugin
+stops. Buttons run the panel action they name with the page's input values, as in a
+result window.
+
+The `list` names its content `version` (1–64 ASCII bytes), its `total` rows (at most
+1,000,000), a declared panel action `rows_action`, optionally a declared `click_action`
+(run with the row's id in `values["row"]`), up to 100 inline `rows` and an `empty_text`.
+The host draws only the rows on screen and asks for missing ones, 50 at a time and one
+request at a time, by running `rows_action` with `page_request {version, start, count}`.
+That action answers with `page_rows {version, start, rows}`: the same version and start
+and at most `count` rows. A fetch may also return `page` and `storage`, and nothing that
+would open a window. The host keeps at most 2,000 fetched rows (8 MiB) in RAM, dropping
+those farthest from view, and forgets them when the version changes.
+
+A row has an `id` (at most 64 bytes), an optional `author` and `time_ms`, `text` (at most
+4 KiB; line breaks allowed, other control characters not), an optional `state` of
+`edited` or `deleted`, and up to 8 earlier `revisions` (`time_ms`, `text`), oldest first.
+Rows show one line with the full text on hover; deleted rows are struck through, and a row
+with revisions has an **(edited) · history** button that opens its versions.
+
+```json
+{"page_rows": {"version": "v3", "start": 50, "rows": [
+  {"id": "1300000000000000000", "author": "Ada", "time_ms": 1763700000000,
+   "text": "See you at 6", "state": "edited",
+   "revisions": [{"time_ms": 1763699000000, "text": "See you at 5"}]}]}}
 ```
 
 ## Plugin data (preview)

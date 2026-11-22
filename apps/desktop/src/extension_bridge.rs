@@ -1089,7 +1089,10 @@ impl Bridge {
 						);
 						continue;
 					}
-					if let Some((id, _, _)) = pending.as_ref().and_then(|p| p.invocation.as_ref()) {
+					if let Some((id, input, _)) =
+						pending.as_ref().and_then(|p| p.invocation.as_ref())
+					{
+						messaging.extensions.page_failed(id, input);
 						if let Some(entry) = self.installed.iter_mut().find(|entry| {
 							entry.manifest.id == *id
 								&& entry.manifest.capabilities.contains(&Capability::ApiProxy)
@@ -1731,9 +1734,12 @@ impl Bridge {
 					{
 						// A draft waiting for its hook falls back instead of waiting forever.
 						messaging.extensions.send_failed(&id, &invocation);
+						messaging.extensions.page_failed(&id, &invocation);
 						continue;
 					}
-					let hook = invocation.send_target.is_some();
+					// Hooks and page row fetches get only their own input.
+					let hook =
+						invocation.send_target.is_some() || invocation.page_request.is_some();
 					let connection_plugin = self.installed.iter().any(|entry| {
 						entry.manifest.id == id
 							&& entry.manifest.capabilities.contains(&Capability::ApiProxy)
@@ -2590,7 +2596,9 @@ impl Bridge {
 		}
 		// Every result restates the plugin's interface: a tree replaces the one shown, and
 		// its absence restores the normal layout. Hooks cannot return one, so keep it.
-		let hook = invocation.send_target.is_some() || invocation.annotate.is_some();
+		let hook = invocation.send_target.is_some()
+			|| invocation.annotate.is_some()
+			|| invocation.page_request.is_some();
 		if !hook
 			&& let Some(installed) = self
 				.installed

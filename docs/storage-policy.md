@@ -2186,6 +2186,12 @@ plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with 
 oldest dropped first, and are cleared on logout or an account switch; which messages each
 plugin was given is remembered in RAM for at most 4,096 messages.
 
+## Plugin pages (preview, November 21, 2026)
+
+Nothing is written to disk. An open page and its fetched rows live in RAM, at most 2,000
+rows and 8 MiB with the rows farthest from view dropped first, and are discarded when the
+page closes, its list version changes, the plugin stops or the account changes.
+
 ## Plugin notification hook (preview, November 21, 2026)
 
 Nothing is written to disk. Alerts waiting for `notification` plugins stay in RAM, at most

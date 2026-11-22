@@ -5822,6 +5822,10 @@ impl MessagingUi {
 					);
 				}
 				self.startup_warnings_toasted = (state.generation, warnings);
+				if self.extensions.page_open(state) {
+					self.extensions.show_page(ui, state);
+					return;
+				}
 				if state.selected.is_none() && self.guild.is_none() {
 					self.call_bar(ui, state, &mut commands, None);
 					self.timeline.download.show_status(ui);

@@ -9,7 +9,9 @@ pub mod imports;
 pub mod message_hooks;
 pub use message_hooks::{AnnotateBatch, AnnotateMessage, Annotation, SendTarget};
 pub mod notification_hook;
+pub mod pages;
 pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
+pub use pages::{Page, PageList, PageRequest, PageRevision, PageRow, PageRowState, PageRows};
 pub mod network;
 pub mod topics;
 pub use imports::{HostImports, NoHostImports, Reply};
@@ -186,6 +188,9 @@ pub enum Capability {
 	/// See each desktop alert, with its message preview, before it is shown and reword or
 	/// hide it from a `notification` action.
 	Notifications,
+	/// Show a page in the main area from activation and panel actions, with a long list the
+	/// host fetches from a panel action as the user scrolls.
+	Pages,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -547,6 +552,9 @@ pub struct Invocation {
 	/// The alert for a `notification` action.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub notification: Option<Box<NotificationInput>>,
+	/// The rows a page's list needs, on its `rows_action`. Requires `pages`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub page_request: Option<Box<PageRequest>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,6 +839,17 @@ pub struct Output {
 	/// How a `notification` action wants the alert shown. Requires `notifications`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub notification: Option<NotificationDecision>,
+	/// Opens or replaces this plugin's page; an explicit `null` closes it and an omitted field
+	/// keeps it. Requires `pages`; activation and panel actions only.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		deserialize_with = "pages::present"
+	)]
+	pub page: Option<Option<Page>>,
+	/// Rows answering the invocation's `page_request`. Requires `pages`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub page_rows: Option<PageRows>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1399,6 +1418,14 @@ impl Invocation {
 			(None, false) => {}
 			_ => return Err(Error::Capability),
 		}
+		if let Some(request) = &self.page_request {
+			if action.surface != Surface::Panel
+				|| !manifest.capabilities.contains(&Capability::Pages)
+			{
+				return Err(Error::Capability);
+			}
+			request.validate()?;
+		}
 		let composer_grant = if action.surface == Surface::Send {
 			Capability::SendHook
 		} else {
@@ -1538,6 +1565,54 @@ impl Output {
 			(Some(decision), true) => decision.validate()?,
 			(None, _) => {}
 			_ => return Err(Error::Capability),
+		}
+		if let Some(Some(page)) = &self.page {
+			if !manifest.capabilities.contains(&Capability::Pages)
+				|| !matches!(surface, Surface::Activation | Surface::Panel)
+			{
+				return Err(Error::Capability);
+			}
+			page.validate(|id| {
+				manifest
+					.actions
+					.iter()
+					.any(|action| action.id == id && action.surface == Surface::Panel)
+			})?;
+			let mut count = 0;
+			validate_elements(
+				&page.elements,
+				0,
+				&mut count,
+				&mut BTreeSet::new(),
+				manifest,
+			)?;
+		} else if self.page.is_some()
+			&& (!manifest.capabilities.contains(&Capability::Pages)
+				|| !matches!(surface, Surface::Activation | Surface::Panel))
+		{
+			return Err(Error::Capability);
+		}
+		match (&self.page_rows, &input.page_request) {
+			(Some(rows), Some(request)) => rows.validate(request)?,
+			(Some(_), None) => return Err(Error::Capability),
+			(None, _) => {}
+		}
+		// A row fetch runs while the user scrolls: it answers with rows and nothing to review.
+		if input.page_request.is_some()
+			&& (self.rich_presence.is_some()
+				|| self.api_proxy.is_some()
+				|| self.image_sharing
+				|| self.preserve_deleted_messages
+				|| self.appearance.is_some()
+				|| self.replacement.is_some()
+				|| !self.panel.is_empty()
+				|| !self.effects.is_empty()
+				|| self.interface_tweaks.is_some()
+				|| self.interface_ui.is_some()
+				|| self.start_screen.is_some()
+				|| !self.annotations.is_empty())
+		{
+			return Err(Error::Capability);
 		}
 		// Background deliveries and hooks may only save storage, and a send hook its rewrite;
 		// database writes go through imports.

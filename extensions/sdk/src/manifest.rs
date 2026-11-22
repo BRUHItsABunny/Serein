@@ -133,6 +133,9 @@ pub enum Capability {
 	/// Reword or hide desktop alerts in a [`Surface::Notification`] action; see
 	/// [`crate::NotificationInvocation`].
 	Notifications,
+	/// Show a [`crate::Page`] in the main area from activation and panel actions; see
+	/// [`crate::PageOutput`].
+	Pages,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
