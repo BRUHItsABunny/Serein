@@ -653,9 +653,9 @@ entries again, so entries should be stored idempotently (by `seq` or message ID)
 
 | Entry `kind` | Fields | Meaning |
 | --- | --- | --- |
-| `create` | `channel_id`, `guild_id`, `message` | A new message |
-| `update` | `channel_id`, `guild_id`, `message_id`, changed `content` / `edited_at_ms` / `attachments`, `previous` | An edit. Embed refreshes and reactions are not journaled. |
-| `delete` | `channel_id`, `guild_id`, `message_id`, `bulk`, `previous` | A deletion, one entry per ID of a bulk delete |
+| `create` | `channel_id`, `guild_id`, `conversation`, `message` | A new message |
+| `update` | `channel_id`, `guild_id`, `conversation`, `message_id`, changed `content` / `edited_at_ms` / `attachments`, `previous` | An edit. Embed refreshes and reactions are not journaled. |
+| `delete` | `channel_id`, `guild_id`, `conversation`, `message_id`, `bulk`, `previous` | A deletion, one entry per ID of a bulk delete |
 | `gap` | `reason`: `overflow` with `dropped`, or `pruned` with `from_seq` / `to_seq` | Entries were lost: the host fell behind, or the journal's bounds removed entries before this plugin read them |
 | `session_started` | none | A new gateway session began; anything while disconnected or closed is not journaled |
 | `missed` | `channel_id`, `after_message_id`, `latest_message_id` | At a new session, a channel's latest message is newer than the last one journaled |
@@ -670,6 +670,13 @@ A `message` holds `id`, `author` (`id`, `name`, `nick`, `bot`, `webhook`), `cont
 `created_at_ms`, `edited_at_ms`, `type`, `flags`, `reply_to`, `forwarded`, embed and
 sticker counts, and `attachments` (`id`, `filename`, `content_type`, `size`, `url`,
 `proxy_url`). An entry over 64 KiB drops attachment details and sets `truncated`.
+
+`conversation` is what Serein knew about the channel when it recorded the entry, or
+`null` when the channel was not loaded: `type` (the Discord channel type, such as `1`
+for a DM and `3` for a group chat), `name`, `parent_id` (a thread's channel or a
+channel's category), and `guild_name` in servers or up to 10 `recipients` (`id`,
+`name`) without one. An archive can scope entries by server, channel, group chat or DM
+and keep their names after access is lost.
 
 `previous` is the version Serein held in memory: the open conversation's loaded
 messages. For other conversations it is `null`; a plugin that stores each `create`

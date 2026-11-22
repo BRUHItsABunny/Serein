@@ -68,6 +68,38 @@ fn guild(state: &State, channel: Id) -> Option<String> {
 		.map(|guild| guild.0.to_string())
 }
 
+/// Recipients a guildless conversation lists in an entry.
+const MAX_RECIPIENTS: usize = 10;
+
+/// What the host knows about the conversation an entry belongs to, so an archive can scope
+/// and label it after access is gone: the Discord channel type, its name, a thread's
+/// parent, the server's name and, without a server, up to ten recipients. `null` when the
+/// channel is not loaded.
+fn conversation(state: &State, channel: Id) -> Value {
+	let Some(channel) = state.channel(channel) else {
+		return Value::Null;
+	};
+	let mut value = json!({
+		"type": channel.kind,
+		"name": channel.name,
+		"parent_id": channel.parent_id.map(|parent| parent.0.to_string()),
+	});
+	match channel.guild {
+		Some(guild) => {
+			value["guild_name"] = state.guild(guild).map(|guild| guild.name.as_str()).into();
+		}
+		None => {
+			value["recipients"] = channel
+				.recipients
+				.iter()
+				.take(MAX_RECIPIENTS)
+				.map(|user| json!({ "id": user.id.0.to_string(), "name": user.name }))
+				.collect();
+		}
+	}
+	value
+}
+
 fn millis(nanos: i128) -> i64 {
 	(nanos / 1_000_000) as i64
 }
@@ -153,6 +185,7 @@ fn update(state: &State, patch: &MessagePatch) -> Option<String> {
 			"kind": "update",
 			"channel_id": patch.channel.0.to_string(),
 			"guild_id": guild(state, patch.channel),
+			"conversation": conversation(state, patch.channel),
 			"message_id": patch.id.0.to_string(),
 			"previous": prior.map(|message| self::message(message, detailed)),
 		});
@@ -176,6 +209,7 @@ fn delete(state: &State, channel: Id, id: Id, bulk: bool) -> Option<String> {
 			"kind": "delete",
 			"channel_id": channel.0.to_string(),
 			"guild_id": guild(state, channel),
+			"conversation": conversation(state, channel),
 			"message_id": id.0.to_string(),
 			"bulk": bulk,
 			"previous": prior.map(|message| self::message(message, detailed)),
@@ -201,6 +235,7 @@ pub fn capture(state: &State, event: &Event) -> Vec<Record> {
 					"kind": "create",
 					"channel_id": created.channel.0.to_string(),
 					"guild_id": guild(state, created.channel),
+					"conversation": conversation(state, created.channel),
 					"message": message(created, detailed),
 				})
 			})
@@ -925,6 +960,27 @@ mod tests {
 		assert_eq!(*latest, Some((20, 1001)));
 		let created: Value = serde_json::from_str(body).unwrap();
 		assert_eq!(created["message"]["content"], "before");
+		// The conversation travels with the entry, so archives can scope and name it.
+		let channel = state.channel(Id(20)).unwrap();
+		assert_eq!(created["conversation"]["type"], channel.kind);
+		assert_eq!(created["conversation"]["name"], channel.name.as_str());
+		let guild = channel.guild.and_then(|guild| state.guild(guild)).unwrap();
+		assert_eq!(created["conversation"]["guild_name"], guild.name.as_str());
+		let direct = state
+			.channels
+			.iter()
+			.find(|channel| channel.guild.is_none() && !channel.recipients.is_empty())
+			.unwrap();
+		let mut message = test_support::message(1003, direct.id);
+		message.content = "dm".into();
+		let dm: Value =
+			serde_json::from_str(&capture(&state, &Event::Message(message))[0].clone_body())
+				.unwrap();
+		assert!(dm["guild_id"].is_null() && dm["conversation"]["guild_name"].is_null());
+		assert_eq!(
+			dm["conversation"]["recipients"][0]["id"],
+			direct.recipients[0].id.0.to_string()
+		);
 
 		let mut patch = MessagePatch {
 			poll: Patch::Absent,
@@ -978,6 +1034,10 @@ mod tests {
 		assert_eq!(unknown.len(), 2);
 		let first: Value = serde_json::from_str(&unknown[0].clone_body()).unwrap();
 		assert!(first["previous"].is_null() && first["bulk"] == true);
+		assert!(
+			first["conversation"].is_null(),
+			"an unloaded channel has no details"
+		);
 		// Oversized messages keep their text but drop attachment details.
 		let mut huge = test_support::message(1002, Id(20));
 		huge.attachments = (0..2_000)

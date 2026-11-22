@@ -423,6 +423,8 @@ pub mod journal {
 			channel_id: String,
 			#[serde(default)]
 			guild_id: Option<String>,
+			#[serde(default)]
+			conversation: Option<Conversation>,
 			message: Message,
 		},
 		/// An edit. Changed fields are present; `previous` is the version the host held,
@@ -431,6 +433,8 @@ pub mod journal {
 			channel_id: String,
 			#[serde(default)]
 			guild_id: Option<String>,
+			#[serde(default)]
+			conversation: Option<Conversation>,
 			message_id: String,
 			#[serde(default)]
 			content: Option<String>,
@@ -446,6 +450,8 @@ pub mod journal {
 			channel_id: String,
 			#[serde(default)]
 			guild_id: Option<String>,
+			#[serde(default)]
+			conversation: Option<Conversation>,
 			message_id: String,
 			#[serde(default)]
 			bulk: bool,
@@ -473,10 +479,41 @@ pub mod journal {
 		},
 		/// A channel was created or its details changed.
 		ChannelChanged { channel_id: String },
+		/// These channels were readable before an event and are not after it, in one server
+		/// (`None` for direct conversations).
+		AccessLost {
+			#[serde(default)]
+			guild_id: Option<String>,
+			channel_ids: Vec<String>,
+		},
 		/// Which conversations the account can read may have changed.
 		AccessChanged,
 		#[serde(other)]
 		Other,
+	}
+
+	/// What the host knew about an entry's channel when it recorded the entry.
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Conversation {
+		/// Discord channel type: `1` a DM, `3` a group chat, `11`/`12` threads, others in servers.
+		#[serde(rename = "type")]
+		pub kind: u8,
+		#[serde(default)]
+		pub name: String,
+		/// A thread's channel, or a server channel's category.
+		#[serde(default)]
+		pub parent_id: Option<String>,
+		#[serde(default)]
+		pub guild_name: Option<String>,
+		/// Up to 10 members of a DM or group chat.
+		#[serde(default)]
+		pub recipients: Vec<Recipient>,
+	}
+
+	#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+	pub struct Recipient {
+		pub id: String,
+		pub name: String,
 	}
 
 	/// The archived form of a message.
@@ -602,7 +639,7 @@ pub mod journal {
 			let batch = parse(
 				br#"{"entries":[
 				{"seq":1,"at_ms":5,"kind":"create","channel_id":"2","guild_id":null,"message":{"id":"3","author":{"id":"4","name":"a","nick":null,"bot":false,"webhook":false},"content":"hi","created_at_ms":9,"edited_at_ms":null,"type":0,"flags":0,"reply_to":null,"forwarded":false,"embeds":0,"stickers":0,"attachments":[]}},
-				{"seq":2,"at_ms":6,"kind":"delete","channel_id":"2","guild_id":"7","message_id":"3","bulk":false,"previous":null},
+				{"seq":2,"at_ms":6,"kind":"delete","channel_id":"2","guild_id":"7","conversation":{"type":0,"name":"general","parent_id":"8","guild_name":"S"},"message_id":"3","bulk":false,"previous":null},
 				{"seq":3,"at_ms":6,"kind":"gap","reason":"pruned","from_seq":3,"to_seq":3},
 				{"seq":4,"at_ms":7,"kind":"from_a_newer_host","x":1}
 			],"more":true}"#,
@@ -614,7 +651,14 @@ pub mod journal {
 			);
 			assert!(matches!(
 				&batch.entries[1].kind,
-				EntryKind::Delete { previous: None, .. }
+				EntryKind::Delete { previous: None, conversation: Some(c), .. } if c.parent_id.as_deref() == Some("8")
+			));
+			assert!(matches!(
+				&batch.entries[0].kind,
+				EntryKind::Create {
+					conversation: None,
+					..
+				}
 			));
 			assert!(matches!(
 				&batch.entries[2].kind,
