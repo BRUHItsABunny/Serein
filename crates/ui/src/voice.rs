@@ -423,17 +423,25 @@ impl MessagingUi {
 	/// Everyone in a voice channel the account can view, as the client shows them: the
 	/// resolved display name when the member is loaded, the shown mute and deafen flags,
 	/// and whether the speaking indicator is lit. Channels without a positive view grant
-	/// are left out, like the directory. For plugin snapshots; no audio data leaves this
-	/// summary.
+	/// are left out, like the directory. The active call's channel comes first, so callers
+	/// that cap the rows never drop the call on busy accounts. For plugin snapshots; no
+	/// audio data leaves this summary.
 	pub fn voice_roster<'a>(
 		&'a self,
 		state: &'a State,
 	) -> impl Iterator<Item = VoiceRosterRow<'a>> + 'a {
+		// The roster is kept in update order, so the call just joined sits at the end.
+		let call = state.voice.active.as_ref().map(|call| call.channel);
+		let rows = &state.voice.roster;
+		let ordered = rows
+			.iter()
+			.filter(move |entry| Some(entry.channel) == call)
+			.chain(rows.iter().filter(move |entry| Some(entry.channel) != call));
 		// Snapshots and the change key walk every row each frame, so rows needing the
 		// member fallback share one index of the loaded list. It is built on first use:
 		// rows filtered out or already carrying their member never pay for it.
 		let mut index = None;
-		state.voice.roster.iter().filter_map(move |entry| {
+		ordered.filter_map(move |entry| {
 			if !state.can_view(entry.channel) {
 				return None;
 			}
@@ -3208,7 +3216,7 @@ impl MessagingUi {
 			(
 				InputProfile::VoiceIsolation,
 				"Voice Isolation",
-				"RNNoise suppression, echo cancellation and automatic gain for speech.",
+				"Automatic noise suppression, echo cancellation and automatic gain for speech.",
 			),
 			(
 				InputProfile::Studio,
@@ -3231,6 +3239,12 @@ impl MessagingUi {
 			{
 				self.voice_processing.profile = profile;
 			}
+		}
+		let fell_back = "RNNoise is active: this device is too busy for DeepFilterNet.";
+		if self.voice_processing.profile == InputProfile::VoiceIsolation
+			&& self.voice_suppression_fell_back
+		{
+			design::hint(ui, fell_back);
 		}
 		if self.voice_processing.profile == InputProfile::Custom {
 			design::card_divider(ui);
@@ -3279,9 +3293,11 @@ impl MessagingUi {
 			}
 			design::card_divider(ui);
 			let choices = [
+				(NoiseSuppression::Auto, "Automatic"),
 				(NoiseSuppression::Off, "Off"),
 				(NoiseSuppression::RnNoise, "RNNoise"),
 				(NoiseSuppression::WebRtc, "WebRTC"),
+				(NoiseSuppression::DeepFilterNet, "DeepFilterNet"),
 			];
 			design::row(
 				ui,
@@ -3309,7 +3325,22 @@ impl MessagingUi {
 						});
 				},
 			);
-			if processing.suppression == NoiseSuppression::WebRtc {
+			if processing.suppression == NoiseSuppression::Auto {
+				design::hint(
+					ui,
+					if self.voice_suppression_fell_back {
+						fell_back
+					} else {
+						"Uses DeepFilterNet, and RNNoise when this device is too busy for it."
+					},
+				);
+			}
+			// RNNoise has no strength, so the control waits while it stands in.
+			if match processing.suppression {
+				NoiseSuppression::WebRtc | NoiseSuppression::DeepFilterNet => true,
+				NoiseSuppression::Auto => !self.voice_suppression_fell_back,
+				NoiseSuppression::Off | NoiseSuppression::RnNoise => false,
+			} {
 				ui.add_space(6.0);
 				let strength = ["Low", "Moderate", "High", "Very high"];
 				design::row(

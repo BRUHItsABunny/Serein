@@ -610,6 +610,14 @@ message storage; source channels/messages are never fetched. Existing rows retai
 their content and default to ordinary messages until refreshed. Schema-15 binaries
 cannot reopen this upgraded cache.
 
+Forward sources (schema 29, no version change): a nullable `forward_origin` JSON column, at
+most 128 bytes, keeps the source server, channel and message IDs from a forward's type-1
+`message_reference` so cached forwards keep their "server · time" source line. Only forwarded
+rows keep one; a malformed or zero-ID value, or one on another row, loads as absent. Rows cached
+before the column, or by older binaries that still open this schema, show no source line until
+refreshed. The source is never fetched: the line names only joined servers and loaded
+conversations, and opens the message through the existing chat-link navigation.
+
 Channel preferences (September 21, schema 15): favorites, pins and collapsed categories are
 device-local, account-isolated SQLite preferences. Pins cover home DMs. Favorites cover guild
 channels. All three lists together contain at most 256 IDs,
@@ -854,6 +862,11 @@ no audio is retained. Preview levels remain session-only.
 
 Loaded thread navigation shares the 4,000-entry account navigation and 4 MiB normalized navigation budgets. Incoming thread syncs additionally cap combined parent/thread entries at 4,000 and normalized snapshot metadata at 2 MiB; wire JSON remains capped at 4 MiB. Removed-member arrays are capped at 4,000 and are discarded after checking the owner. Navigation/member lists are session-only; selected thread messages/drafts reuse existing account history/draft storage. Actual accepted thread removals delete only those threads' cached history, preserving drafts; ignored, empty-scope and rename-only events do not clear disk history.
 
+Draft undo snapshots stay in memory for the active composer. They use egui's
+bounded undo stack and are discarded when the conversation or session changes.
+Undo can restore submitted text to the draft without changing the pending or
+sent message. Ordinary draft persistence applies after the user restores text.
+
 The owner explicitly withdrew the no-storage policy on 2026-09-09. Local files, SQLite, saved drafts, settings and caches are permitted. The implementation persists **history with embeds, attachments and mentioned users; avatar/server-icon/banner/preview images; drafts; appearance; reading/layout preferences; and the login token**. Normal window size and supported outer position are retained in the bounded device-local app_preferences singleton.
 
 | Data | Location / bound | Removal |
@@ -1019,7 +1032,7 @@ Conversation search queries and result snippets are session-only, limited to one
 
 Archived-thread pages share the same exclusive read/result slot with search and pins. At most 25 channel summaries / 64 KiB are retained from a response capped at 512 KiB; member payloads are ignored. Request/next cursors are fixed-size timestamps or IDs. Pages and cursors are not persisted. Opening admits one transient channel within existing account item/byte navigation limits, then uses ordinary bounded history caching. Leaving retires transient navigation, not saved drafts or cached history; explicit revocation still invalidates inaccessible content. No archive directory cache, background paging or added worker queue exists.
 
-Pinned-message summaries share search's single session-only 25-item / 64 KiB result slot and 512 KiB response limit. Manual older-page navigation replaces that slot instead of accumulating results; two optional fixed-size timestamp cursors track the request and next page. Failed older requests can be retried deliberately, with no background retry. Opening a result uses ordinary bounded history caching; pin snapshots/cursors are not written to SQLite. PR screenshots are synthetic development evidence and are excluded from packaged documentation.
+Pinned-message summaries share search's single session-only 25-item / 256 KiB result slot and 512 KiB response limit. Manual older-page navigation replaces that slot instead of accumulating results; two optional fixed-size timestamp cursors track the request and next page. Failed older requests can be retried deliberately, with no background retry. Opening a result uses ordinary bounded history caching; pin snapshots/cursors are not written to SQLite. PR screenshots are synthetic development evidence and are excluded from packaged documentation.
 
 Uploads do not persist local source paths, signed staging targets or file bytes. Pending filename/size labels remain bounded session metadata; existing recovery drafts retain only composed text, so retrying an attachment requires selecting the source again. Files are opened for reading and checked for observable size/modification changes; this is not an immutable snapshot guarantee. Cancellation stops the local job, but bytes already uploaded to Discord staging may remain there without a created message; no remote cleanup or retention guarantee is claimed. Completed messages and their returned attachment metadata can enter the existing bounded history cache. The OS file picker may retain OS-managed recent-location history. No new application log or hidden upload recovery store is introduced.
 

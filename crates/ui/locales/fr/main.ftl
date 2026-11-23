@@ -311,7 +311,14 @@ attachments-media-menu-unavailable-for-synthetic-attachments = Indisponible pour
 # Context: open_original
 attachments-open-original-open-original = Ouvrir l'original…
 # Context: pending_card
+attachments-mark-spoiler = Marquer la pièce jointe comme spoiler
+attachments-remove-spoiler = Retirer le marquage spoiler
+attachments-spoiler-label = Spoiler
 attachments-pending-card-remove-attachment = Supprimer la pièce jointe
+# Context: pending_viewer
+attachments-pending-viewer-full-size-unavailable = Aperçu en taille réelle indisponible
+attachments-pending-viewer-loading = Chargement de l’image en taille réelle…
+attachments-pending-viewer-close = Fermer (Esc)
 attachments-loading-card-preparing = Préparation…
 # Context: show_status
 attachments-show-status-cancel-download = Annuler le téléchargement
@@ -4936,3 +4943,8 @@ moderation-confirm-ban = Bannir
 ## crates/ui/src/interface_ui.rs
 # Context: interface_tree
 interface-ui-empty = Ce module n'a encore rien à afficher.
+
+group-add-title = Ajouter des amis au DM
+group-add-subtitle = Choisissez un ami à ajouter à ce groupe.
+group-add-full = Ce groupe a atteint la limite de 10 personnes.
+group-add-confirm = Ajouter un ami

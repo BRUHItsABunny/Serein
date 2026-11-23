@@ -374,6 +374,8 @@ pub struct MessagingUi {
 	/// Local render filters only; neither changes relationships nor service-side read state.
 	pub hide_blocked_messages: bool,
 	pub hide_ignored_messages: bool,
+	/// Server tags stay in profiles and lists; this only leaves them out of message headers.
+	pub hide_chat_server_tags: bool,
 	pub show_hidden_channels: bool,
 	/// Folds the home list's message requests away; the device preference restores it.
 	pub message_requests_collapsed: bool,
@@ -474,6 +476,19 @@ pub struct MessagingUi {
 	pub attachment_previews: Vec<Option<std::sync::Arc<egui::ColorImage>>>,
 	/// GPU copies of `attachment_previews`, keyed by the pixel buffer they were uploaded from.
 	attachment_textures: Vec<Option<(usize, egui::TextureHandle)>>,
+	/// Staged file the user opened full size; the app decodes it into `attachment_view_image`.
+	pub attachment_view_open: Option<usize>,
+	/// Stable upload selection keys, in the same order as `attachment_files`.
+	pub attachment_keys: Vec<u64>,
+	/// Spoiler state in selection order, projected from the native upload sources.
+	pub attachment_spoilers: Vec<bool>,
+	pub attachment_spoiler_requests: std::collections::BTreeMap<u64, bool>,
+	attachment_view_file: Option<(String, u64, Option<u64>)>,
+	pub attachment_view_image: Option<(usize, Option<std::sync::Arc<egui::ColorImage>>)>,
+	/// Conversation the open viewer belongs to, so switching leaves it behind.
+	attachment_view_scope: Option<(u64, Option<Id>)>,
+	/// GPU copy of the full-size decode above.
+	attachment_view_texture: Option<(usize, egui::TextureHandle)>,
 	pub attach_requested: bool,
 	pub host_attachment_requested: Option<usize>,
 	pub attachment_paste_requested: Option<AttachmentPaste>,
@@ -563,6 +578,8 @@ pub struct MessagingUi {
 	pub voice_refresh_devices: bool,
 	pub voice_device_status: &'static str,
 	pub voice_microphone_unavailable: bool,
+	/// The running call or microphone test moved automatic suppression to RNNoise.
+	pub voice_suppression_fell_back: bool,
 	pub voice_push_to_talk: bool,
 	/// Device-local voice intent, retained between calls and restarts.
 	pub voice_muted: bool,
@@ -629,6 +646,8 @@ pub struct MessagingUi {
 	ime_active: bool,
 	/// A composer picker pick returns focus to the draft next frame, once its click is over.
 	refocus_composer: bool,
+	/// The one draft undo history held by the composer.
+	composer_undo: Option<(u64, Id, egui::Id)>,
 	/// Enter the input method passed on after finishing a composition, replayed next frame.
 	ime_enter: Option<egui::Event>,
 	/// The composer claimed Tab last frame, so egui left it in the input for a suggestion menu.
@@ -980,6 +999,8 @@ impl MessagingUi {
 			self.attachment = Some((filename.to_owned(), bytes));
 		}
 		self.attachment_files.push((filename.to_owned(), bytes));
+		self.attachment_spoilers
+			.push(filename.starts_with("SPOILER_"));
 		self.attachment_previews
 			.resize(self.attachment_files.len() - 1, None);
 		self.attachment_previews
@@ -991,6 +1012,14 @@ impl MessagingUi {
 			self.attachment.iter().cloned().collect()
 		} else {
 			self.attachment_files.clone()
+		}
+	}
+	fn toggle_attachment_spoiler(&mut self, index: usize, file_count: usize) {
+		self.attachment_spoilers.resize(file_count, false);
+		let spoiler = &mut self.attachment_spoilers[index];
+		*spoiler = !*spoiler;
+		if let Some(key) = self.attachment_keys.get(index) {
+			self.attachment_spoiler_requests.insert(*key, *spoiler);
 		}
 	}
 	/// Textures for `attachment_previews`, uploaded once per pixel buffer and reused per frame.
@@ -1022,6 +1051,88 @@ impl MessagingUi {
 			})
 			.collect()
 	}
+	/// Clears a viewer whose conversation or selected file changed, before requesting a decode.
+	pub fn validate_attachment_view(&mut self, state: &State) {
+		let valid = self.attachment_view_open.is_some_and(|index| {
+			self.attachment_view_scope == Some((state.generation, state.selected))
+				&& self
+					.selected_files()
+					.get(index)
+					.is_some_and(|(name, bytes)| {
+						self.attachment_view_file.as_ref()
+							== Some(&(
+								name.clone(),
+								*bytes,
+								self.attachment_keys.get(index).copied(),
+							))
+					})
+		});
+		if !valid {
+			self.attachment_view_open = None;
+			self.attachment_view_scope = None;
+			self.attachment_view_file = None;
+			self.attachment_view_image = None;
+			self.attachment_view_texture = None;
+		}
+	}
+	/// Full-size look at one staged image; the tray thumbnail shows until the decode lands.
+	fn attachment_viewer(&mut self, ctx: &egui::Context, state: &State) {
+		self.validate_attachment_view(state);
+		let Some(index) = self.attachment_view_open else {
+			return;
+		};
+		let (filename, _) = self.selected_files()[index].clone();
+		let decoded = self
+			.attachment_view_image
+			.as_ref()
+			.filter(|(current, _)| *current == index)
+			.map(|(_, image)| image.clone());
+		let failed = matches!(decoded, Some(None));
+		// A staged file the app never received has no decode to wait for: the offline fixtures
+		// stage pixels only, so their thumbnail is the whole picture instead of a stuck spinner.
+		let decodable = self
+			.attachment_view_file
+			.as_ref()
+			.is_some_and(|(_, _, key)| key.is_some());
+		let loading = decoded.is_none() && decodable;
+		let full = decoded.flatten();
+		let texture = match full {
+			Some(image) => {
+				let key = std::sync::Arc::as_ptr(&image) as usize;
+				if self
+					.attachment_view_texture
+					.as_ref()
+					.is_none_or(|(current, _)| *current != key)
+				{
+					let handle = ctx.load_texture(
+						"attachment-view",
+						egui::ImageData::Color(image),
+						egui::TextureOptions::LINEAR,
+					);
+					self.attachment_view_texture = Some((key, handle));
+				}
+				self.attachment_view_texture
+					.as_ref()
+					.map(|(_, handle)| handle.clone())
+			}
+			None => {
+				self.attachment_view_texture = None;
+				None
+			}
+		};
+		let thumbnail = self.attachment_textures(ctx).get(index).cloned().flatten();
+		if attachments::pending_viewer(
+			ctx,
+			&filename,
+			texture.or(thumbnail).as_ref(),
+			failed,
+			loading,
+		) {
+			self.attachment_view_open = None;
+			self.attachment_view_scope = None;
+			self.attachment_view_texture = None;
+		}
+	}
 	/// Moves staged files and thumbnails into the optimistic row for `command`.
 	pub fn stage_pending_upload(&mut self, ctx: &egui::Context, command: &Command) {
 		let files = self.selected_files();
@@ -1034,12 +1145,25 @@ impl MessagingUi {
 				files: files
 					.into_iter()
 					.zip(textures)
-					.map(|((_, bytes), preview)| pending::UploadFile { bytes, preview })
+					.enumerate()
+					.map(|(index, ((_, bytes), preview))| {
+						let spoiler = self
+							.attachment_spoilers
+							.get(index)
+							.copied()
+							.unwrap_or_default();
+						pending::UploadFile {
+							bytes,
+							preview: preview.filter(|_| !spoiler),
+							spoiler,
+						}
+					})
 					.collect(),
 				progress: None,
 			});
 			self.attachment = None;
 			self.attachment_files.clear();
+			self.attachment_spoilers.clear();
 			self.attachment_previews.clear();
 			self.attachment_textures.clear();
 			self.upload_busy = true;
@@ -1350,6 +1474,7 @@ impl MessagingUi {
 			// Device-level chat filters belong to the device, not to the account being cleared.
 			hide_blocked_messages: self.hide_blocked_messages,
 			hide_ignored_messages: self.hide_ignored_messages,
+			hide_chat_server_tags: self.hide_chat_server_tags,
 			startup_enabled: self.startup_enabled,
 			startup_minimized: self.startup_minimized,
 			startup_available: self.startup_available,
@@ -3090,6 +3215,28 @@ impl MessagingUi {
 							shortcuts_available,
 						),
 					);
+					let slots = state.group_dm_slots(c.id);
+					let available = slots.is_some_and(|slots| slots > 0)
+						&& (state.demo || state.gateway_connected)
+						&& !state.group_action_pending();
+					let button = ui
+						.add_enabled_ui(available, |ui| {
+							icons::button(
+								ui,
+								icons::Icon::AddPeople,
+								32.0,
+								&crate::i18n::translate("group-add-title"),
+							)
+						})
+						.inner;
+					if slots == Some(0) {
+						button
+							.clone()
+							.on_disabled_hover_text(crate::i18n::translate("group-add-full"));
+					}
+					if button.clicked() {
+						self.new_message.open_for_group(state, c.id);
+					}
 				}
 				if state.selected.is_some() && !selected_voice {
 					if self.search.open && !self.search.pins() {
@@ -3449,6 +3596,21 @@ impl MessagingUi {
 				.map(|(name, _)| name.as_str())
 				.collect::<Vec<_>>(),
 		) {
+			// Start the next draft at an empty checkpoint. Undo can recall the
+			// submitted text locally without changing delivery or attachments.
+			if let Some((generation, target, editor)) = self.composer_undo
+				&& generation == state.generation
+				&& target == channel
+				&& let Some(mut editor_state) = egui::TextEdit::load_state(ctx, editor)
+			{
+				editor_state
+					.cursor
+					.set_char_range(Some(egui::text::CCursorRange::one(
+						egui::text::CCursor::new(0),
+					)));
+				editor_state.checkpoint_undo("");
+				editor_state.store(ctx, editor);
+			}
 			// Consume this selection once, before desktop dispatch.
 			self.stage_pending_upload(ctx, &command);
 			self.timeline.follow_latest(state);
@@ -3536,6 +3698,20 @@ impl MessagingUi {
 			});
 		ui.add_space(8.0);
 	}
+	fn clear_inactive_composer_undo(
+		&mut self,
+		ctx: &egui::Context,
+		generation: u64,
+		channel: Option<Id>,
+	) {
+		if let Some((owner, target, editor)) = self.composer_undo
+			&& (owner != generation || channel != Some(target))
+		{
+			egui::text_edit::TextEditState::default().store(ctx, editor);
+			self.composer_undo = None;
+		}
+	}
+
 	fn composer(
 		&mut self,
 		ui: &mut egui::Ui,
@@ -3544,6 +3720,7 @@ impl MessagingUi {
 		ctx: &egui::Context,
 		commands: &mut Vec<Command>,
 	) {
+		self.clear_inactive_composer_undo(ctx, state.generation, Some(channel));
 		let had_edit = self.editing.is_some();
 		self.reconcile_edit(state);
 		let closed_here = self.edit_closed_channel.take() == Some(channel);
@@ -3954,8 +4131,21 @@ impl MessagingUi {
 		if focus_composer || typed || refocus {
 			ctx.memory_mut(|m| m.request_focus(composer_id));
 		}
-		if focus_edit || (focus_composer && !editing_here) {
-			let mut edit_state = egui::text_edit::TextEditState::default();
+		let new_undo_scope =
+			!editing_here && self.composer_undo != Some((state.generation, channel, composer_id));
+		if new_undo_scope
+			&& let Some((_, _, previous)) =
+				self.composer_undo
+					.replace((state.generation, channel, composer_id))
+		{
+			egui::text_edit::TextEditState::default().store(ctx, previous);
+		}
+		if new_undo_scope || focus_edit || (focus_composer && !editing_here) {
+			let mut edit_state = if new_undo_scope || focus_edit {
+				egui::text_edit::TextEditState::default()
+			} else {
+				egui::text_edit::TextEditState::load(ctx, composer_id).unwrap_or_default()
+			};
 			let text = if editing_here {
 				self.editing
 					.as_ref()
@@ -3968,6 +4158,9 @@ impl MessagingUi {
 				.set_char_range(Some(egui::text::CCursorRange::one(
 					egui::text::CCursor::end_of_str(text),
 				)));
+			if new_undo_scope {
+				edit_state.checkpoint_undo(text);
+			}
 			edit_state.store(ctx, composer_id);
 		}
 		let paste_allowed = keyboard_enabled
@@ -4153,7 +4346,7 @@ impl MessagingUi {
                     egui::pos2(ui.max_rect().right() + 10.0, ui.max_rect().top()),
                 );
                 if !editing_here && (self.attachment.is_some() || self.attachment_loading > 0) {
-                    self.attachment_tray(ui, state.can_send(channel), upload_limit);
+                    self.attachment_tray(ui, state, state.can_send(channel), upload_limit);
                 }
                 // Tall drafts stack the actions in bottom-aligned columns so the text keeps the
                 // width. Last pass's visible draft height decides.
@@ -4582,6 +4775,13 @@ impl MessagingUi {
                         let edit = output.response;
                         let cleared = draft.is_empty();
                         if edit.changed() || mention_changed {
+                            // Record actual draft changes immediately. An idle timeout would
+                            // combine rapid edits and can lose the final text when Send clears it.
+                            if !self.ime_active
+                                && let Some(editor) = egui::TextEdit::load_state(ctx, composer_id)
+                            {
+                                editor.checkpoint_undo(draft);
+                            }
                             if editing_here && let Some((_, _, modified)) = &mut self.edit_modified {
                                 *modified = true;
                             }
@@ -4712,7 +4912,13 @@ impl MessagingUi {
 		}
 	}
 	/// Selected-file cards above the composer input, in the style of Discord's upload tray.
-	fn attachment_tray(&mut self, ui: &mut egui::Ui, can_host: bool, upload_limit: u64) {
+	fn attachment_tray(
+		&mut self,
+		ui: &mut egui::Ui,
+		state: &State,
+		can_host: bool,
+		upload_limit: u64,
+	) {
 		let colors = design::palette(ui);
 		let textures = self.attachment_textures(ui.ctx());
 		ui.add_space(4.0);
@@ -4730,7 +4936,7 @@ impl MessagingUi {
 					for (index, (filename, bytes)) in files.iter().enumerate() {
 						ui.push_id(index, |ui| {
 							ui.vertical(|ui| {
-								if ui
+								match ui
 									.scope(|ui| {
 										attachments::pending_card(
 											ui,
@@ -4738,11 +4944,33 @@ impl MessagingUi {
 											*bytes,
 											textures.get(index).and_then(Option::as_ref),
 											!self.upload_busy,
+											self.attachment_spoilers
+												.get(index)
+												.copied()
+												.unwrap_or_default(),
 										)
 									})
 									.inner
 								{
-									self.remove_attachment_index = Some(index);
+									attachments::PendingAction::Remove => {
+										self.remove_attachment_index = Some(index);
+										self.attachment_view_open = None;
+										self.attachment_view_scope = None;
+									}
+									attachments::PendingAction::Preview => {
+										self.attachment_view_file = Some((
+											filename.clone(),
+											*bytes,
+											self.attachment_keys.get(index).copied(),
+										));
+										self.attachment_view_open = Some(index);
+										self.attachment_view_scope =
+											Some((state.generation, state.selected));
+									}
+									attachments::PendingAction::ToggleSpoiler => {
+										self.toggle_attachment_spoiler(index, files.len());
+									}
+									attachments::PendingAction::None => {}
 								}
 								if *bytes > upload_limit
 									&& ui
@@ -5135,6 +5363,7 @@ impl MessagingUi {
 	/// Draws one frame of the signed-in client and returns the commands it produced for the
 	/// service layer.
 	pub fn show(&mut self, ui: &mut egui::Ui, state: &mut State) -> Vec<Command> {
+		self.clear_inactive_composer_undo(ui.ctx(), state.generation, state.selected);
 		interface_tweaks::publish(ui.ctx(), &self.interface_tweaks);
 		rtl::scope(
 			ui.ctx(),
@@ -5232,6 +5461,7 @@ impl MessagingUi {
 		}
 		self.timeline.audio.seen = false;
 		self.timeline.video.seen = false;
+		self.timeline.video.position_shown = false;
 		let side = self.drain_side_press();
 		let mut commands = Vec::new();
 		commands.extend(cosmetics_refresh);
@@ -5647,7 +5877,12 @@ impl MessagingUi {
 		{
 			self.search.focus_conversation(channel, state);
 		}
-		self.search.sync(&ctx, state, &mut commands);
+		self.search.sync(
+			&ctx,
+			state,
+			&mut commands,
+			self.attachment_view_open.is_none(),
+		);
 		self.search.extension_actions = self.extensions.message_actions();
 		let search_open =
 			self.search.results_visible(state) && state.selected.is_some() && !selected_voice;
@@ -5941,8 +6176,11 @@ impl MessagingUi {
 						&self.channel_preferences,
 						self.shortcuts_available(state),
 					);
+					let mut toggle_spoiler = None;
 					let mut staged = forum::Staged {
 						files: &files,
+						spoilers: &self.attachment_spoilers,
+						toggle_spoiler: &mut toggle_spoiler,
 						textures: &textures,
 						choose: &mut self.attach_requested,
 						remove: &mut self.remove_attachment_index,
@@ -5957,6 +6195,9 @@ impl MessagingUi {
 						(&mut self.scroll, &mut staged, &mut self.avatars),
 						(&mut self.channel_menu, view),
 					);
+					if let Some(index) = toggle_spoiler {
+						self.toggle_attachment_spoiler(index, files.len());
+					}
 					return;
 				}
 				self.conversation(ui, state, channel, &mut commands, message_fill);
@@ -6063,6 +6304,8 @@ impl MessagingUi {
 				self.timeline.hide_media_links = self.reading_preferences.hide_media_links;
 				self.timeline.hide_blocked_messages = self.hide_blocked_messages;
 				self.timeline.hide_ignored_messages = self.hide_ignored_messages;
+				self.timeline.hide_server_tags =
+					self.hide_chat_server_tags || self.cosmetics.hide_clan_tags;
 				self.timeline.compact_messages = self.reading_preferences.compact_messages;
 				self.timeline.double_click_reaction = self
 					.reading_preferences
@@ -6366,6 +6609,7 @@ impl MessagingUi {
 		self.thread_create.show(&ctx, state, &mut commands);
 		self.new_message
 			.show(&ctx, state, &mut self.avatars, &mut commands);
+		self.attachment_viewer(&ctx, state);
 		self.screen.show(&ctx, state);
 		if let Some(id) = self.timeline.channel_reference_load.take()
 			&& state.channel(id).is_none()
@@ -7840,6 +8084,7 @@ mod composer_tests {
 					reply_deleted: false,
 					interaction: None,
 					forwarded: false,
+					forward_origin: None,
 					unsupported: false,
 					extra_content: Default::default(),
 					components: vec![],
@@ -7887,6 +8132,68 @@ mod composer_tests {
 		// These tests are about sending; the typing indicator has its own test.
 		commands.retain(|command| !matches!(command, Command::Typing { .. }));
 		commands
+	}
+
+	#[test]
+	fn composer_undo_keeps_recent_edits_and_recalls_submitted_text() {
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let channel = state.selected.unwrap();
+		state.drafts.remove(&channel);
+		let mut view = MessagingUi {
+			focus_switched_composer: true,
+			..Default::default()
+		};
+		edit_frame(&ctx, &mut view, &mut state, vec![]);
+		let shortcut = |key| egui::Event::Key {
+			key,
+			physical_key: None,
+			pressed: true,
+			repeat: false,
+			modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+		};
+		for text in ["hello", " world"] {
+			edit_frame(
+				&ctx,
+				&mut view,
+				&mut state,
+				vec![egui::Event::Text(text.into())],
+			);
+		}
+		edit_frame(&ctx, &mut view, &mut state, vec![shortcut(egui::Key::Z)]);
+		assert_eq!(
+			state.drafts.get(&channel).map(String::as_str),
+			Some("hello")
+		);
+		edit_frame(&ctx, &mut view, &mut state, vec![shortcut(egui::Key::Y)]);
+		assert_eq!(state.drafts[&channel], "hello world");
+
+		let sent = edit_frame(
+			&ctx,
+			&mut view,
+			&mut state,
+			vec![edit_key(egui::Key::Enter)],
+		);
+		assert!(
+			matches!(sent.as_slice(), [Command::Send { content, .. }] if content == "hello world")
+		);
+		assert!(!state.drafts.contains_key(&channel));
+		edit_frame(
+			&ctx,
+			&mut view,
+			&mut state,
+			vec![egui::Event::Text("new draft".into())],
+		);
+		edit_frame(&ctx, &mut view, &mut state, vec![shortcut(egui::Key::Z)]);
+		assert!(!state.drafts.contains_key(&channel));
+		let undo = edit_frame(&ctx, &mut view, &mut state, vec![shortcut(egui::Key::Z)]);
+		assert!(undo.is_empty());
+		assert_eq!(state.drafts[&channel], "hello world");
+
+		state.generation += 1;
+		state.drafts.insert(channel, "another session".into());
+		edit_frame(&ctx, &mut view, &mut state, vec![shortcut(egui::Key::Z)]);
+		assert_eq!(state.drafts[&channel], "another session");
 	}
 
 	#[test]
@@ -8595,6 +8902,54 @@ mod composer_tests {
 		assert!(view.timeline.opening.is_some());
 		frame(&mut view, &mut state, vec![edit_key(egui::Key::Escape)]);
 		assert!(view.timeline.opening.is_none());
+	}
+
+	#[test]
+	fn staged_viewer_escape_preserves_background_search() {
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let mut view = MessagingUi::default();
+		let frame = |view: &mut MessagingUi, state: &mut State, events| {
+			let output = ctx.run_ui(
+				egui::RawInput {
+					screen_rect: Some(egui::Rect::from_min_size(
+						egui::Pos2::ZERO,
+						egui::vec2(1000.0, 700.0),
+					)),
+					events,
+					..Default::default()
+				},
+				|ui| {
+					view.show(ui, state);
+				},
+			);
+			output.drop_without_applying_deltas();
+		};
+		// The first frame adopts the selected conversation, which would close a search opened
+		// before it; open search only once the view follows the selection.
+		frame(&mut view, &mut state, vec![]);
+		view.search.open = true;
+		view.preview_attachment("synthetic.png", 1024, None);
+		view.attachment_view_file = Some(("synthetic.png".into(), 1024, None));
+		view.attachment_view_scope = Some((state.generation, state.selected));
+		view.attachment_view_open = Some(0);
+		for _ in 0..3 {
+			frame(&mut view, &mut state, vec![]);
+		}
+		assert!(view.attachment_view_open.is_some());
+		assert!(view.search.open);
+		frame(&mut view, &mut state, vec![edit_key(egui::Key::Escape)]);
+		assert!(
+			view.attachment_view_open.is_none(),
+			"Escape closes the staged viewer"
+		);
+		assert!(
+			view.search.open,
+			"Escape belongs to the staged viewer, not the search behind it"
+		);
+		// With the viewer closed, Escape returns to the search it was covering.
+		frame(&mut view, &mut state, vec![edit_key(egui::Key::Escape)]);
+		assert!(!view.search.open);
 	}
 
 	#[test]
@@ -10726,6 +11081,21 @@ mod composer_tests {
 		assert!(
 			ctx.memory(|memory| memory.focused().is_none()),
 			"the retained profile keeps focus instead of the destination composer"
+		);
+	}
+
+	#[test]
+	fn attachment_spoiler_requests_keep_the_latest_choice_for_each_file() {
+		let mut view = MessagingUi {
+			attachment_keys: vec![10, 11],
+			..Default::default()
+		};
+		view.toggle_attachment_spoiler(0, 2);
+		view.toggle_attachment_spoiler(1, 2);
+		view.toggle_attachment_spoiler(0, 2);
+		assert_eq!(
+			view.attachment_spoiler_requests,
+			std::collections::BTreeMap::from([(10, false), (11, true)])
 		);
 	}
 

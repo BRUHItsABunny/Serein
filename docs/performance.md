@@ -30,6 +30,52 @@ Recent synthetic/offline measurements are workload-specific. They do not establi
 performance, universal device results or application-wide memory bounds. The raw PR screenshot,
 log and per-run evidence archive has been removed; the summaries below retain the useful results.
 
+## DeepFilterNet in plain Rust — November 20, 2026
+
+`crates/deepfilternet` runs the DeepFilterNet3 weights without an inference runtime. It
+replaces the libDF/tract 0.22.5 runtime that PR #1085 vendored, and was compared with that
+runtime in one test binary before the runtime was removed. Apple M5 Pro, 24 GB, macOS
+27.2.1, Homebrew Rust 1.100 instead of the pinned 1.99.1, dev profile with both runtimes
+at `opt-level = 3` as development builds run them. No release package was built.
+
+A throwaway harness, not committed, timed each suppressor alone (no echo cancellation or
+gain) over 1,000 10 ms hops of synthetic noise, harmonic "speech" and silence, three
+rounds each. The worker runs two hops per 20 ms frame.
+
+| Metric, median of 3 rounds | libDF on tract 0.22.5 | `crates/deepfilternet` |
+| --- | ---: | ---: |
+| Per-hop median | 0.965 ms | 0.179 ms |
+| Per-hop p99 | 1.095 ms | 0.211 ms |
+| Start (decode and optimize networks / build state) | 289 ms | 0.14 ms |
+
+The port's slowest hop was 4.2 ms in the first round and 0.22 ms in later rounds: the first
+hops page the embedded weights in. Two hops per frame are about 1.8% of real time.
+
+Output parity over 9,000 hops (90 s) of synthetic noise, speech-like tones, clipping and
+digital silence, largest per-sample difference from the tract runtime:
+
+| Setting | Largest difference | Error energy / output energy |
+| --- | ---: | ---: |
+| High (no cap) | 3.6e-6 | 8.2e-14 |
+| Low (12 dB cap) | 2.4e-6 | 4.5e-14 |
+| Very high (post-filter) | 3.6e-5 | 7.1e-11 |
+
+The post-filter row differs more because the port also filters the 24 kHz bin, which
+libDF's four-bin loop skips. The network alone matched ONNX Runtime on the original model
+files within 1.5e-6 over 60 frames of unit-scale random features. Sparse features 300 and
+3,000 times larger, which force the filter decoder's direct path active, matched within
+6.2e-6 and 1.2e-4 on coefficients as large as 6.7 and 86.
+
+In `rust:1.99.1` Linux containers the crate's tests passed on arm64 and on x86_64 (emulated
+by Rosetta, so its timing is not representative). Per-hop medians there were 0.18–0.20 ms
+on arm64, and two minutes of digital silence ran at the same median as noise.
+
+The weights add 8,535,484 bytes to every executable; the tract runtime had added
+25,964,032 bytes to the Windows x64 release executable in PR #1085. The lockfile gains no
+third-party package. Release executable and package sizes, process memory, whole-app CPU,
+real x86 hardware, Windows, physical microphones, perceived quality and live calls are
+unmeasured. PR #903's SI-SDR table was measured on the tract runtime and not re-run.
+
 ## G-SYNC steady refresh offer — November 10, 2026
 
 Baseline `09bee5a` and this branch were built with the pinned Rust 1.99.1 toolchain and locked
@@ -2039,3 +2085,63 @@ copying the player's decode and palette loops (rustc 1.99.1), 25 frames of 160×
 
 Single runs on a shared desktop. Texture upload, GPU time, frame latency and whole-process CPU
 were not instrumented and are not claimed; other screens pay nothing for the feature.
+
+## Inline video without a ui pass per frame — November 23, 2026
+
+Before this change every decoded picture of a playing attachment asked egui for a repaint:
+the whole ui was laid out, tessellated and uploaded again 30–60 times a second to change
+one texture, and VideoToolbox's GPU surfaces were copied to memory and uploaded back. Now:
+
+- A new picture asks for a paint-only frame (egui fork patch 0029): the picture goes into
+  the texture the last pass drew, and that pass's meshes are presented again without logic,
+  ui, layout, tessellation or a vertex upload. Input, state changes and a visible seek bar
+  still get ordinary passes.
+- On macOS the converter samples the decoder's IOSurface planes in place
+  (`platform::video::Surface`); no plane passes through memory. Linux reuses the plane
+  buffer of the picture shown last instead of allocating one per frame.
+- The player sleeps until the next picture is due instead of polling every 5 ms, and runs
+  its clock between the audio device's position steps instead of jumping with them.
+
+Baseline `8b2c993b` (main) and the changed tree, Rust 1.100.0 on macOS and 1.99.1 on Linux,
+release builds with thin LTO and 16 codegen units (not the shipped fat-LTO profile).
+`--demo --demo-video-playing --demo-video-file=<clip>` played a generated 90 s 1080p60
+H.264 clip (`testsrc2`, libx264 veryfast, 6 Mbps, AAC) in the synthetic channel, controls
+hidden. After 8–10 s, 20 s of user plus system time over all threads, alternating builds
+three times. Percentages are of one core.
+
+| Workload | Before | After | Delta |
+| --- | ---: | ---: | ---: |
+| macOS M5 Pro (Metal, 2240×1520 window), process CPU | 27.1 / 27.2 / 27.3% | 16.1 / 15.7 / 16.5% | −41% |
+| macOS same runs, RSS | 244–247 MiB | 234 MiB | −10 to −13 MiB |
+| macOS same runs, `footprint` | 355–361 MB | 349–351 MB | −4 to −12 MB |
+| macOS, time between pictures handed to the renderer (300-frame windows) | 16.67 ms ± 5.9, max 27.1 | 16.67 ms ± 1.4, max 20.4 | −76% deviation |
+| Asahi Linux (M1, Vulkan, headless labwc 1920×1080), process CPU | 105.4 / 97.0 / 97.2% | 80.4 / 80.9 / 81.3% | −19% |
+| Asahi same runs, main and render threads | 31.0 / 29.5 / 29.2% | 12.8 / 13.0 / 13.0% | −57% |
+| Asahi same runs, `openh264dec` streaming thread | 62–64% | 62–63% | unchanged |
+
+Watched streams and remote cameras take the same paint-only path; a stream's queued pictures
+ask for their frame at their presentation deadline. No real stream was used. The demo flag
+`--demo-call-stream-live` feeds generated 1080p60 pictures, stamped 80 ms ahead, through the
+stream's own queue and wake-ups, and `--demo-full-repaints` turns the paint-only handle off
+in the same binary for comparison (two alternating 15 s runs on the Asahi machine):
+
+| Workload | Repaint per picture | Paint-only | Delta |
+| --- | ---: | ---: | ---: |
+| Synthetic 1080p60 stream, main and render threads | 29.4 / 29.5% | 14.1 / 13.8% | −53% |
+| Same runs, pictures shown through a paint-only frame | 0 | about 296 of 300 per 5 s | |
+
+The generator itself costs another 20% of a core in both columns and is not app work.
+
+The Linux runs used the same clip without its audio track, because the SSH session has no
+audio output device. No picture was dropped in any macOS pacing window. Single macOS runs
+while building the change put the steps at roughly 25% (baseline), 20% (paint-only frames),
+18% (decoder surfaces) and 13% (no mesh upload on a paint-only frame); those came from a
+different session than the table and are an attribution, not a second measurement.
+
+The synthetic channel is almost empty, so the ui pass that no longer runs is small here; a
+busy channel was not measured. Windows was neither built nor measured: it gets paint-only
+frames and the player changes but still copies planes. On Linux the decoder dominates when
+no hardware decoder is installed. Real calls and streams were not run: the stream numbers
+come from the synthetic source only, and stream and camera pictures are still copied on
+every platform. Package size was not measured. `video::gst::tests::native_mov_decodes_audio_video_and_seeks` fails
+on the Asahi machine ("no frame after seek") with and without this change.

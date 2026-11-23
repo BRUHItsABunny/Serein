@@ -2209,6 +2209,12 @@ impl Desktop {
 			messaging.preview_settings(&page);
 		}
 		#[cfg(feature = "demo")]
+		if demo && std::env::args().any(|arg| arg == "--demo-deepfilternet") {
+			// Preview voice controls are read-only, so show this Custom suppressor preselected.
+			messaging.voice_processing.edit().suppression =
+				model::voice_settings::NoiseSuppression::DeepFilterNet;
+		}
+		#[cfg(feature = "demo")]
 		if demo
 			&& let Some(tab) = std::env::args().find_map(|arg| {
 				arg.strip_prefix("--demo-theme-maker")
@@ -4187,7 +4193,7 @@ impl Desktop {
 					use model::Patch;
 					let channel = action.channel();
 					let patch = match action {
-						Action::Leave(_) => None,
+						Action::Leave(_) | Action::AddRecipient { .. } => None,
 						Action::Edit { name, icon, .. } => Some(model::ChannelPatch {
 							user_limit: Patch::Absent,
 							slowmode: Patch::Absent,
@@ -4485,6 +4491,8 @@ impl Desktop {
 							mentions: message.mentions,
 							attachments: message.attachments,
 							embeds: message.embeds,
+							forwarded: message.forwarded,
+							forward_origin: message.forward_origin,
 						}
 					})
 					.collect();
@@ -4590,6 +4598,8 @@ impl Desktop {
 									excerpt: message.content.clone(),
 									attachments: message.attachments,
 									embeds: message.embeds,
+									forwarded: message.forwarded,
+									forward_origin: message.forward_origin,
 								});
 							}
 						}
@@ -6217,9 +6227,28 @@ impl eframe::App for Desktop {
 		}
 	}
 	/// One UI frame: pumps workers, expires challenges, renders and drains commands.
-	fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+	/// A playing attachment's next picture goes into the texture the last pass drew and
+	/// that pass's shapes are presented again: no layout or tessellation per video frame.
+	fn paint_only(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) -> bool {
+		// The demo's pending automatic pause is decided in the ui pass.
+		self.demo_video_autoplay.is_none()
+			&& self.video.paint_only(self.messaging.video(), ctx)
+			&& self.voice.paint_only(ctx)
+	}
+	fn keep_paint(&self) -> bool {
+		self.video.active() || self.voice.shows_video()
+	}
+	fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
 		// Last frame's shapes are painted; video textures retired since then can go.
 		gpu_video::collect();
+		// `--demo-full-repaints` keeps a repaint per picture, to measure against.
+		static FULL_REPAINTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+		let full_repaints = cfg!(feature = "demo")
+			&& *FULL_REPAINTS
+				.get_or_init(|| std::env::args().any(|arg| arg == "--demo-full-repaints"));
+		let presenter = frame.paint_only_requester().filter(|_| !full_repaints);
+		self.video.set_presenter(presenter.clone());
+		self.voice.set_presenter(presenter);
 		// `raw_input_hook` samples placements before the pass begins, where a requested repaint
 		// can be dropped when the pass starts, so the frame that saves a resting one is asked here.
 		// Every pass asks: a discarded pass's request would arrive stale and be ignored.
@@ -6567,7 +6596,18 @@ impl eframe::App for Desktop {
 		if held || cancelled {
 			self.ptt_release = None;
 		} else if self.messaging.voice_ptt_active && self.ptt_release.is_none() {
-			self.ptt_release = Some(now + self.messaging.keybinds.push_to_talk_release());
+			// After automatic suppression moved to RNNoise the longer delay is gone, and
+			// holding the microphone open for it would transmit sound from after the release.
+			let suppression = self.messaging.voice_processing.effective().suppression;
+			let fell_back = suppression == model::voice_settings::NoiseSuppression::Auto
+				&& self.messaging.voice_suppression_fell_back;
+			let extra = if fell_back {
+				Duration::ZERO
+			} else {
+				suppression.extra_delay()
+			};
+			let release = self.messaging.keybinds.push_to_talk_release();
+			self.ptt_release = Some(now + release + extra);
 		}
 		// Like Discord, transmission lingers for the release delay so a word is not clipped.
 		let lingering = talking && self.ptt_release.is_some_and(|until| until > now);
@@ -6738,6 +6778,8 @@ impl eframe::App for Desktop {
 			// Explicit artwork Send finishes asynchronously; retain its prepared thumbnails.
 			self.messaging.attachment_previews = self.uploads.previews();
 			self.messaging.attachment_files = self.uploads.files();
+			self.messaging.attachment_keys = self.uploads.selection_keys();
+			self.messaging.attachment_spoilers = self.uploads.spoilers();
 			self.messaging.stage_pending_upload(&ctx, &command);
 			if let Command::Send { channel, .. } = &command {
 				self.messaging.draft_changes.push(*channel);
@@ -6788,6 +6830,23 @@ impl eframe::App for Desktop {
 				.map(|(name, size)| (name.to_owned(), size));
 			self.messaging.attachment_previews = self.uploads.previews();
 			self.messaging.attachment_files = self.uploads.files();
+			self.messaging.attachment_keys = self.uploads.selection_keys();
+			self.messaging.attachment_spoilers = self.uploads.spoilers();
+		}
+		// Validate identity before any decode request after navigation or selection changes.
+		self.messaging.validate_attachment_view(&self.state);
+		// One staged image can be looked at full size; its decode runs off the render thread.
+		if let Some(index) = self.messaging.attachment_view_open {
+			self.uploads
+				.request_view(index, self.runtime.handle(), &ctx);
+			// Pending is `None` too, so a file replaced at this index never shows the old pixels.
+			self.messaging.attachment_view_image = self
+				.uploads
+				.view_image(index)
+				.map(|decoded| (index, decoded));
+		} else {
+			self.uploads.cancel_view();
+			self.messaging.attachment_view_image = None;
 		}
 		self.messaging
 			.external_upload
@@ -7095,6 +7154,7 @@ impl eframe::App for Desktop {
 					self.fixture_only || self.state.demo,
 				);
 			}
+			self.video.sync(player);
 			// Posters download attachments too, so they follow the playback session gate.
 			if !self.state.demo && self.state.auth != AuthState::Authenticated {
 				player.poster_queue.clear();
@@ -7181,12 +7241,16 @@ impl eframe::App for Desktop {
 					self.messaging.external_upload.complete(Err(error));
 				}
 			}
+			for (key, spoiler) in std::mem::take(&mut self.messaging.attachment_spoiler_requests) {
+				self.uploads.set_spoiler(key, spoiler);
+			}
 			if let Some(index) = self.messaging.remove_attachment_index.take() {
 				self.uploads.remove_at(index);
 				if self.state.demo {
 					self.messaging.attachment = None;
 					self.messaging.attachment_files.clear();
 					self.messaging.attachment_previews.clear();
+					self.messaging.attachment_spoilers.clear();
 				}
 			}
 			if std::mem::take(&mut self.messaging.remove_attachment_requested) {
@@ -7194,6 +7258,7 @@ impl eframe::App for Desktop {
 				self.messaging.attachment = None;
 				self.messaging.attachment_files.clear();
 				self.messaging.attachment_previews.clear();
+				self.messaging.attachment_spoilers.clear();
 			}
 			if std::mem::take(&mut self.messaging.cancel_upload_requested) {
 				// The timeline row cancels its own upload, not files loading for the next message.

@@ -71,6 +71,7 @@ a quick read of the code would not. Prefer extending an existing test over addin
 - `crates/model`, `discord-protocol`: entities and bounded wire parsing.
 - `crates/client-core`, `session-cache`: state, reconciliation and bounded RAM.
 - `crates/discord-api`, `discord-gateway`, `discord-voice`: transports and voice.
+- `crates/deepfilternet`: DeepFilterNet3 noise suppression with embedded weights.
 - `crates/local-store`, `platform`: persistence and native integrations.
 - `crates/extensions`, `extension-host`: Wasm sandbox and wire contract; toolkit-free plugin host
   (package store, worker, snapshots, event admission) shared by front ends.
