@@ -469,6 +469,71 @@ impl ExtensionUi {
 		}
 	}
 
+	/// Switches `plugin`'s own hooks in `channel`, as the user confirmed from the plugin:
+	/// its notes, and its send hook in `send` mode (which replaces another plugin's), or
+	/// off. Saved like the composer menu's switches.
+	pub(crate) fn set_plugin_hooks(
+		&mut self,
+		plugin: &str,
+		channel: Id,
+		notes: bool,
+		send: Option<SendMode>,
+	) -> Result<(), String> {
+		let has = |this: &Self, surface| this.hook_plugins(surface).any(|(id, _, _)| id == plugin);
+		if (notes && !has(self, Surface::Annotate)) || (send.is_some() && !has(self, Surface::Send))
+		{
+			return Err("That plugin has no hook for messages".into());
+		}
+		let before = self.hooks_in(channel);
+		let mut hooks = before.clone();
+		hooks.annotate.retain(|id| id != plugin);
+		if notes {
+			if hooks.annotate.len() >= extension_host::hooks::MAX_ANNOTATORS {
+				return Err("Too many plugins add notes here; switch one off first".into());
+			}
+			hooks.annotate.push(plugin.to_owned());
+		} else if before.annotate.iter().any(|id| id == plugin) {
+			self.notes.push(NoteUpdate::Forget(plugin.to_owned()));
+		}
+		match send {
+			Some(mode) => {
+				// A fallback chosen in the menu stays.
+				let fallback = hooks
+					.send
+					.as_ref()
+					.filter(|hook| hook.plugin == plugin)
+					.map_or(Fallback::KeepDraft, |hook| hook.fallback);
+				hooks.send = Some(SendHook {
+					plugin: plugin.to_owned(),
+					mode,
+					fallback,
+				});
+			}
+			None if hooks
+				.send
+				.as_ref()
+				.is_some_and(|hook| hook.plugin == plugin) =>
+			{
+				hooks.send = None;
+			}
+			None => {}
+		}
+		if hooks == before {
+			return Ok(());
+		}
+		self.channel_hooks.retain(|saved| saved.channel != channel);
+		if !hooks.is_empty() {
+			self.channel_hooks.push(hooks.clone());
+		}
+		if hooks.send != before.send {
+			self.send.pending = None;
+			self.send.review = None;
+		}
+		self.requests
+			.push(ExtensionRequest::SetChannelHooks { hooks });
+		Ok(())
+	}
+
 	/// The switches for this channel's hooks, in the composer's tools menu.
 	pub(super) fn channel_hooks_menu(&mut self, ui: &mut egui::Ui, state: &State) {
 		let Some(channel) = state.selected else {

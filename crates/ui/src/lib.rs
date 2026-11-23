@@ -7492,6 +7492,96 @@ mod composer_tests {
 		}
 	}
 
+	/// A plugin's confirmed proposal switches only its own hooks in one conversation: its
+	/// send hook replaces another plugin's and keeps a fallback the user chose, and a hook
+	/// the plugin does not have is refused.
+	#[test]
+	fn confirmed_hook_proposals_switch_only_the_plugins_own_hooks() {
+		use crate::extensions_ui::ExtensionRequest;
+		use extension_host::hooks::{ChannelHooks, Fallback, SendHook, SendMode};
+		let channel = Id(10);
+		let mut view = MessagingUi::default();
+		let plugin = |id: &str, surfaces: &[extensions::Surface]| {
+			let mut entry = crate::extensions_ui::tests::entry();
+			entry.enabled = true;
+			entry.manifest.id = id.into();
+			entry.manifest.actions = surfaces
+				.iter()
+				.map(|surface| extensions::Action {
+					id: format!("{surface:?}").to_lowercase(),
+					label: "Hook".into(),
+					surface: *surface,
+				})
+				.collect();
+			entry
+		};
+		use extensions::Surface::{Annotate, Send};
+		view.extensions.set_entries(vec![
+			plugin("translator", &[Annotate, Send]),
+			plugin("archive", &[Annotate]),
+			plugin("other", &[Send]),
+		]);
+		view.extensions.channel_hooks = vec![ChannelHooks {
+			channel,
+			send: Some(SendHook {
+				plugin: "other".into(),
+				mode: SendMode::Preview,
+				fallback: Fallback::SendOriginal,
+			}),
+			annotate: vec!["archive".into()],
+		}];
+		let saved = |view: &mut MessagingUi| match std::mem::take(&mut view.extensions.requests)
+			.as_slice()
+		{
+			[ExtensionRequest::SetChannelHooks { hooks }] => hooks.clone(),
+			other => panic!("one save, got {}", other.len()),
+		};
+		view.extensions
+			.set_plugin_hooks("translator", channel, true, Some(SendMode::Auto))
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(hooks.annotate, ["archive", "translator"]);
+		let send = hooks.send.clone().unwrap();
+		assert_eq!(
+			(send.plugin.as_str(), send.mode, send.fallback),
+			("translator", SendMode::Auto, Fallback::KeepDraft),
+			"another plugin's fallback is not inherited"
+		);
+		// Its own fallback stays when the mode changes.
+		view.extensions.channel_hooks = vec![ChannelHooks {
+			send: Some(SendHook {
+				fallback: Fallback::SendOriginal,
+				..send
+			}),
+			..hooks
+		}];
+		view.extensions
+			.set_plugin_hooks("translator", channel, false, Some(SendMode::Preview))
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(hooks.annotate, ["archive"]);
+		assert_eq!(
+			hooks.send.as_ref().unwrap().fallback,
+			Fallback::SendOriginal
+		);
+		// Switching off leaves the other plugins alone.
+		view.extensions.channel_hooks = vec![hooks];
+		view.extensions
+			.set_plugin_hooks("translator", channel, false, None)
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(
+			(hooks.annotate.as_slice(), hooks.send),
+			(&["archive".to_owned()][..], None)
+		);
+		assert!(
+			view.extensions
+				.set_plugin_hooks("archive", channel, true, Some(SendMode::Auto))
+				.is_err()
+		);
+		assert!(view.extensions.requests.is_empty());
+	}
+
 	#[test]
 	fn send_hooks_hold_the_draft_until_the_plugin_answers_and_fall_back_as_chosen() {
 		use crate::extensions_ui::ExtensionRequest;

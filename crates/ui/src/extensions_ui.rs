@@ -3394,8 +3394,19 @@ impl ExtensionUi {
 					if let Some(effect) = result.output.effects.first() {
 						crate::dialog::label(ui, "extensions-ui-show-result-proposed-app-action");
 						ui.add(
-							egui::Label::new(crate::extension_app::effect_description(effect))
-								.wrap(),
+							egui::Label::new(crate::extension_app::effect_description_in(
+								effect,
+								state,
+								&self
+									.entries
+									.iter()
+									.find(|entry| entry.manifest.id == result.id)
+									.map_or_else(
+										|| result.id.clone(),
+										|entry| entry.manifest.name.clone(),
+									),
+							))
+							.wrap(),
 						);
 						ui.add_space(10.0);
 					}

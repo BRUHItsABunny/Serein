@@ -564,6 +564,61 @@ fn local_effects_require_matching_grants_and_cannot_run_in_background() {
 }
 
 #[test]
+fn channel_hook_proposals_need_each_hook_they_switch() {
+	let hooks = |notes, send| HostEffect::SetChannelHooks {
+		channel_id: "20".into(),
+		notes,
+		send,
+	};
+	let mut manifest = test_manifest(vec![Capability::MessageAnnotations]);
+	manifest.actions.push(Action {
+		id: "notes".into(),
+		label: "Notes".into(),
+		surface: Surface::Annotate,
+	});
+	let both = hooks(true, Some(SendHookMode::Auto));
+	assert!(hooks(true, None).validate(&manifest).is_ok());
+	assert!(
+		hooks(false, None).validate(&manifest).is_ok(),
+		"switching off"
+	);
+	// A send hook needs its grant and a send action, not just notes.
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	manifest.capabilities.push(Capability::SendHook);
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	manifest.actions.push(Action {
+		id: "send".into(),
+		label: "Send".into(),
+		surface: Surface::Send,
+	});
+	assert!(both.validate(&manifest).is_ok());
+	// Notes need their action too, whatever the grants.
+	manifest
+		.actions
+		.retain(|action| action.surface != Surface::Annotate);
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	assert!(
+		hooks(false, Some(SendHookMode::Preview))
+			.validate(&manifest)
+			.is_ok()
+	);
+	let wire = serde_json::to_value(&both).unwrap();
+	assert_eq!(
+		wire,
+		serde_json::json!({"type": "set_channel_hooks", "channel_id": "20", "notes": true,
+			"send": "auto"})
+	);
+	let sdk: sdk::HostEffect = serde_json::from_value(wire).unwrap();
+	assert!(matches!(
+		sdk,
+		sdk::HostEffect::SetChannelHooks {
+			send: Some(sdk::SendHookMode::Auto),
+			..
+		}
+	));
+}
+
+#[test]
 fn app_events_are_unique_granted_and_have_no_direct_conversation_context() {
 	let mut manifest = test_manifest(vec![
 		Capability::AppEvents,

@@ -460,6 +460,46 @@ fn app_action_description(action: &AppAction) -> String {
 	}
 }
 
+/// The conversation's name for a confirmation, else its ID.
+fn conversation_name(state: &State, channel_id: &str) -> String {
+	let channel = channel_id.parse().ok().and_then(|id| state.channel(Id(id)));
+	match channel {
+		Some(channel) if !channel.name.is_empty() => channel.name.clone(),
+		Some(channel) if !channel.recipients.is_empty() => channel
+			.recipients
+			.iter()
+			.map(|user| user.name.as_str())
+			.collect::<Vec<_>>()
+			.join(", "),
+		_ => format!("conversation {channel_id}"),
+	}
+}
+
+/// What confirming `effect` does, naming what `state` knows.
+pub(crate) fn effect_description_in(effect: &HostEffect, state: &State, plugin: &str) -> String {
+	let HostEffect::SetChannelHooks {
+		channel_id,
+		notes,
+		send,
+	} = effect
+	else {
+		return effect_description(effect);
+	};
+	let name = conversation_name(state, channel_id);
+	if !*notes && send.is_none() {
+		return format!("Switch {plugin} off in {name}.");
+	}
+	let notes = if *notes { "on" } else { "off" };
+	let send = match send {
+		Some(extensions::SendHookMode::Auto) => {
+			"rewritten and sent at once; if that fails, your draft stays"
+		}
+		Some(extensions::SendHookMode::Preview) => "rewritten for you to review before sending",
+		None => "unchanged",
+	};
+	format!("Switch {plugin} on in {name}:\nNotes under messages: {notes}\nWhat you send: {send}")
+}
+
 pub(crate) fn effect_description(effect: &HostEffect) -> String {
 	match effect {
 		HostEffect::AppAction { action } | HostEffect::TrackedAppAction { action, .. } => {
@@ -506,6 +546,9 @@ pub(crate) fn effect_description(effect: &HostEffect) -> String {
 				lines.push(format!("Scroll speed: {value}%"));
 			}
 			lines.join("\n")
+		}
+		HostEffect::SetChannelHooks { channel_id, .. } => {
+			format!("Change this plugin's hooks in conversation {channel_id}")
 		}
 		HostEffect::SetNotificationSettings { settings } => {
 			let mut lines = vec!["Change local notification settings:".into()];
@@ -568,6 +611,12 @@ pub(crate) fn effect_button(effect: &HostEffect) -> &'static str {
 		HostEffect::SetLocalSettings { .. } => "Apply: Change settings",
 		HostEffect::SetNotificationSettings { .. } => "Apply: Change notifications",
 		HostEffect::Search { .. } => "Apply: Search",
+		HostEffect::SetChannelHooks {
+			notes: false,
+			send: None,
+			..
+		} => "Apply: Switch off here",
+		HostEffect::SetChannelHooks { .. } => "Apply: Switch on here",
 		_ => "Apply: Open view",
 	}
 }
@@ -917,6 +966,24 @@ impl MessagingUi {
 				.toasts
 				.push(design::Level::Info, format!("{plugin_name}: {text}")),
 			HostEffect::CopyText { text } => ctx.copy_text(text),
+			HostEffect::SetChannelHooks {
+				channel_id,
+				notes,
+				send,
+			} => {
+				let channel = Id(channel_id
+					.parse()
+					.map_err(|_| "Invalid channel identifier")?);
+				if state.channel(channel).is_none() {
+					return Err("That conversation is not available".into());
+				}
+				let mode = send.map(|mode| match mode {
+					extensions::SendHookMode::Preview => extension_host::hooks::SendMode::Preview,
+					extensions::SendHookMode::Auto => extension_host::hooks::SendMode::Auto,
+				});
+				self.extensions
+					.set_plugin_hooks(&confirmed.plugin, channel, notes, mode)?;
+			}
 			HostEffect::SetVoice { muted, deafened } => {
 				self.extension_voice_current(state, confirmed.context.voice_request)?;
 				if !muted
