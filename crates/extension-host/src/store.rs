@@ -837,6 +837,7 @@ impl ExtensionHost {
 		&self,
 		id: &str,
 		account: &str,
+		backlog: crate::media::Backlog,
 		wake: Arc<dyn Fn() + Send + Sync>,
 	) -> crate::media::MediaWorker {
 		let root = self.root.clone();
@@ -885,6 +886,7 @@ impl ExtensionHost {
 						.map_err(|error| error.to_string())?;
 				Ok((instance, action))
 			}),
+			backlog,
 			wake,
 		)
 	}
@@ -3887,7 +3889,12 @@ mod tests {
 			sequence: None,
 			keyframe: false,
 		};
-		let worker = host.start_media("media", "account", Arc::clone(&wake));
+		let worker = host.start_media(
+			"media",
+			"account",
+			crate::media::Backlog::LIVE,
+			Arc::clone(&wake),
+		);
 		worker.push(vec![chunk(5)], b"hello".to_vec());
 		worker.push(vec![chunk(5)], b"hello".to_vec());
 		let text = |event| match event {
@@ -3906,7 +3913,7 @@ mod tests {
 			worker.wait_event(),
 			Some(crate::media::MediaEvent::Failed(_))
 		));
-		let refused = host.start_media("plain", "account", wake);
+		let refused = host.start_media("plain", "account", crate::media::Backlog::LIVE, wake);
 		assert!(matches!(
 			refused.wait_event(),
 			Some(crate::media::MediaEvent::Failed(error)) if error.contains("not granted")

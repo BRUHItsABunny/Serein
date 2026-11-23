@@ -1795,7 +1795,16 @@ fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
 			.validate(&manifest, &input)
 			.is_err()
 	);
+	let chunks = Output {
+		media_chunks: Some(false),
+		..Default::default()
+	};
+	assert!(
+		chunks.validate(&manifest, &input).is_err(),
+		"pausing chunks needs a media tap"
+	);
 	manifest.capabilities.push(Capability::MediaPackets);
+	chunks.validate(&manifest, &input).unwrap();
 	manifest.validate().unwrap();
 	keyframes(&["camera:5", "screen:6"])
 		.validate(&manifest, &input)
@@ -1803,6 +1812,47 @@ fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
 	for invalid in [&["voice:5"][..], &["camera:x"], &["camera"]] {
 		assert!(keyframes(invalid).validate(&manifest, &input).is_err());
 	}
+
+	// Other actions tell the worker its state, bounded; the worker cannot set its own.
+	let state = |text: String| Output {
+		media_state: Some(serde_json::json!({ "record": text })),
+		..Default::default()
+	};
+	assert!(state(String::new()).validate(&manifest, &input).is_err());
+	manifest.actions.push(Action {
+		id: "record".into(),
+		label: "Record".into(),
+		surface: Surface::Panel,
+	});
+	let panel = Invocation {
+		action: "record".into(),
+		..Default::default()
+	};
+	state("call".into()).validate(&manifest, &panel).unwrap();
+	let large = "x".repeat(extensions::media::MAX_MEDIA_STATE_BYTES);
+	assert!(matches!(
+		state(large.clone()).validate(&manifest, &panel),
+		Err(Error::Limit)
+	));
+	assert!(
+		batch(
+			vec![MediaItem::State {
+				time_us: 0,
+				state: serde_json::json!(large),
+			}],
+			0
+		)
+		.validate(&manifest)
+		.is_err(),
+		"an oversized state never reaches the worker"
+	);
+	let mut workerless = manifest.clone();
+	workerless.capabilities = vec![Capability::CallCaptions];
+	workerless
+		.actions
+		.retain(|action| action.surface == Surface::Panel);
+	assert!(state("call".into()).validate(&workerless, &panel).is_err());
+
 	let mut unpaired = manifest.clone();
 	unpaired.capabilities = vec![Capability::MediaAudio];
 	unpaired.actions.clear();

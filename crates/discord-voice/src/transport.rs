@@ -801,7 +801,7 @@ async fn run_inner(
 						   let Some(decoder)=&decoder else{continue;};
 						   if !dave.ready {metrics.video(Video::NotReady,1);continue;}
 						   if receivers.has_source(rtp.ssrc) {receive_reports.receive(rtp.ssrc,rtp.sequence,rtp.timestamp,Instant::now().into_std());}
-						   let first=receivers.push(rtp.ssrc,rtp.sequence,rtp.timestamp,rtp.marker,&rtp.payload);
+						   let first=receivers.push_timed(rtp.ssrc,rtp.sequence,rtp.timestamp,rtp.marker,&rtp.payload);
 						   receive_video(&mut receivers,decoder,&mut dave,&mut metrics,first)?;
 						   continue;
 					   }
@@ -1202,17 +1202,18 @@ fn receive_video(
 	decoder: &DecoderQueue,
 	dave: &mut Dave,
 	metrics: &mut crate::diagnostics::Metrics,
-	mut first: Option<(u64, Vec<u8>)>,
+	mut first: Option<crate::video_receive::Received>,
 ) -> Result<(), &'static str> {
-	while let Some((user, frame)) = first.take().or_else(|| receivers.pop()) {
+	while let Some(received) = first.take().or_else(|| receivers.pop_timed()) {
+		let user = received.user;
 		let Some(frame) = decrypt_video(
 			receivers,
 			dave,
 			metrics,
 			user,
 			Codec::H264,
-			frame,
-			(crate::tap::Source::Camera, 0),
+			received.data,
+			(crate::tap::Source::Camera, received.timestamp),
 		) else {
 			continue;
 		};

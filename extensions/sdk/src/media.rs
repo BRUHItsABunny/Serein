@@ -41,8 +41,7 @@ pub enum MediaItem {
 		time_us: u64,
 		offset: u32,
 		length: u32,
-		/// The sender's RTP timestamp: 48 kHz for audio, 90 kHz for screen video; absent
-		/// or zero for cameras.
+		/// The sender's RTP timestamp: 48 kHz for audio, 90 kHz for video.
 		#[serde(default)]
 		rtp_timestamp: Option<u32>,
 		#[serde(default)]
@@ -55,6 +54,12 @@ pub enum MediaItem {
 		stream: String,
 		time_us: u64,
 		lost: u32,
+	},
+	/// What your other actions last set with [`MediaStateOutput::media_state`]: in the
+	/// first batch of each worker, and in the next batch whenever it changes.
+	State {
+		time_us: u64,
+		state: serde_json::Value,
 	},
 	/// An item this SDK version does not know.
 	#[serde(other)]
@@ -93,6 +98,25 @@ pub struct MediaOutput {
 	/// when a recording starts. Requires `media_packets`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub keyframes: Vec<String>,
+	/// `Some(false)` stops media chunks while you only wait for events, such as someone
+	/// joining; `Some(true)` resumes them. Requires `media_packets` or `media_audio`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_chunks: Option<bool>,
+}
+
+/// Largest [`MediaStateOutput::media_state`], as JSON.
+pub const MAX_MEDIA_STATE_BYTES: usize = 16 * 1024;
+
+/// Output of any action but `media`, `send`, `annotate` and `notification` that tells your
+/// media worker something, such as its settings or "record this call".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaStateOutput {
+	#[serde(flatten)]
+	pub output: Output,
+	/// Replaces the state your media worker is given; it is kept in memory until Serein
+	/// closes, so set it again from your `activation` action. Requires `media_worker`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_state: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -106,7 +130,8 @@ mod tests {
 				{"type":"event","time_us":0,"event":{"kind":"started","channel_id":"20"}},
 				{"type":"event","time_us":1,"event":{"kind":"raised_hand","user_id":"5"}},
 				{"type":"chunk","stream":"user:5","codec":"opus","time_us":2,"offset":0,"length":5},
-				{"type":"video_keyframe"}]}}"#,
+				{"type":"video_keyframe"},
+				{"type":"state","time_us":3,"state":{"record":true}}]}}"#,
 		)
 		.unwrap();
 		let items = input.media.unwrap().items;
@@ -119,5 +144,6 @@ mod tests {
 		));
 		assert!(matches!(items[2], MediaItem::Chunk { length: 5, .. }));
 		assert_eq!(items[3], MediaItem::Other);
+		assert!(matches!(&items[4], MediaItem::State { state, .. } if state["record"] == true));
 	}
 }

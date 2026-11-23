@@ -916,6 +916,17 @@ pub struct Output {
 	/// a keyframe. Requires `media_packets`; `media` actions only.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub keyframes: Vec<String>,
+	/// Replaces what this plugin's media worker is told: any JSON value of at most
+	/// [`media::MAX_MEDIA_STATE_BYTES`], such as its settings or "record this call". The
+	/// running worker gets it in its next batch and each later worker in its first, as a
+	/// `state` item. Requires `media_worker`; not from `media`, `send`, `annotate` or
+	/// `notification` actions.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_state: Option<serde_json::Value>,
+	/// `false` stops sending this worker media chunks while it only waits for events;
+	/// `true` resumes them. Requires `media_packets` or `media_audio`; `media` actions only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_chunks: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1766,6 +1777,24 @@ impl Output {
 				return Err(Error::Capability);
 			}
 			media::validate_keyframes(&self.keyframes)?;
+		}
+		if let Some(state) = &self.media_state {
+			if !manifest.capabilities.contains(&Capability::MediaWorker)
+				|| matches!(
+					surface,
+					Surface::Media | Surface::Send | Surface::Annotate | Surface::Notification
+				) || input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			media::validate_state(state)?;
+		}
+		if self.media_chunks.is_some()
+			&& (surface != Surface::Media
+				|| !manifest.capabilities.contains(&Capability::MediaPackets)
+					&& !manifest.capabilities.contains(&Capability::MediaAudio))
+		{
+			return Err(Error::Capability);
 		}
 		if let Some(captions) = &self.captions {
 			if !manifest.capabilities.contains(&Capability::CallCaptions)

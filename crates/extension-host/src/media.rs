@@ -1,15 +1,37 @@
 //! Media workers: one thread per plugin and call, holding a [`MediaInstance`] that stays
 //! loaded and runs the plugin's `media` action once per batch. The queue in front of it is
-//! bounded by batches and bytes; when the plugin falls behind, the oldest batches are
-//! dropped and the next batch reports how many. A failed call ends the worker.
+//! bounded by batches and bytes; when the plugin falls behind, the oldest media batches are
+//! dropped and the next batch reports how many. Batches without media (call events and
+//! state) are kept. A failed call ends the worker.
 use extensions::{Caption, Invocation, MediaBatch, MediaInstance, MediaItem};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
-/// Batches waiting for the plugin.
-const MAX_QUEUED: usize = 32;
-/// Payload bytes waiting for the plugin.
-const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// How much a worker's queue holds before the oldest media is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backlog {
+	pub batches: usize,
+	pub bytes: usize,
+}
+
+impl Backlog {
+	/// About 0.6 s of 20 ms batches: a live consumer such as captions would rather skip
+	/// ahead than fall further behind.
+	pub const LIVE: Self = Self {
+		batches: 32,
+		bytes: 16 * 1024 * 1024,
+	};
+	/// About 5 s, for workers that write files and would otherwise lose media to a disk
+	/// that stalls for a moment.
+	pub const FILES: Self = Self {
+		batches: 256,
+		bytes: 64 * 1024 * 1024,
+	};
+}
+
+/// Batches without media kept beyond the backlog before they too are dropped, so a stuck
+/// plugin cannot grow the queue without bound.
+const MAX_EXTRA_EVENT_BATCHES: usize = 256;
 
 /// What a worker reports back.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,6 +40,8 @@ pub enum MediaEvent {
 	Captions(Vec<Caption>),
 	/// Camera and screen share streams the plugin wants keyframes for.
 	Keyframes(Vec<String>),
+	/// Whether the plugin wants media chunks or only events.
+	Chunks(bool),
 	/// The worker stopped after an error; a new one may be started.
 	Failed(String),
 }
@@ -31,10 +55,20 @@ struct Queue {
 	closing: bool,
 }
 
-#[derive(Default)]
 struct Shared {
 	queue: Mutex<Queue>,
 	ready: Condvar,
+	backlog: Backlog,
+}
+
+impl Shared {
+	fn new(backlog: Backlog) -> Self {
+		Self {
+			queue: Mutex::default(),
+			ready: Condvar::new(),
+			backlog,
+		}
+	}
 }
 
 /// Loads the plugin for a worker: its instance and its `media` action.
@@ -55,8 +89,20 @@ impl MediaSender {
 		}
 		queue.bytes += data.len();
 		queue.batches.push_back((items, data));
-		while queue.batches.len() > MAX_QUEUED || queue.bytes > MAX_QUEUED_BYTES {
-			let Some((_, data)) = queue.batches.pop_front() else {
+		let backlog = self.0.backlog;
+		while queue.batches.len() > backlog.batches || queue.bytes > backlog.bytes {
+			// The oldest batch with media goes first; events and state are kept unless
+			// nothing else is left to drop.
+			let index = match queue
+				.batches
+				.iter()
+				.position(|(items, data)| !data.is_empty() || items.iter().any(is_media))
+			{
+				Some(index) => index,
+				None if queue.batches.len() > backlog.batches + MAX_EXTRA_EVENT_BATCHES => 0,
+				None => break,
+			};
+			let Some((_, data)) = queue.batches.remove(index) else {
 				break;
 			};
 			queue.bytes -= data.len();
@@ -64,6 +110,10 @@ impl MediaSender {
 		}
 		self.0.ready.notify_one();
 	}
+}
+
+fn is_media(item: &MediaItem) -> bool {
+	matches!(item, MediaItem::Chunk { .. } | MediaItem::Gap { .. })
 }
 
 pub struct MediaWorker {
@@ -74,8 +124,8 @@ pub struct MediaWorker {
 
 impl MediaWorker {
 	/// Starts a worker thread; `wake` runs after each event so the front end polls.
-	pub fn spawn(start: Starter, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-		let shared = Arc::new(Shared::default());
+	pub fn spawn(start: Starter, backlog: Backlog, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+		let shared = Arc::new(Shared::new(backlog));
 		let (send, events) = mpsc::sync_channel(16);
 		let worker = Arc::clone(&shared);
 		let thread = std::thread::Builder::new()
@@ -109,6 +159,9 @@ impl MediaWorker {
 							}
 							if !output.keyframes.is_empty() {
 								report(MediaEvent::Keyframes(output.keyframes));
+							}
+							if let Some(chunks) = output.media_chunks {
+								report(MediaEvent::Chunks(chunks));
 							}
 						}
 						Err(error) => return report(MediaEvent::Failed(error.to_string())),
@@ -183,29 +236,45 @@ fn next(shared: &Shared) -> Option<(Vec<MediaItem>, Vec<u8>, u32)> {
 mod tests {
 	use super::*;
 
-	/// A plugin that falls behind loses the oldest batches, by count and by bytes, and the
-	/// next batch it gets says how many; closing drains what is queued.
+	/// A plugin that falls behind loses the oldest media batches, by count and by bytes,
+	/// but not the call events between them, and the next batch it gets says how many;
+	/// closing drains what is queued.
 	#[test]
 	fn queued_batches_are_bounded_and_report_what_was_dropped() {
 		let (_, events) = mpsc::sync_channel(1);
+		let backlog = Backlog::LIVE;
 		let worker = MediaWorker {
-			shared: Arc::new(Shared::default()),
+			shared: Arc::new(Shared::new(backlog)),
 			events,
 			thread: None,
 		};
-		let item = |seq: u64| MediaItem::Event {
+		let item = |seq: u64| MediaItem::Gap {
+			stream: "voice:1".into(),
 			time_us: seq,
-			event: extensions::CallEvent::Ended,
+			lost: 1,
 		};
-		for seq in 0..MAX_QUEUED as u64 + 8 {
+		let joined = MediaItem::Event {
+			time_us: 3,
+			event: extensions::CallEvent::Joined {
+				user_id: "5".into(),
+			},
+		};
+		for seq in 0..backlog.batches as u64 + 8 {
 			worker.push(vec![item(seq)], Vec::new());
+			if seq == 3 {
+				worker.push(vec![joined.clone()], Vec::new());
+			}
 		}
 		let (items, _, dropped) = next(&worker.shared).unwrap();
-		assert_eq!((items, dropped), (vec![item(8)], 8));
-		let (_, _, dropped) = next(&worker.shared).unwrap();
-		assert_eq!(dropped, 0, "reported once");
+		assert_eq!(
+			(items, dropped),
+			(vec![joined], 9),
+			"the event outlives older media"
+		);
+		let (items, _, dropped) = next(&worker.shared).unwrap();
+		assert_eq!((items, dropped), (vec![item(9)], 0), "reported once");
 		// Bytes bound the queue too.
-		worker.push(vec![item(100)], vec![0; MAX_QUEUED_BYTES]);
+		worker.push(vec![item(100)], vec![0; backlog.bytes]);
 		worker.push(vec![item(101)], vec![0; 1]);
 		worker.close();
 		let mut last = None;

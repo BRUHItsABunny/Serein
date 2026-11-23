@@ -554,6 +554,7 @@ impl Receivers {
 	}
 	/// Queue RTP and return the first ready access unit. Call `pop` afterwards: filling
 	/// one hole can release several pictures, including later RTP timestamps.
+	#[allow(dead_code, reason = "untimed helpers for tests and examples")]
 	pub fn push(
 		&mut self,
 		ssrc: u32,
@@ -610,9 +611,11 @@ impl Receivers {
 		self.pop_timed_at(now)
 	}
 	/// Also called on transport ticks so a missing packet cannot hold video forever.
+	#[allow(dead_code, reason = "untimed helpers for tests and examples")]
 	pub fn pop(&mut self) -> Option<(u64, Vec<u8>)> {
 		self.pop_at(Instant::now())
 	}
+	#[allow(dead_code, reason = "untimed helpers for tests and examples")]
 	fn pop_at(&mut self, now: Instant) -> Option<(u64, Vec<u8>)> {
 		self.pop_timed_at(now).map(|frame| (frame.user, frame.data))
 	}

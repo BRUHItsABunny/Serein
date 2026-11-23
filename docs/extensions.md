@@ -211,8 +211,9 @@ supports 73 capabilities, with at most 96 distinct declarations per manifest.
 | `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
 | `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
 | `files` | Read and write files in a private folder, and in folders and files the user picks for it, with `serein.file_request` and `serein.file_write` | Preview; [files](#files-preview); the private folder counts against the data limit; picks are listed in the plugin's details and can be removed |
-| `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions` |
-| `media_packets` | Receive the decrypted Opus, H.264, H.265 and AV1 packets of everyone else in the call in `media` batches, and ask senders for keyframes | Preview; [media taps](#media-taps-preview); requires `media_worker`; the user's own microphone and camera are not included |
+| `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media; other actions may tell it a `media_state` | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions`, `keyframes` and `media_chunks` |
+| `media_packets` | Receive the decrypted Opus, H.264, H.265 and AV1 packets of everyone else in the call in `media` batches, and ask senders for keyframes | Preview; [media taps](#media-taps-preview); requires `media_worker`; the user's own media needs `media_own` |
+| `media_own` | Also receive the user's own microphone, camera, screen share and screen share audio, as sent | Preview; [media taps](#media-taps-preview); requires `media_packets` |
 | `media_audio` | Receive each other speaker's audio as 16 kHz mono 16-bit samples in `media` batches | Preview; [media taps](#media-taps-preview); requires `media_worker` |
 | `media_archive` | Save original message attachments from Discord's CDN into the private folder with `serein.attachment_fetch` | Preview; [attachment archive](#attachment-archive-preview); requires `files`; counts against the data limit |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
@@ -1002,13 +1003,31 @@ plugin fell behind), `data_bytes` and up to 256 `items` in time order:
 - `{"type": "chunk", "stream", "codec", "time_us", "offset", "length"}` points into the
   batch's binary data (at most 4 MiB), copied with `serein.media_read`. Media taps fill
   these; until then batches carry only events.
+- `{"type": "state", "time_us", "state"}`: what the plugin's other actions last set with
+  `media_state` (below), in each worker's first batch and again whenever it changes.
 
 The action may return only `captions` (with `call_captions`), shown above the call
-controls. It may also call the clock, randomness, its files, its network origins and
-`broadcast`; the database, journal and topic deliveries are not available, and it cannot
-save `storage`. The host queues at most 32 batches or 16 MiB per worker, dropping the
-oldest. An error ends the worker; a new one starts 10 seconds later in the same call. The
-worker ends with the call, or when the plugin is disabled or the account changes.
+controls, `keyframes` and `media_chunks` (see [media taps](#media-taps-preview)). It may
+also call the clock, randomness, its files, its network origins and `broadcast`; the
+database, journal and topic deliveries are not available, and it cannot save `storage`.
+
+The worker has no database, so the plugin's other actions tell it what it needs to know
+by returning `media_state`: any JSON value of at most 16 KiB, such as its settings or the
+call the user asked to record. Any action except `media`, `send`, `annotate`,
+`notification` and page row fetches may return it. Each one replaces the last; the host
+keeps it in memory until the plugin is disabled, the account changes or Serein closes, so
+an `activation` action should set it again. A running worker gets it in its next batch.
+
+```json
+{"media_state": {"record": ["1200000000000000001"], "people": ["1200000000000000002"]}}
+```
+
+The host queues at most 32 batches or 16 MiB per worker (about 0.6 seconds), or 256 batches
+or 64 MiB (about 5 seconds) for a plugin granted `files`, so a disk that stalls for a moment
+does not cut holes into what it writes. Past that it drops the oldest batches with media;
+batches of only call events and state are kept. An error ends the worker; a new one starts
+10 seconds later in the same call. The worker ends with the call, or when the plugin is
+disabled or the account changes.
 
 ```json
 {"action": "media", "media": {"seq": 2, "items": [
@@ -1025,8 +1044,10 @@ the copy happens only while such a worker runs. A separate thread drains the que
 
 - Streams are `voice:<user>`, `camera:<user>`, `screen:<user>` and `screen_audio:<user>`.
 - `media_packets` chunks are one Opus frame (`opus`) or one complete access unit (`h264`,
-  `h265`, `av1`), with the sender's `rtp_timestamp`, audio `sequence` and video
-  `keyframe`. Video is copied only once the client accepted the picture, so a stream
+  `h265`, `av1`), with the sender's `rtp_timestamp` (48 kHz audio, 90 kHz video), audio
+  `sequence` and video `keyframe`. `time_us` is when the host received the packet on one
+  clock shared by all streams of the worker, so streams can be aligned with it, using
+  each stream's `rtp_timestamp` for spacing within it. Video is copied only once the client accepted the picture, so a stream
   starts on a keyframe.
 - `media_audio` chunks (`pcm_s16le`) are one Opus frame decoded to 16 kHz mono
   little-endian samples, one decoder per stream, off the UI thread.
@@ -1035,10 +1056,16 @@ the copy happens only while such a worker runs. A separate thread drains the que
 - A `media` result with `media_packets` may return `keyframes`: up to 16 `camera:<user>`
   or `screen:<user>` streams. The host asks those senders through the same rate-limited
   path it uses to recover lost pictures.
+- A `media` result may return `"media_chunks": false` while the worker only waits for
+  events, such as someone joining; the host then stops copying media for it (and stops the
+  tap when no worker wants media). `"media_chunks": true` resumes; ask for keyframes then
+  so video starts promptly.
+- With `media_own` (requires `media_packets`), the user's own microphone, camera, screen
+  share and screen share audio arrive too, as encoded and before encryption, in streams
+  named by the user's own ID. Microphone silence is sent as Discord's Opus silence frame.
 
-Not included: the user's own microphone and camera, audio while the user is deafened
-(it is not decrypted then), and video Discord does not send, such as streams the user is
-not watching.
+Not included: audio while the user is deafened (it is not decrypted then), and video
+Discord does not send, such as streams the user is not watching.
 
 ## Attachment archive (preview)
 

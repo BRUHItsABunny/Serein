@@ -287,6 +287,9 @@ pub struct Bridge {
 	media_retry: BTreeMap<String, Instant>,
 	/// Hands tapped call media to the workers that may receive it.
 	media_tap: crate::media_tap::Pump,
+	/// What each plugin last told its media worker with `media_state`, until it is
+	/// disabled or Serein closes.
+	media_states: BTreeMap<String, serde_json::Value>,
 }
 
 /// A plugin's media worker for one call.
@@ -295,6 +298,8 @@ struct MediaSession {
 	channel: model::Id,
 	participants: BTreeSet<model::Id>,
 	started: Instant,
+	/// Whether the worker wants media chunks or, for now, only events.
+	chunks: bool,
 }
 
 /// How long a failed media worker waits before it starts again in the same call.
@@ -984,6 +989,7 @@ impl Bridge {
 			self.file_pick = None;
 			self.media.clear();
 			self.media_retry.clear();
+			self.media_states.clear();
 			messaging.extensions.channel_hooks.clear();
 			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
@@ -1371,6 +1377,7 @@ impl Bridge {
 					self.refresh_api_proxy();
 					self.refresh_start_screen();
 					messaging.extensions.remove_runtime(&id);
+					self.media_states.remove(&id);
 					self.apply_theme(ctx);
 					self.entries(messaging);
 					// The gallery reports the outcome; an open theme editor is a different task.
@@ -1388,6 +1395,7 @@ impl Bridge {
 						.is_some_and(|pending| pending.tick.as_deref() == Some(id.as_str())) =>
 				{
 					self.show_captions(state, messaging, &id, output.captions.take());
+					self.set_media_state(&id, output.media_state.take());
 					let now = Instant::now();
 					if let Some(schedule) = self.ticks.get_mut(&id) {
 						schedule.next_due =
@@ -2300,22 +2308,36 @@ impl Bridge {
 				continue;
 			}
 			let repaint = ctx.clone();
+			// A worker that writes files gets a longer queue, so a disk that stalls for a
+			// moment does not cut holes into what it records.
+			let backlog = if self.installed.iter().any(|entry| {
+				entry.manifest.id == *id && entry.manifest.capabilities.contains(&Capability::Files)
+			}) {
+				extension_host::media::Backlog::FILES
+			} else {
+				extension_host::media::Backlog::LIVE
+			};
 			let worker = self.host.as_ref().unwrap().start_media(
 				id,
 				account,
+				backlog,
 				Arc::new(move || repaint.request_repaint()),
 			);
 			let guild = state.channel(channel).and_then(|channel| channel.guild);
-			worker.push(
-				vec![extensions::MediaItem::Event {
+			let mut first = vec![extensions::MediaItem::Event {
+				time_us: 0,
+				event: extensions::CallEvent::Started {
+					channel_id: channel.0.to_string(),
+					guild_id: guild.map(|guild| guild.0.to_string()),
+				},
+			}];
+			if let Some(state) = self.media_states.get(id) {
+				first.push(extensions::MediaItem::State {
 					time_us: 0,
-					event: extensions::CallEvent::Started {
-						channel_id: channel.0.to_string(),
-						guild_id: guild.map(|guild| guild.0.to_string()),
-					},
-				}],
-				Vec::new(),
-			);
+					state: state.clone(),
+				});
+			}
+			worker.push(first, Vec::new());
 			self.media.insert(
 				id.clone(),
 				MediaSession {
@@ -2323,6 +2345,7 @@ impl Bridge {
 					channel,
 					participants: BTreeSet::new(),
 					started: now,
+					chunks: true,
 				},
 			);
 		}
@@ -2377,6 +2400,7 @@ impl Bridge {
 							}
 						}
 					}
+					extension_host::media::MediaEvent::Chunks(chunks) => session.chunks = chunks,
 					extension_host::media::MediaEvent::Failed(error) => {
 						messaging.extensions.status =
 							format!("{id} stopped handling the call and restarts shortly. {error}");
@@ -2391,7 +2415,23 @@ impl Bridge {
 		}
 		self.update_media_tap();
 	}
-	/// Points the media tap at the running workers granted packets or audio.
+	/// Keeps what a plugin tells its media worker, and hands it to the running one.
+	fn set_media_state(&mut self, id: &str, state: Option<serde_json::Value>) {
+		let Some(state) = state else {
+			return;
+		};
+		if let Some(session) = self.media.get(id) {
+			session.worker.push(
+				vec![extensions::MediaItem::State {
+					time_us: session.started.elapsed().as_micros() as u64,
+					state: state.clone(),
+				}],
+				Vec::new(),
+			);
+		}
+		self.media_states.insert(id.to_owned(), state);
+	}
+	/// Points the media tap at the running workers granted packets or audio that want them.
 	fn update_media_tap(&mut self) {
 		let targets = self
 			.media
@@ -2406,8 +2446,8 @@ impl Bridge {
 				Some(crate::media_tap::Target {
 					plugin: id.clone(),
 					sender: session.worker.sender(),
-					packets: grants.contains(&Capability::MediaPackets),
-					audio: grants.contains(&Capability::MediaAudio),
+					packets: session.chunks && grants.contains(&Capability::MediaPackets),
+					audio: session.chunks && grants.contains(&Capability::MediaAudio),
 					own: grants.contains(&Capability::MediaOwn),
 					started: session.started,
 				})
@@ -3011,6 +3051,7 @@ impl Bridge {
 	) {
 		let (invocation, context) = invocation;
 		self.show_captions(state, messaging, id, output.captions.take());
+		self.set_media_state(id, output.media_state.take());
 		if let Some(pick) = output.pick.take() {
 			if self.file_pick.is_some() || self.pick_request.is_some() {
 				messaging.extensions.status = "Finish the open folder or file picker first.".into();

@@ -57,6 +57,21 @@ pub enum MediaItem {
 		time_us: u64,
 		lost: u32,
 	},
+	/// What the plugin's other actions last set with `media_state`.
+	State {
+		time_us: u64,
+		state: serde_json::Value,
+	},
+}
+
+/// Largest `media_state`, as JSON.
+pub const MAX_MEDIA_STATE_BYTES: usize = 16 * 1024;
+
+pub(crate) fn validate_state(state: &serde_json::Value) -> Result<(), Error> {
+	if serde_json::to_vec(state).map_or(true, |bytes| bytes.len() > MAX_MEDIA_STATE_BYTES) {
+		return Err(Error::Limit);
+	}
+	Ok(())
 }
 
 /// Most streams one result may ask a keyframe for.
@@ -131,6 +146,7 @@ impl MediaBatch {
 					CallEvent::Ended => {}
 				},
 				MediaItem::Gap { stream, .. } => name(stream)?,
+				MediaItem::State { state, .. } => validate_state(state)?,
 				MediaItem::Chunk {
 					stream,
 					codec,

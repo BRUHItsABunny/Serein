@@ -232,6 +232,7 @@ mod tests {
 		let (worker, _) = (
 			extension_host::media::MediaWorker::spawn(
 				Box::new(|| Err("unused".into())),
+				extension_host::media::Backlog::LIVE,
 				Arc::new(|| {}),
 			),
 			(),
