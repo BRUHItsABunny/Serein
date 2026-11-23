@@ -242,6 +242,8 @@ pub struct Note {
 	/// Oldest first.
 	pub history: Vec<Revision>,
 	pub deleted: Vec<Archived>,
+	/// The conversation `deleted` belongs to, so another one never shows them.
+	pub deleted_channel: Option<Id>,
 	pub alternate: Option<Alternate>,
 }
 
@@ -339,7 +341,14 @@ impl Annotations {
 	/// A plugin given older messages may place a newer deleted one under the newest of
 	/// them. Each deleted message stays under the closest earlier message `plugin` placed it
 	/// under, so it is shown once, where it was.
-	pub fn set_deleted(&mut self, plugin: &str, name: &str, message: Id, mut rows: Vec<Archived>) {
+	pub fn set_deleted(
+		&mut self,
+		plugin: &str,
+		name: &str,
+		message: Id,
+		channel: Id,
+		mut rows: Vec<Archived>,
+	) {
 		rows.retain(|row| row.message > message);
 		let mut moved = Vec::new();
 		rows.retain(|row| {
@@ -361,7 +370,10 @@ impl Annotations {
 				note.deleted.retain(|kept| kept.message != row);
 			});
 		}
-		self.update(plugin, name, message, |note| note.deleted = rows);
+		self.update(plugin, name, message, |note| {
+			note.deleted = rows;
+			note.deleted_channel = Some(channel);
+		});
 	}
 	/// Sets the text `plugin` shows in place of `message`; empty text removes it.
 	pub fn set_alternate(
@@ -440,12 +452,13 @@ impl Annotations {
 		self.notes.get(&message).map_or(&[], Vec::as_slice)
 	}
 
-	/// The deleted rows plugins kept that fall after message `after` and before `before`, by
-	/// their own ids, oldest first, with the note that holds each. A timeline draws them after
-	/// the message shown before them, whichever message a plugin placed them under: a plugin
-	/// is not given every message, such as one with only pictures.
+	/// The deleted rows plugins kept in `channel` that fall after message `after` and before
+	/// `before`, by their own ids, oldest first, with the note that holds each. A timeline
+	/// draws them after the message shown before them, whichever message a plugin placed them
+	/// under: a plugin is not given every message, such as one with only pictures.
 	pub fn deleted_between(
 		&self,
+		channel: Id,
 		after: Id,
 		before: Option<Id>,
 	) -> impl Iterator<Item = (&Note, &Archived)> {
@@ -453,19 +466,19 @@ impl Annotations {
 		let start = Id(after.0.saturating_add(1)).min(end);
 		self.deleted
 			.range((start, String::new())..(end, String::new()))
-			.filter_map(|((row, plugin), anchor)| {
+			.filter_map(move |((row, plugin), anchor)| {
 				let note = self
 					.get(*anchor)
 					.iter()
-					.find(|note| note.plugin == *plugin)?;
+					.find(|note| note.plugin == *plugin && note.deleted_channel == Some(channel))?;
 				Some((note, note.deleted.iter().find(|kept| kept.message == *row)?))
 			})
 	}
 
 	/// Changes whenever [`Self::deleted_between`] would show something else; 0 without rows.
-	pub fn deleted_fingerprint(&self, after: Id, before: Option<Id>) -> u64 {
+	pub fn deleted_fingerprint(&self, channel: Id, after: Id, before: Option<Id>) -> u64 {
 		use std::hash::{Hash, Hasher};
-		let mut rows = self.deleted_between(after, before).peekable();
+		let mut rows = self.deleted_between(channel, after, before).peekable();
 		if rows.peek().is_none() {
 			return 0;
 		}
@@ -611,6 +624,7 @@ mod tests {
 			"a",
 			"A",
 			Id(1),
+			Id(7),
 			vec![Archived {
 				message: Id(2),
 				author: "Ada".into(),
@@ -624,7 +638,7 @@ mod tests {
 		let kept = &notes.get(Id(1))[0];
 		assert_eq!((kept.history.len(), kept.deleted.len()), (1, 1));
 		notes.set_history("a", "A", Id(1), Vec::new());
-		notes.set_deleted("a", "A", Id(1), Vec::new());
+		notes.set_deleted("a", "A", Id(1), Id(7), Vec::new());
 		assert_eq!(notes.get(Id(1)).len(), 1, "only plugin b's note is left");
 		// An alternate alone keeps an entry, and the first plugin's is shown.
 		notes.set_alternate("c", "C", Id(1), "Translation", "later plugin");
@@ -664,20 +678,20 @@ mod tests {
 		};
 		// The newest batch places 90 under 80; an older batch, ending at 40, places it
 		// there too, with 30 that belongs under it.
-		notes.set_deleted("a", "A", Id(80), vec![gone(90)]);
-		notes.set_deleted("a", "A", Id(40), vec![gone(30), gone(45), gone(90)]);
+		notes.set_deleted("a", "A", Id(80), Id(7), vec![gone(90)]);
+		notes.set_deleted("a", "A", Id(40), Id(7), vec![gone(30), gone(45), gone(90)]);
 		assert_eq!(shown(&notes, 80), [90]);
 		assert_eq!(shown(&notes, 40), [45], "not a row before its own message");
 		// A closer message moves it; another plugin keeps its own placement.
-		notes.set_deleted("a", "A", Id(85), vec![gone(90)]);
-		notes.set_deleted("b", "B", Id(40), vec![gone(90)]);
+		notes.set_deleted("a", "A", Id(85), Id(7), vec![gone(90)]);
+		notes.set_deleted("b", "B", Id(40), Id(7), vec![gone(90)]);
 		assert_eq!((shown(&notes, 80), shown(&notes, 85)), (vec![], vec![90]));
 		assert_eq!(shown(&notes, 40), [45, 90]);
 		// Drawn by their own ids after the message shown before them, such as a picture the
 		// plugin was never given, whichever message they were placed under.
 		let between = |notes: &Annotations, after: u64, before: Option<u64>| {
 			notes
-				.deleted_between(Id(after), before.map(Id))
+				.deleted_between(Id(7), Id(after), before.map(Id))
 				.map(|(note, row)| (note.plugin.clone(), row.message.0))
 				.collect::<Vec<_>>()
 		};
@@ -688,8 +702,12 @@ mod tests {
 		);
 		assert_eq!(between(&notes, 45, Some(90)), [], "not the rows themselves");
 		assert_eq!(between(&notes, 88, None), [row("a", 90), row("b", 90)]);
+		// Another conversation's timeline shows none of them, as message ids say nothing
+		// about where a message was.
+		assert_eq!(notes.deleted_between(Id(8), Id(0), None).count(), 0);
+		assert_eq!(notes.deleted_fingerprint(Id(8), Id(0), None), 0);
 		// Its earlier versions, kept under its own id, change the rows it is drawn in.
-		let before = notes.deleted_fingerprint(Id(88), None);
+		let before = notes.deleted_fingerprint(Id(7), Id(88), None);
 		notes.set_history(
 			"a",
 			"A",
@@ -699,7 +717,7 @@ mod tests {
 				text: "first".into(),
 			}],
 		);
-		assert_ne!(notes.deleted_fingerprint(Id(88), None), before);
+		assert_ne!(notes.deleted_fingerprint(Id(7), Id(88), None), before);
 		// Removing a plugin, or evicting its notes, drops its rows from the order too.
 		notes.remove_plugin("b");
 		assert_eq!(

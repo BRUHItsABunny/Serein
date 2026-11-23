@@ -1611,10 +1611,12 @@ fn row_height_key(
 	row_key(message, previous, boundary, state)
 		^ u64::from(deleted)
 		^ notes.fingerprint(message.id)
-		^ notes.deleted_fingerprint(message.id, next).rotate_left(1)
+		^ notes
+			.deleted_fingerprint(message.channel, message.id, next)
+			.rotate_left(1)
 		^ previous.map_or(0, |previous| {
 			notes
-				.deleted_fingerprint(previous.id, Some(message.id))
+				.deleted_fingerprint(message.channel, previous.id, Some(message.id))
 				.rotate_left(2)
 		})
 }
@@ -3533,7 +3535,7 @@ impl TimelineView {
 				let new_day = previous.is_none_or(|previous| {
 					let shown = self
 						.notes
-						.deleted_between(previous.id, Some(id))
+						.deleted_between(message.channel, previous.id, Some(id))
 						.last()
 						.map_or(previous.id, |(_, row)| row.message);
 					timestamp(shown).date() != timestamp(id).date()
@@ -4452,8 +4454,11 @@ impl TimelineView {
 												});
 											}
 											let mut day = timestamp(id).date();
-											for (note, row) in self.notes.deleted_between(id, next)
-											{
+											for (note, row) in self.notes.deleted_between(
+												message.channel,
+												id,
+												next,
+											) {
 												let date = timestamp(row.message);
 												if date.date() != day {
 													day = date.date();

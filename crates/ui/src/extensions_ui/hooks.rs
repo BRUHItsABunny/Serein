@@ -83,6 +83,8 @@ pub(crate) enum NoteUpdate {
 		plugin: String,
 		name: String,
 		message: Id,
+		/// The conversation the rows were kept in.
+		channel: Id,
 		rows: Vec<extension_host::hooks::Archived>,
 	},
 	/// Text a plugin shows in place of a message; empty text removes it.
@@ -661,8 +663,15 @@ impl ExtensionUi {
 		}
 	}
 
-	/// Notes a plugin returned, shown under their messages.
-	pub fn receive_annotations(&mut self, id: &str, output: &extensions::Output) {
+	/// Notes a plugin returned, shown under their messages. `channel` is the conversation
+	/// the plugin was given; deleted rows without one are dropped, as message ids alone do
+	/// not say where they belong.
+	pub fn receive_annotations(
+		&mut self,
+		id: &str,
+		channel: Option<Id>,
+		output: &extensions::Output,
+	) {
 		let annotations: &[Annotation] = &output.annotations;
 		let additions = annotations.len()
 			+ output.histories.len()
@@ -736,7 +745,7 @@ impl ExtensionUi {
 			}
 		}
 		for group in &output.deleted_messages {
-			let Ok(anchor) = group.after_message_id.parse() else {
+			let (Ok(anchor), Some(channel)) = (group.after_message_id.parse(), channel) else {
 				continue;
 			};
 			let rows = group
@@ -764,6 +773,7 @@ impl ExtensionUi {
 				plugin: id.to_owned(),
 				name: name.clone(),
 				message: Id(anchor),
+				channel,
 				rows,
 			});
 		}
@@ -812,8 +822,9 @@ impl ExtensionUi {
 					plugin,
 					name,
 					message,
+					channel,
 					rows,
-				} => into.set_deleted(&plugin, &name, message, rows),
+				} => into.set_deleted(&plugin, &name, message, channel, rows),
 				NoteUpdate::Alternate {
 					plugin,
 					name,

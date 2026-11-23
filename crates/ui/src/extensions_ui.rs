@@ -1248,7 +1248,20 @@ impl ExtensionUi {
 		if self.receive_page(&id, &invocation, &mut output, state) {
 			return;
 		}
-		self.receive_annotations(&id, &output);
+		// The conversation the plugin was given: the batch's, the chosen message's, or the
+		// one open when it ran.
+		let channel = invocation
+			.annotate
+			.as_ref()
+			.map(|batch| batch.channel_id.as_str())
+			.or(invocation
+				.selected_message_ref
+				.as_ref()
+				.map(|message| message.channel_id.as_str()))
+			.and_then(|channel| channel.parse().ok())
+			.map(Id)
+			.or(context.channel);
+		self.receive_annotations(&id, channel, &output);
 		// Notes need no review: a batch, or a message action that only annotated.
 		if invocation.annotate.is_some()
 			|| (!output.annotations.is_empty()
