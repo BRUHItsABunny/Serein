@@ -271,7 +271,7 @@ messages, 100 entries each and 64 participant IDs respectively. The voice roster
 up to 128 tracked participants with names and flags across voice channels the account
 can view, on its own 16-KiB byte budget within the snapshot. A simultaneous
 `message_details` grant lowers the timeline row limit to 20, retaining its 20-KiB
-byte budget and the shared 10-million Wasm fuel limit; valid wire size alone does not
+byte budget and the shared Wasm fuel limit (10 million plus 150 per input byte); valid wire size alone does not
 guarantee execution fits the fuel budget. Collector budgets
 include item overhead and escaped text: 10 KiB channels (plus 48 KiB and up to 250
 channels for the focus server, trimmed from the end to keep the snapshot within

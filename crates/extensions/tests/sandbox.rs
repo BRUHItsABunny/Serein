@@ -1910,3 +1910,33 @@ fn media_workers_copy_large_batches_at_the_price_of_wasm_copies() {
 		.invoke(&batch(FULL as u32), vec![7; FULL])
 		.expect("a full batch has fuel to move its data");
 }
+
+/// Decoding its input is work every plugin must do, and the input's size is mostly the
+/// snapshot the host chose to send, so an invocation's fuel grows with it: work that
+/// does not fit next to a small input fits next to a large one.
+#[test]
+fn invocations_get_fuel_for_the_input_they_must_decode() {
+	let mut package = plugin(&format!(
+		r#"(module
+		(memory (export "memory") 8)
+		(data (i32.const 16) "{{}}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 65536))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(local $n i32)
+			;; Work worth 12,000,000 fuel: six per turn.
+			(local.set $n (i32.const 2000000))
+			(loop $work
+				(br_if $work (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(i64.const {}))
+		)"#,
+		(16_u64 << 32) | 2,
+	));
+	package.manifest.capabilities.push(Capability::Storage);
+	let input = |storage: usize| Invocation {
+		action: "run".into(),
+		storage: Some("x".repeat(storage)),
+		..Default::default()
+	};
+	assert!(matches!(invoke(&package, &input(10)), Err(Error::Fuel)));
+	invoke(&package, &input(150 * 1024)).expect("a large input brings its fuel");
+}

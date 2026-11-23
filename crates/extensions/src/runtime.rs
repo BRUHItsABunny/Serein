@@ -11,6 +11,11 @@ use wasmi::{
 
 const MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const FUEL: u64 = 10_000_000;
+/// Extra fuel an invocation gets per byte of its encoded input. Decoding JSON in the
+/// sandbox costs roughly 70 to 200 fuel per byte, and the input's size is mostly the
+/// snapshot Serein chose to send, so a large snapshot must not leave the plugin's own work
+/// without fuel: a full 256 KiB input gets about 49,000,000 in all.
+pub const INPUT_BYTE_FUEL: u64 = 150;
 
 fn engine() -> Engine {
 	let mut config = Config::default();
@@ -528,7 +533,8 @@ pub fn invoke_with(
 	let bytes = prepare(package, input)?;
 	let engine = engine();
 	let module = granted_module(&engine, package, grants)?;
-	let (mut store, instance) = instantiate(&engine, &module, services, MEMORY_BYTES, FUEL)?;
+	let fuel = FUEL.saturating_add((bytes.len() as u64).saturating_mul(INPUT_BYTE_FUEL));
+	let (mut store, instance) = instantiate(&engine, &module, services, MEMORY_BYTES, fuel)?;
 	run(&mut store, &instance, &package.manifest, input, &bytes)
 }
 

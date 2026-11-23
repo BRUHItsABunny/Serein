@@ -302,8 +302,8 @@ content (8 KiB), forum data (6 KiB) and conversation activity (2 KiB) also share
 that ceiling; no new total snapshot allocation is authorized. The timeline
 skips messages larger than 4 KiB and reports partial data. Granting
 `message_details` also caps both timeline text and metadata rows at 12 when requested together, while preserving
-the 20-KiB timeline byte budget and shared 10-million-fuel limit. Valid wire-sized
-inputs can still exceed execution fuel. Bounded list responses
+the 20-KiB timeline byte budget and shared fuel limit (10 million plus 150 per input
+byte). Valid wire-sized inputs can still exceed execution fuel. Bounded list responses
 expose `truncated`; voice participant IDs are capped without a completeness flag.
 No snapshot includes tokens, deleted/ephemeral text, attachment bytes/URLs, raw
 voice/video/screen media or the unbounded client state.
@@ -513,7 +513,7 @@ identify a useful next check, not a complete crash trace:
 
 | Host error category | Author action |
 | --- | --- |
-| `Fuel` | Reduce handler loops, JSON work or requested data; the limit is 10 million fuel. |
+| `Fuel` | Reduce handler loops, JSON work or requested data; the limit is 10 million fuel plus 150 per byte of input. |
 | `Memory` | Reduce memory/table allocation; linear memory remains capped at 16 MiB. This category also covers engine allocation failure, not only hitting that exact cap. |
 | `Stack` | Reduce recursion and stack allocations. |
 | `Trap` | Check for panic, invalid memory access or arithmetic traps. No panic text is exposed. |
@@ -542,7 +542,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Compiled Wasm | 4 MiB | Keep the module small; the host validates imports and compilation limits too. |
 | JSON package | 16 MiB | Includes the manifest and encoded payload. |
 | Linear memory | 16 MiB | Includes decoding, handler allocations and output buffers. |
-| Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
+| Execution fuel | 10,000,000 plus 150 per byte of encoded input (about 49,000,000 for a full 256 KiB input) | Shared by parsing and execution. Decoding JSON costs roughly 70–200 fuel per byte, so a large snapshot brings fuel for itself; decode only the fields you use. A valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
 | Manifest actions / capabilities | 16 / 96 distinct | Only the 73 supported capability names are currently accepted. |

@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod runtime;
 pub use runtime::{
-	MEDIA_BYTE_FUEL, MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke, invoke_with,
+	INPUT_BYTE_FUEL, MEDIA_BYTE_FUEL, MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke,
+	invoke_with,
 };
 pub mod imports;
 pub mod message_hooks;
