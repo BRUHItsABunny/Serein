@@ -530,6 +530,15 @@ fn plugin_history(
 				.color(colors.muted),
 		);
 	}
+	earlier_versions(ui, notes, colors);
+}
+
+/// Each earlier version a plugin kept of a message, oldest first.
+fn earlier_versions(
+	ui: &mut egui::Ui,
+	notes: &[extension_host::hooks::Note],
+	colors: &crate::design::Palette,
+) {
 	for note in notes {
 		for revision in &note.history {
 			egui::Frame::new()
@@ -563,11 +572,13 @@ fn plugin_history(
 	}
 }
 
-/// A deleted message a plugin kept, drawn plainly where it was.
+/// A deleted message a plugin kept, drawn plainly where it was, after the earlier versions
+/// plugins showed of it while it was loaded.
 fn archived_row(
 	ui: &mut egui::Ui,
 	plugin: &str,
 	row: &extension_host::hooks::Archived,
+	history: &[extension_host::hooks::Note],
 	colors: &crate::design::Palette,
 ) {
 	egui::Frame::new()
@@ -594,6 +605,7 @@ fn archived_row(
 					.color(colors.danger),
 				);
 			});
+			earlier_versions(ui, history, colors);
 			ui.add(
 				egui::Label::new(RichText::new(&row.text).color(colors.muted).strikethrough())
 					.wrap(),
@@ -4398,7 +4410,13 @@ impl TimelineView {
 											}
 											for note in notes {
 												for row in &note.deleted {
-													archived_row(ui, &note.name, row, &colors);
+													archived_row(
+														ui,
+														&note.name,
+														row,
+														self.notes.get(row.message),
+														&colors,
+													);
 												}
 											}
 											if !message.components.is_empty() {

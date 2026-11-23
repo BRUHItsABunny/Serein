@@ -322,7 +322,35 @@ impl Annotations {
 		self.update(plugin, name, message, |note| note.history = history);
 	}
 	/// Sets the deleted messages `plugin` shows under `message`; an empty list removes them.
-	pub fn set_deleted(&mut self, plugin: &str, name: &str, message: Id, rows: Vec<Archived>) {
+	///
+	/// A plugin given older messages may place a newer deleted one under the newest of
+	/// them. Each deleted message stays under the closest earlier message `plugin` placed it
+	/// under, so it is shown once, where it was.
+	pub fn set_deleted(&mut self, plugin: &str, name: &str, message: Id, mut rows: Vec<Archived>) {
+		rows.retain(|row| row.message > message);
+		let mut moved = Vec::new();
+		rows.retain(|row| {
+			let elsewhere = self.notes.iter().find_map(|(anchor, notes)| {
+				let held = notes.iter().any(|note| {
+					note.plugin == plugin
+						&& note.deleted.iter().any(|kept| kept.message == row.message)
+				});
+				(held && *anchor != message).then_some(*anchor)
+			});
+			match elsewhere {
+				Some(anchor) if anchor > message => false,
+				Some(anchor) => {
+					moved.push((anchor, row.message));
+					true
+				}
+				None => true,
+			}
+		});
+		for (anchor, row) in moved {
+			self.update(plugin, name, anchor, |note| {
+				note.deleted.retain(|kept| kept.message != row);
+			});
+		}
 		self.update(plugin, name, message, |note| note.deleted = rows);
 	}
 	/// Sets the text `plugin` shows in place of `message`; empty text removes it.
@@ -392,8 +420,9 @@ impl Annotations {
 		self.notes.get(&message).map_or(&[], Vec::as_slice)
 	}
 
-	/// Changes whenever the notes under `message` change; 0 without notes. Row layouts
-	/// cached by message include it.
+	/// Changes whenever the notes under `message` change, including the earlier versions of
+	/// the deleted messages shown under it; 0 without notes. Row layouts cached by message
+	/// include it.
 	pub fn fingerprint(&self, message: Id) -> u64 {
 		use std::hash::{Hash, Hasher};
 		let Some(notes) = self.notes.get(&message) else {
@@ -401,6 +430,9 @@ impl Annotations {
 		};
 		let mut hasher = std::collections::hash_map::DefaultHasher::new();
 		notes.hash(&mut hasher);
+		for row in notes.iter().flat_map(|note| &note.deleted) {
+			self.get(row.message).hash(&mut hasher);
+		}
 		hasher.finish()
 	}
 
@@ -556,5 +588,46 @@ mod tests {
 		assert!(notes.get(Id(1)).is_empty(), "oldest message evicted");
 		notes.remove_plugin("a");
 		assert!(notes.is_empty() && notes.bytes == 0);
+	}
+
+	#[test]
+	fn a_deleted_message_stays_under_the_closest_earlier_message() {
+		let mut notes = Annotations::default();
+		let gone = |id| Archived {
+			message: Id(id),
+			author: "Ada".into(),
+			time_ms: None,
+			text: "gone".into(),
+		};
+		let shown = |notes: &Annotations, anchor| {
+			notes
+				.get(Id(anchor))
+				.iter()
+				.flat_map(|note| note.deleted.iter().map(|row| row.message.0))
+				.collect::<Vec<_>>()
+		};
+		// The newest batch places 90 under 80; an older batch, ending at 40, places it
+		// there too, with 30 that belongs under it.
+		notes.set_deleted("a", "A", Id(80), vec![gone(90)]);
+		notes.set_deleted("a", "A", Id(40), vec![gone(30), gone(45), gone(90)]);
+		assert_eq!(shown(&notes, 80), [90]);
+		assert_eq!(shown(&notes, 40), [45], "not a row before its own message");
+		// A closer message moves it; another plugin keeps its own placement.
+		notes.set_deleted("a", "A", Id(85), vec![gone(90)]);
+		notes.set_deleted("b", "B", Id(40), vec![gone(90)]);
+		assert_eq!((shown(&notes, 80), shown(&notes, 85)), (vec![], vec![90]));
+		assert_eq!(shown(&notes, 40), [45, 90]);
+		// Its earlier versions, kept under its own id, change the row it is shown under.
+		let before = notes.fingerprint(Id(85));
+		notes.set_history(
+			"a",
+			"A",
+			Id(90),
+			vec![Revision {
+				time_ms: None,
+				text: "first".into(),
+			}],
+		);
+		assert_ne!(notes.fingerprint(Id(85)), before);
 	}
 }
