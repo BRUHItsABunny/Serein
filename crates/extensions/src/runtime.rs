@@ -113,6 +113,8 @@ struct HostState {
 	pending: Option<Vec<u8>>,
 	/// The current media batch's binary payload, for `media_read`.
 	media: Vec<u8>,
+	/// A media worker's instance, whose copies cost what Wasm's own do.
+	media_worker: bool,
 }
 
 fn exported_memory(caller: &Caller<'_, HostState>) -> Result<Memory, wasmi::Error> {
@@ -131,12 +133,26 @@ fn span(pointer: i32, length: i32, max: u32) -> Option<(usize, usize)> {
 
 /// Charges one host call plus `bytes` copied, trapping when the call budget or fuel runs out.
 fn charge(caller: &mut Caller<'_, HostState>, bytes: u64) -> Result<(), wasmi::Error> {
+	charge_fuel(caller, bytes.saturating_mul(imports::BYTE_FUEL))
+}
+
+/// Charges one host call that copies `bytes` of media or file data: in a media worker at
+/// the rate of Wasm's own `memory.copy`, elsewhere like any other copy.
+fn charge_media(caller: &mut Caller<'_, HostState>, bytes: u64) -> Result<(), wasmi::Error> {
+	if caller.data().media_worker {
+		charge_fuel(caller, bytes.div_ceil(imports::MEDIA_COPY_BYTES_PER_FUEL))
+	} else {
+		charge(caller, bytes)
+	}
+}
+
+fn charge_fuel(caller: &mut Caller<'_, HostState>, copied: u64) -> Result<(), wasmi::Error> {
 	let state = caller.data_mut();
 	if state.calls >= imports::MAX_HOST_CALLS {
 		return Err(TrapCode::OutOfFuel.into());
 	}
 	state.calls += 1;
-	let cost = imports::CALL_FUEL.saturating_add(bytes.saturating_mul(imports::BYTE_FUEL));
+	let cost = imports::CALL_FUEL.saturating_add(copied);
 	let fuel = caller.get_fuel()?;
 	if fuel < cost {
 		caller.set_fuel(0)?;
@@ -313,7 +329,7 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					charge(&mut caller, 0)?;
 					return Ok(status::INVALID);
 				};
-				charge(&mut caller, (length + data_length) as u64)?;
+				charge_media(&mut caller, (length + data_length) as u64)?;
 				let memory = exported_memory(&caller)?;
 				let mut header = vec![0; length];
 				let mut bytes = vec![0; data_length];
@@ -346,7 +362,7 @@ fn linker(engine: &Engine) -> Result<Linker<HostState>, Error> {
 					charge(&mut caller, 0)?;
 					return Ok(status::INVALID);
 				};
-				charge(&mut caller, length as u64)?;
+				charge_media(&mut caller, length as u64)?;
 				let bytes = caller.data().media[offset..end].to_vec();
 				exported_memory(&caller)?
 					.write(&mut caller, pointer, &bytes)
@@ -481,6 +497,7 @@ fn instantiate(
 			calls: 0,
 			pending: None,
 			media: Vec::new(),
+			media_worker: false,
 		},
 	);
 	store.limiter(|state| &mut state.limits);
@@ -610,8 +627,11 @@ fn run(
 
 /// Linear memory a media instance may grow to.
 pub const MEDIA_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-/// Fuel each media batch may spend.
+/// Fuel each media batch may spend, plus [`MEDIA_BYTE_FUEL`] per byte of its data.
 pub const MEDIA_FUEL: u64 = 50_000_000;
+/// Extra fuel per byte of a media batch's data, so a batch carrying a large picture has
+/// room to read, convert and write it: a full 4 MiB batch gets about 117,000,000.
+pub const MEDIA_BYTE_FUEL: u64 = 16;
 
 /// A plugin instance that stays loaded across calls, so its memory carries state from one
 /// media batch to the next. Each call gets fresh fuel and host-call budgets. After any
@@ -634,8 +654,9 @@ impl MediaInstance {
 		package.manifest.validate()?;
 		let engine = engine();
 		let module = granted_module(&engine, &package, grants)?;
-		let (store, instance) =
+		let (mut store, instance) =
 			instantiate(&engine, &module, services, MEDIA_MEMORY_BYTES, MEDIA_FUEL)?;
+		store.data_mut().media_worker = true;
 		Ok(Self {
 			store,
 			instance,
@@ -645,9 +666,8 @@ impl MediaInstance {
 	/// Runs one call with `data`, the batch's binary payload `media_read` copies from.
 	pub fn invoke(&mut self, input: &Invocation, data: Vec<u8>) -> Result<Output, Error> {
 		let bytes = prepare(&self.package, input)?;
-		self.store
-			.set_fuel(MEDIA_FUEL)
-			.map_err(|_| Error::Execution)?;
+		let fuel = MEDIA_FUEL.saturating_add((data.len() as u64).saturating_mul(MEDIA_BYTE_FUEL));
+		self.store.set_fuel(fuel).map_err(|_| Error::Execution)?;
 		let state = self.store.data_mut();
 		state.calls = 0;
 		state.pending = None;

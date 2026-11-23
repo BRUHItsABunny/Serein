@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod runtime;
-pub use runtime::{MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke, invoke_with};
+pub use runtime::{
+	MEDIA_BYTE_FUEL, MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke, invoke_with,
+};
 pub mod imports;
 pub mod message_hooks;
 pub use message_hooks::{

@@ -1858,3 +1858,55 @@ fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
 	unpaired.actions.clear();
 	assert!(matches!(unpaired.validate(), Err(Error::Capability)));
 }
+
+/// A media worker moves every byte of the call through `media_read` and `file_write`, so
+/// those copies cost what Wasm's own do: reading a full 4 MiB batch eight times and
+/// writing it out would take 151,000,000 fuel at the general per-byte price.
+#[test]
+fn media_workers_copy_large_batches_at_the_price_of_wasm_copies() {
+	const FULL: usize = extensions::media::MAX_MEDIA_DATA_BYTES as usize;
+	let mut package = plugin(&format!(
+		r#"(module
+		(import "serein" "media_read" (func $read (param i32 i32 i32) (result i32)))
+		(import "serein" "file_write" (func $write (param i32 i32 i32 i32) (result i32)))
+		(memory (export "memory") 80)
+		(data (i32.const 16) "{{}}")
+		(data (i32.const 32) "{{\"root\":\"private\",\"path\":\"a\"}}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 4096))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(local $n i32) (local $length i32)
+			(local.set $length (call $read (i32.const 65536) (i32.const 0) (i32.const {FULL})))
+			(local.set $n (i32.const 7))
+			(loop $reads
+				(drop (call $read (i32.const 65536) (i32.const 0) (local.get $length)))
+				(br_if $reads (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(local.set $n (i32.const 4))
+			(loop $writes
+				(drop (call $write (i32.const 32) (i32.const 29) (i32.const 65536) (i32.const 1048576)))
+				(br_if $writes (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(i64.const {}))
+		)"#,
+		(16_u64 << 32) | 2,
+	));
+	package.manifest.capabilities = vec![Capability::MediaWorker, Capability::Files];
+	package.manifest.actions = vec![Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	}];
+	let grants = package.manifest.capabilities.clone();
+	let mut worker = MediaInstance::new(package, &grants, Box::new(Fixed)).unwrap();
+	let batch = |data_bytes| Invocation {
+		action: "media".into(),
+		media: Some(Box::new(MediaBatch {
+			seq: 1,
+			dropped: 0,
+			data_bytes,
+			items: Vec::new(),
+		})),
+		..Default::default()
+	};
+	worker
+		.invoke(&batch(FULL as u32), vec![7; FULL])
+		.expect("a full batch has fuel to move its data");
+}

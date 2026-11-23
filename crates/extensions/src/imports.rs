@@ -18,6 +18,10 @@ pub const MAX_HOST_CALLS: u32 = 4096;
 pub(crate) const CALL_FUEL: u64 = 1_000;
 /// Fuel charged per byte a host call copies into or out of Wasm memory.
 pub(crate) const BYTE_FUEL: u64 = 4;
+/// Bytes per unit of fuel that a media worker's `media_read` and `file_write` copy: what
+/// Wasm's own `memory.copy` pays. A worker moves every byte of the call's media through
+/// these, so the general per-byte price would leave a large picture no fuel to work with.
+pub(crate) const MEDIA_COPY_BYTES_PER_FUEL: u64 = 64;
 /// Largest buffer one `random_fill` call may fill.
 pub const MAX_RANDOM_BYTES: u32 = 4096;
 /// Largest request one `db_execute` call may send.

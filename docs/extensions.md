@@ -547,7 +547,7 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
 | Manifest actions / capabilities | 16 / 96 distinct | Only the 73 supported capability names are currently accepted. |
 | Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
-| Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied | Exceeding either ends the call with the fuel error. |
+| Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied (1 per 64 bytes for a media worker's `media_read` and `file_write`) | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
 | Plugin database | 64 MiB file by default (user-selectable 64 MiB-16 GiB); 256 KiB per request and reply; about 100 million SQLite instructions per invocation | See [plugin database](#plugin-database-preview). |
@@ -991,8 +991,10 @@ and read at most 512 MiB each.
 With `media_worker`, a plugin declares one action with `surface: "media"`. While the user
 is in a call, the host keeps one instance of the plugin loaded on its own thread, so its
 memory carries state from one call of `serein_invoke` to the next, and runs the action
-once per batch. The instance may grow to 64 MiB of memory, and each batch gets fresh fuel
-(50,000,000) and host-call budgets.
+once per batch. The instance may grow to 64 MiB of memory, and each batch gets fresh
+host-call budgets and fresh fuel: 50,000,000 plus 16 per byte of the batch's data, so a
+full 4 MiB batch gets about 117,000,000. Its `media_read` and `file_write` copies cost 1
+fuel per 64 bytes, as Wasm's own `memory.copy` does, instead of 4 per byte.
 
 The action receives `media`: `seq`, `dropped` (batches the host discarded because the
 plugin fell behind), `data_bytes` and up to 256 `items` in time order:
