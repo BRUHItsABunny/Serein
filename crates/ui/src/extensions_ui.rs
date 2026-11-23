@@ -4083,6 +4083,9 @@ fn capability_label(capability: Capability) -> &'static str {
 		Capability::MediaArchive => {
 			"Save original attachments of messages it receives into its own folder"
 		}
+		Capability::MediaOwn => {
+			"Also receive your own microphone, camera and screen share in your calls, as sent"
+		}
 		Capability::MediaWorker => {
 			"Stay running during your calls and hear who joins and leaves, and call media once available"
 		}

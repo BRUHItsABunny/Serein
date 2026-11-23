@@ -2408,6 +2408,7 @@ impl Bridge {
 					sender: session.worker.sender(),
 					packets: grants.contains(&Capability::MediaPackets),
 					audio: grants.contains(&Capability::MediaAudio),
+					own: grants.contains(&Capability::MediaOwn),
 					started: session.started,
 				})
 			})

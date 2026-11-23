@@ -151,6 +151,9 @@ pub enum Capability {
 	/// Save original attachments into the private folder with [`crate::host::archive`].
 	/// Requires `files`.
 	MediaArchive,
+	/// Also receive the user's own microphone, camera and screen share, as sent, in media
+	/// batches. Requires `media_packets`.
+	MediaOwn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

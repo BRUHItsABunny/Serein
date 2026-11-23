@@ -97,6 +97,7 @@ impl HostInfo {
 				Capability::MediaPackets,
 				Capability::MediaAudio,
 				Capability::MediaArchive,
+				Capability::MediaOwn,
 			],
 			app_events: &[
 				AppEventKind::Ready,

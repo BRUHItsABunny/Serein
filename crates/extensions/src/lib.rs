@@ -217,6 +217,9 @@ pub enum Capability {
 	/// Save original message attachments from Discord's CDN into the private folder with
 	/// `serein.attachment_fetch`. Requires `files`.
 	MediaArchive,
+	/// Also receive the user's own microphone, camera, screen share and screen share audio,
+	/// as sent, in `media` batches. Requires `media_packets`.
+	MediaOwn,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -1121,6 +1124,11 @@ impl Manifest {
 		if (capabilities.contains(&Capability::MediaPackets)
 			|| capabilities.contains(&Capability::MediaAudio))
 			&& !capabilities.contains(&Capability::MediaWorker)
+		{
+			return Err(Error::Capability);
+		}
+		if capabilities.contains(&Capability::MediaOwn)
+			&& !capabilities.contains(&Capability::MediaPackets)
 		{
 			return Err(Error::Capability);
 		}

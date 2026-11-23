@@ -695,6 +695,7 @@ async fn run_inner(
 							   video.announced=true;
 						   }
 						   let normalized=crate::video_sps::normalize(&frame.data)?;
+						   crate::tap::push_own(crate::tap::Source::Camera,credentials.user.0,"h264",frame.timestamp,None,frame.keyframe,&normalized);
 						   let encrypted=dave.session.encrypt(davey::MediaType::VIDEO,davey::Codec::H264,&normalized).map_err(|_|"DAVE camera encryption failed")?;
 						   video.packetize(&encrypted,frame.timestamp,encryption.as_mut().ok_or("Missing camera transport key")?)?;
 					   }
@@ -728,8 +729,9 @@ async fn run_inner(
 							   }
 							   soft_clip.apply(&mut stereo);
 							   let length=encoder.encode_float(&stereo,&mut encoded).map_err(|_|"Opus encoding failed")?;
+							   crate::tap::push_own(crate::tap::Source::Voice,credentials.user.0,"opus",timestamp,Some(sequence),false,&encoded[..length]);
 							   dave.session.encrypt_opus(&encoded[..length]).map_err(|_|"DAVE audio encryption failed")?.into_owned()
-						   } else {silence-=1;davey::OPUS_SILENCE_PACKET.to_vec()};
+						   } else {silence-=1;crate::tap::push_own(crate::tap::Source::Voice,credentials.user.0,"opus",timestamp,Some(sequence),false,&davey::OPUS_SILENCE_PACKET);davey::OPUS_SILENCE_PACKET.to_vec()};
 						   let mut header=[0;12];header[0]=0x80;header[1]=120;header[2..4].copy_from_slice(&sequence.to_be_bytes());header[4..8].copy_from_slice(&timestamp.to_be_bytes());header[8..12].copy_from_slice(&ssrc.to_be_bytes());
 						   let wire=encryption.as_mut().ok_or("Missing voice transport key")?.seal(&header,&data)?;
 						   metrics.finish(crate::diagnostics::Stage::Encode, start);
@@ -808,7 +810,7 @@ async fn run_inner(
 					   let Some(user)=mixer.user(source) else{continue;};
 					   if !dave.ready || !dave.contains(user) || controls.borrow().deafened {continue;}
 					   let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&frame) else{continue;};
-					   if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::Voice,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(seq),keyframe:false,data:opus.clone()});}
+					   if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::Voice,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(seq),keyframe:false,own:false,data:opus.clone()});}
 					   mixer.push(source,seq,opus);
 					   metrics.finish(crate::diagnostics::Stage::Receive, start);
 				   },
@@ -1182,6 +1184,7 @@ fn decrypt_video(
 			rtp_timestamp: tapped.1,
 			sequence: None,
 			keyframe,
+			own: false,
 			data: data.clone(),
 		});
 	}
@@ -1790,6 +1793,7 @@ async fn run_stream_inner(
 					}
 					let start=metrics.start();
 					let length=shared.encoder.encode_float(&frame,&mut audio_encoded).map_err(|_|"Stream audio encoding failed")?;
+					crate::tap::push_own(crate::tap::Source::ScreenAudio,credentials.user.0,"opus",audio_timestamp,Some(audio_sequence),false,&audio_encoded[..length]);
 					let data=dave.session.encrypt_opus(&audio_encoded[..length]).map_err(|_|"DAVE stream audio encryption failed")?.into_owned();
 					let mut header=[0;12];header[0]=0x80;header[1]=120;header[2..4].copy_from_slice(&audio_sequence.to_be_bytes());header[4..8].copy_from_slice(&audio_timestamp.to_be_bytes());header[8..12].copy_from_slice(&audio_ssrc.to_be_bytes());
 					let crypto=encryption.as_mut().ok_or("Missing stream transport key")?;
@@ -1809,6 +1813,7 @@ async fn run_stream_inner(
 				if awaiting_keyframe && !frame.keyframe {continue;}
 				let start=metrics.start();
 				let normalized=crate::video_sps::normalize(&frame.data)?;
+				crate::tap::push_own(crate::tap::Source::Screen,credentials.user.0,"h264",frame.timestamp,None,frame.keyframe,&normalized);
 				let encrypted=dave.session.encrypt(davey::MediaType::VIDEO,davey::Codec::H264,&normalized).map_err(|_|"DAVE H264 encryption failed")?;
 				let packets=crate::video::packetize(&encrypted,&mut sequence,frame.timestamp,video_ssrc)?;
 				outgoing.queue(packets,Instant::now());
@@ -1864,7 +1869,7 @@ async fn run_stream_inner(
 					if !dave.contains(user) {continue;}
 					let start=metrics.start();
 					let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&rtp.payload) else {metrics.poll(false,1,false,0);continue;};
-					if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::ScreenAudio,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(rtp.sequence),keyframe:false,data:opus.clone()});}
+					if crate::tap::enabled() {crate::tap::push(crate::tap::Packet{source:crate::tap::Source::ScreenAudio,user,codec:"opus",received:std::time::Instant::now(),rtp_timestamp:rtp.timestamp,sequence:Some(rtp.sequence),keyframe:false,own:false,data:opus.clone()});}
 					metrics.finish(crate::diagnostics::Stage::Receive,start);
 					mixer.push(rtp.ssrc,rtp.sequence,rtp.timestamp,opus,&mut sync,Instant::now().into_std());
 					continue;

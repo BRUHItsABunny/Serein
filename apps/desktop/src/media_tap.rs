@@ -24,6 +24,8 @@ pub struct Target {
 	pub packets: bool,
 	/// 16 kHz samples (`media_audio`).
 	pub audio: bool,
+	/// The user's own media too (`media_own`).
+	pub own: bool,
 	/// The worker's media clock starts here.
 	pub started: Instant,
 }
@@ -32,7 +34,7 @@ pub struct Target {
 pub struct Pump {
 	targets: Arc<Mutex<Vec<Target>>>,
 	/// What the targets were last set to, so unchanged ones are not handed over again.
-	key: Vec<(String, bool, bool)>,
+	key: Vec<(String, bool, bool, bool)>,
 	running: Option<Arc<AtomicBool>>,
 }
 
@@ -41,17 +43,25 @@ impl Pump {
 	pub fn set_targets(&mut self, targets: Vec<Target>) {
 		let key: Vec<_> = targets
 			.iter()
-			.map(|target| (target.plugin.clone(), target.packets, target.audio))
+			.map(|target| {
+				(
+					target.plugin.clone(),
+					target.packets,
+					target.audio,
+					target.own,
+				)
+			})
 			.collect();
 		if key == self.key {
 			return;
 		}
 		self.key = key;
 		let wanted = targets.iter().any(|target| target.packets || target.audio);
+		let own = targets.iter().any(|target| target.packets && target.own);
 		if let Ok(mut current) = self.targets.lock() {
 			*current = targets;
 		}
-		tap::set_enabled(wanted);
+		tap::set_enabled(wanted, own);
 		match (&self.running, wanted) {
 			(None, true) => {
 				let running = Arc::new(AtomicBool::new(true));
@@ -150,6 +160,9 @@ fn batches(
 		lost,
 	};
 	for (index, packet) in packets.iter().enumerate() {
+		if packet.own && !target.own {
+			continue;
+		}
 		let chunk = |codec: &str, bytes: &[u8]| MediaItem::Chunk {
 			stream: stream(packet),
 			codec: codec.into(),
@@ -206,6 +219,7 @@ mod tests {
 			rtp_timestamp: 960,
 			sequence: source.audio().then_some(7),
 			keyframe: !source.audio(),
+			own: false,
 			data: vec![1; bytes],
 		}
 	}
@@ -228,6 +242,7 @@ mod tests {
 			sender: worker.sender(),
 			packets,
 			audio,
+			own: false,
 			started,
 		};
 		let at = started + Duration::from_millis(5);
@@ -278,6 +293,21 @@ mod tests {
 			matches!(&items[2], MediaItem::Gap { stream, lost: 1, .. } if stream == "screen:6")
 		);
 		assert_eq!(items.len(), 5);
+
+		// The user's own media reaches only targets granted it.
+		let mine = vec![Packet {
+			own: true,
+			..packet(tap::Source::Voice, 1, 2, at)
+		}];
+		assert!(batches(&target(true, false), &mine, &[], &[], at).is_empty());
+		let granted = Target {
+			own: true,
+			..target(true, false)
+		};
+		assert!(matches!(
+			&batches(&granted, &mine, &[], &[], at)[..],
+			[(items, _)] if matches!(&items[..], [MediaItem::Chunk { stream, .. }] if stream == "voice:1")
+		));
 
 		let many: Vec<_> = (0..MAX_MEDIA_ITEMS + 1)
 			.map(|_| packet(tap::Source::Voice, 5, 1, at))

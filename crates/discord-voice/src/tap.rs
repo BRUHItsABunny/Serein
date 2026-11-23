@@ -56,6 +56,8 @@ pub struct Packet {
 	/// RTP sequence number of audio packets.
 	pub sequence: Option<u16>,
 	pub keyframe: bool,
+	/// The user's own media, copied as sent; `user` is then the user's own ID.
+	pub own: bool,
 	pub data: Vec<u8>,
 }
 
@@ -69,6 +71,8 @@ struct Queue {
 #[derive(Default)]
 struct Tap {
 	enabled: AtomicBool,
+	/// Also copy the user's own media, for consumers granted it.
+	own: AtomicBool,
 	queue: Mutex<Queue>,
 	camera_keyframes: Lost,
 	screen_keyframes: Lost,
@@ -79,9 +83,11 @@ fn tap() -> &'static Tap {
 	TAP.get_or_init(Tap::default)
 }
 
-/// Switches copying on or off; off discards what is queued.
-pub fn set_enabled(enabled: bool) {
+/// Switches copying on or off, and copying the user's own media with it; off discards what
+/// is queued.
+pub fn set_enabled(enabled: bool, own: bool) {
 	let tap = tap();
+	tap.own.store(enabled && own, Ordering::Release);
 	tap.enabled.store(enabled, Ordering::Release);
 	if !enabled && let Ok(mut queue) = tap.queue.lock() {
 		*queue = Queue::default();
@@ -90,6 +96,32 @@ pub fn set_enabled(enabled: bool) {
 
 pub(crate) fn enabled() -> bool {
 	tap().enabled.load(Ordering::Relaxed)
+}
+
+/// Copies the user's own media as it is sent, before encryption, while that is wanted.
+pub(crate) fn push_own(
+	source: Source,
+	user: u64,
+	codec: &'static str,
+	rtp_timestamp: u32,
+	sequence: Option<u16>,
+	keyframe: bool,
+	data: &[u8],
+) {
+	if !tap().own.load(Ordering::Relaxed) {
+		return;
+	}
+	push(Packet {
+		source,
+		user,
+		codec,
+		received: Instant::now(),
+		rtp_timestamp,
+		sequence,
+		keyframe,
+		own: true,
+		data: data.to_vec(),
+	});
 }
 
 /// Queues a copy, or counts it lost when the queue is full.
@@ -189,6 +221,7 @@ mod tests {
 			rtp_timestamp: 0,
 			sequence: Some(1),
 			keyframe: false,
+			own: false,
 			data: vec![0xF8; bytes],
 		}
 	}
@@ -198,9 +231,9 @@ mod tests {
 	/// to 20 ms of 16 kHz audio.
 	#[test]
 	fn taps_copy_only_while_on_and_count_what_did_not_fit() {
-		set_enabled(false);
+		set_enabled(false, false);
 		assert!(!enabled());
-		set_enabled(true);
+		set_enabled(true, false);
 		for _ in 0..MAX_PACKETS + 3 {
 			push(packet(1, 1));
 		}
@@ -210,7 +243,7 @@ mod tests {
 		assert_eq!(lost, vec![(Source::Voice, 1, 3), (Source::Voice, 2, 1)]);
 		assert!(drain().0.is_empty(), "drained once");
 		push(packet(1, 1));
-		set_enabled(false);
+		set_enabled(false, false);
 		assert!(drain().0.is_empty());
 
 		// A 20 ms Opus frame decodes to 320 samples at 16 kHz.
