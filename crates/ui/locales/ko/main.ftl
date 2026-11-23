@@ -3944,8 +3944,7 @@ timeline-show-with-scroll-dismiss-message = 메시지 닫기
 timeline-show-with-scroll-display-limited-copy-message-for-the-full-text = 표시 제한됨 · 전체 텍스트를 보려면 메시지를 복사하세요
 # Context: show_with_scroll
 timeline-show-with-scroll-edited = (수정됨)
-timeline-plugin-history = (기록)
-timeline-plugin-history-from = { $plugin }에 저장된 이전 버전
+timeline-plugin-earlier = 이전 버전 · { $plugin }에 보관됨
 timeline-alternate-from = { $plugin }의 { $label }
 timeline-alternate-show-sent = 보낸 그대로 보기
 timeline-alternate-show = { $label } 보기

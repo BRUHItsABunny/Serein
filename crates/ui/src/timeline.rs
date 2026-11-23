@@ -515,42 +515,30 @@ const ALTERNATE_PART: u16 = u16::MAX;
 /// Messages switched back from their alternate that are remembered at once.
 const MAX_SHOWN_ORIGINALS: usize = 512;
 
+/// The "edited" label, then each earlier version a plugin kept, drawn under the message
+/// oldest first.
 fn plugin_history(
 	ui: &mut egui::Ui,
 	edited: bool,
 	notes: &[extension_host::hooks::Note],
 	colors: &crate::design::Palette,
 ) {
-	let label = crate::i18n::translate(if edited {
-		"timeline-show-with-scroll-edited"
-	} else {
-		"timeline-plugin-history"
-	});
-	if notes.iter().all(|note| note.history.is_empty()) {
-		ui.label(RichText::new(label).small().color(colors.muted));
-		return;
+	if edited {
+		ui.label(
+			RichText::new(crate::i18n::translate("timeline-show-with-scroll-edited"))
+				.small()
+				.color(colors.muted),
+		);
 	}
-	let button = ui.add(
-		egui::Button::new(RichText::new(label).small().color(colors.muted))
-			.frame(false)
-			.small(),
-	);
-	egui::Popup::from_toggle_button_response(&button).show(|ui| {
-		ui.set_max_width(420.0);
-		egui::ScrollArea::vertical()
-			.max_height(320.0)
-			.show(ui, |ui| {
-				for note in notes.iter().filter(|note| !note.history.is_empty()) {
-					ui.label(
-						RichText::new(crate::i18n::translate_args(
-							"timeline-plugin-history-from",
-							&[("plugin", &note.name)],
-						))
-						.small()
-						.strong()
-						.color(colors.muted),
-					);
-					for revision in &note.history {
+	for note in notes {
+		for revision in &note.history {
+			egui::Frame::new()
+				.inner_margin(egui::Margin::symmetric(8, 4))
+				.corner_radius(4)
+				.stroke(egui::Stroke::new(1.0, colors.muted.gamma_multiply(0.35)))
+				.show(ui, |ui| {
+					ui.horizontal_wrapped(|ui| {
+						ui.spacing_mut().item_spacing.x = 6.0;
 						if let Some(time) = revision.time_ms.and_then(plugin_time) {
 							ui.label(
 								RichText::new(crate::local_time::full(time))
@@ -558,13 +546,21 @@ fn plugin_history(
 									.color(colors.muted),
 							);
 						}
-						ui.add(egui::Label::new(&revision.text).wrap());
-						ui.add_space(4.0);
-					}
-					ui.separator();
-				}
-			});
-	});
+						ui.label(
+							RichText::new(crate::i18n::translate_args(
+								"timeline-plugin-earlier",
+								&[("plugin", &note.name)],
+							))
+							.small()
+							.color(colors.muted),
+						);
+					});
+					ui.add(
+						egui::Label::new(RichText::new(&revision.text).color(colors.muted)).wrap(),
+					);
+				});
+		}
+	}
 }
 
 /// A deleted message a plugin kept, drawn plainly where it was.

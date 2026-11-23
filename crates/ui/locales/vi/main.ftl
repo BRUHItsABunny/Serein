@@ -4088,8 +4088,7 @@ timeline-show-with-scroll-dismiss-message = Loại bỏ tin nhắn
 timeline-show-with-scroll-display-limited-copy-message-for-the-full-text = Hiển thị hạn chế · Sao chép tin nhắn cho toàn văn
 # Context: show_with_scroll
 timeline-show-with-scroll-edited = (đã chỉnh sửa)
-timeline-plugin-history = (lịch sử)
-timeline-plugin-history-from = Các phiên bản trước từ { $plugin }
+timeline-plugin-earlier = phiên bản trước · được { $plugin } lưu lại
 timeline-alternate-from = { $label } từ { $plugin }
 timeline-alternate-show-sent = Xem như đã gửi
 timeline-alternate-show = Xem { $label }

@@ -4076,8 +4076,7 @@ timeline-show-with-scroll-dismiss-message = Dismiss message
 timeline-show-with-scroll-display-limited-copy-message-for-the-full-text = Display limited · Copy message for the full text
 # Context: show_with_scroll
 timeline-show-with-scroll-edited = (edited)
-timeline-plugin-history = (history)
-timeline-plugin-history-from = Earlier versions from { $plugin }
+timeline-plugin-earlier = earlier version · kept by { $plugin }
 timeline-alternate-from = { $label } by { $plugin }
 timeline-alternate-show-sent = Show as sent
 timeline-alternate-show = Show { $label }
