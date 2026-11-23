@@ -20,7 +20,7 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		Surface::Annotate => capabilities.push(Capability::MessageAnnotations),
 		Surface::Notification => capabilities.push(Capability::Notifications),
 		Surface::Media => capabilities.push(Capability::MediaWorker),
-		Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
+		Surface::User | Surface::Channel | Surface::Server | Surface::Role | Surface::Call => {
 			capabilities.push(Capability::ContextMenus)
 		}
 	}
@@ -77,6 +77,7 @@ fn host_invocations_and_legacy_handlers_keep_the_v1_contract() {
 		("channel", Surface::Channel),
 		("server", Surface::Server),
 		("role", Surface::Role),
+		("call", Surface::Call),
 	] {
 		let manifest = manifest(action, surface);
 		let input = Invocation {
@@ -103,6 +104,10 @@ fn host_invocations_and_legacy_handlers_keep_the_v1_contract() {
 				}),
 				Surface::Server => Some(extensions::MenuTarget::Server {
 					guild_id: "5".into(),
+				}),
+				Surface::Call => Some(extensions::MenuTarget::Call {
+					channel_id: "2".into(),
+					guild_id: Some("5".into()),
 				}),
 				Surface::Role => Some(extensions::MenuTarget::Role {
 					guild_id: "5".into(),

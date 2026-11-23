@@ -3703,6 +3703,17 @@ impl MessagingUi {
 				egui::Popup::menu(&more)
 					.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
 					.show(|ui| {
+						// Plugin entries for this call, such as starting a recording.
+						crate::extensions_ui::context_menu_items(
+							ui,
+							extensions::MenuTarget::Call {
+								channel_id: channel.to_string(),
+								guild_id: state
+									.channel(channel)
+									.and_then(|channel| channel.guild)
+									.map(|guild| guild.to_string()),
+							},
+						);
 						let label = crate::i18n::translate_if_key(if deafened {
 							"Undeafen"
 						} else {

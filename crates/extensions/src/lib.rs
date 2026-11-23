@@ -303,12 +303,18 @@ pub enum Surface {
 	/// Runs in an instance kept loaded during a call, once per batch in `media`. Requires
 	/// `media_worker`.
 	Media,
+	/// An entry in the call controls' More menu; the invocation names the call's channel.
+	/// Requires `context_menus`.
+	Call,
 }
 
 impl Surface {
 	/// Context-menu surfaces whose invocation carries a [`MenuTarget`].
 	pub fn is_context_menu(self) -> bool {
-		matches!(self, Self::User | Self::Channel | Self::Server | Self::Role)
+		matches!(
+			self,
+			Self::User | Self::Channel | Self::Server | Self::Role | Self::Call
+		)
 	}
 }
 
@@ -669,6 +675,12 @@ pub enum MenuTarget {
 	Server {
 		guild_id: String,
 	},
+	/// The call the user is in, from the call controls.
+	Call {
+		channel_id: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		guild_id: Option<String>,
+	},
 	/// Besides IDs, a role carries the name and color shown on the chip that was clicked.
 	Role {
 		guild_id: String,
@@ -693,6 +705,7 @@ impl MenuTarget {
 			Self::Channel { .. } => Surface::Channel,
 			Self::Server { .. } => Surface::Server,
 			Self::Role { .. } => Surface::Role,
+			Self::Call { .. } => Surface::Call,
 		}
 	}
 	/// Every ID the target carries, required ones first.
@@ -704,6 +717,10 @@ impl MenuTarget {
 				channel_id,
 			} => (Some(user_id), guild_id.as_ref(), channel_id.as_ref()),
 			Self::Channel {
+				channel_id,
+				guild_id,
+			}
+			| Self::Call {
 				channel_id,
 				guild_id,
 			} => (Some(channel_id), guild_id.as_ref(), None),
@@ -1202,9 +1219,11 @@ impl Manifest {
 				Surface::Message => Some(Capability::SelectedMessage),
 				Surface::Composer => Some(Capability::Composer),
 				Surface::Panel => None,
-				Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
-					Some(Capability::ContextMenus)
-				}
+				Surface::User
+				| Surface::Channel
+				| Surface::Server
+				| Surface::Role
+				| Surface::Call => Some(Capability::ContextMenus),
 				Surface::Activation => None,
 				Surface::MessageEvent => Some(Capability::MessageEvents),
 				Surface::AppEvent => Some(Capability::AppEvents),

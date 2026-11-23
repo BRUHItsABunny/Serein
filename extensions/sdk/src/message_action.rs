@@ -42,6 +42,12 @@ pub enum MenuTarget {
 	Server {
 		guild_id: String,
 	},
+	/// The call the user is in, from the call controls.
+	Call {
+		channel_id: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		guild_id: Option<String>,
+	},
 	/// A role in a member's profile, with the name and `0xRRGGBB` color shown on its chip.
 	Role {
 		guild_id: String,

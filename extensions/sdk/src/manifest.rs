@@ -186,6 +186,9 @@ pub enum Surface {
 	/// Runs once per batch in an instance kept loaded during a call; decode
 	/// [`crate::MediaInvocation`]. It may return only captions.
 	Media,
+	/// An entry in the call controls' More menu; decode [`crate::MenuInvocation`], whose
+	/// target is [`crate::MenuTarget::Call`]. Requires `context_menus`.
+	Call,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.
