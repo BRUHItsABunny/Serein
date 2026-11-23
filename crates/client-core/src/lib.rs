@@ -4077,10 +4077,7 @@ impl State {
 							p.confirmed = Some(m.id);
 						}
 						if correlated {
-							self.confirmed_sends.push_back((nonce.clone(), m.id));
-							if self.confirmed_sends.len() > 16 {
-								self.confirmed_sends.pop_front();
-							}
+							self.confirmed_send(nonce.clone(), m.id);
 						}
 						if accepted_reference
 							&& self.selected == Some(m.channel)
@@ -4398,8 +4395,27 @@ impl State {
 			{
 				self.remember_sticker(sticker);
 			}
+			let before = self.pending.len();
 			self.pending
 				.retain(|p| !(p.nonce == *nonce && p.channel == message.channel));
+			// The gateway echo often beats the send's own reply; what waits for the
+			// confirmation, such as a plugin's follow-up, must still see it.
+			if self.pending.len() != before {
+				self.confirmed_send(nonce.clone(), message.id);
+			}
+		}
+	}
+	fn confirmed_send(&mut self, nonce: String, message: Id) {
+		if self
+			.confirmed_sends
+			.iter()
+			.any(|(known, _)| *known == nonce)
+		{
+			return;
+		}
+		self.confirmed_sends.push_back((nonce, message));
+		if self.confirmed_sends.len() > 16 {
+			self.confirmed_sends.pop_front();
 		}
 	}
 	fn fail(&mut self, failure: auth::Failure) {

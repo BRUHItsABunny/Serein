@@ -7649,6 +7649,15 @@ mod composer_tests {
 		let mut first = test_support::message(7001, channel);
 		first.author = state.user.clone().unwrap();
 		first.nonce = Some(nonce.clone());
+		// The gateway echo usually arrives before the send's own reply and ends the pending
+		// row; the follow-up still goes, and only once.
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::Message(first.clone()),
+		});
+		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
+		assert!(notices.is_empty(), "{notices:?}");
+		assert_eq!(sent(&follow_ups).as_deref(), Some("six"));
 		state.apply(client_core::Envelope {
 			generation: state.generation,
 			event: client_core::Event::SendResult {
@@ -7656,9 +7665,6 @@ mod composer_tests {
 				result: Ok(first),
 			},
 		});
-		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
-		assert!(notices.is_empty());
-		assert_eq!(sent(&follow_ups).as_deref(), Some("six"));
 		assert!(
 			view.extensions.send_follow_ups(&mut state).0.is_empty(),
 			"sent once"
