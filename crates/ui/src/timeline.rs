@@ -1597,15 +1597,26 @@ fn row_key(
 	crate::mentions::presentation_fingerprint(state, message).hash(&mut key);
 	key.finish()
 }
+/// `next` is the row after this one: deleted rows plugins kept between them are drawn in
+/// this row, and those before it decide its day divider.
 fn row_height_key(
 	message: &Message,
 	previous: Option<&Message>,
+	next: Option<Id>,
 	boundary: Option<Id>,
 	state: &State,
 	deleted: bool,
 	notes: &extension_host::hooks::Annotations,
 ) -> u64 {
-	row_key(message, previous, boundary, state) ^ u64::from(deleted) ^ notes.fingerprint(message.id)
+	row_key(message, previous, boundary, state)
+		^ u64::from(deleted)
+		^ notes.fingerprint(message.id)
+		^ notes.deleted_fingerprint(message.id, next).rotate_left(1)
+		^ previous.map_or(0, |previous| {
+			notes
+				.deleted_fingerprint(previous.id, Some(message.id))
+				.rotate_left(2)
+		})
 }
 fn divider(
 	ui: &mut egui::Ui,
@@ -2936,8 +2947,19 @@ impl TimelineView {
 				.map(|m| {
 					let prior = previous;
 					let deleted = state.timeline.is_deleted(m.id);
-					let key =
-						row_height_key(m, prior, self.unread_boundary, state, deleted, &self.notes);
+					let next = row_ids
+						.binary_search(&m.id)
+						.ok()
+						.and_then(|index| row_ids.get(index + 1).copied());
+					let key = row_height_key(
+						m,
+						prior,
+						next,
+						self.unread_boundary,
+						state,
+						deleted,
+						&self.notes,
+					);
 					row_keys.insert(m.id, key);
 					previous = Some(m);
 					let lines = m
@@ -3436,6 +3458,7 @@ impl TimelineView {
 						row_height_key(
 							starter,
 							None,
+							Some(id),
 							self.unread_boundary,
 							state,
 							state.timeline.is_deleted(id),
@@ -3459,6 +3482,7 @@ impl TimelineView {
 				let previous = index
 					.checked_sub(1)
 					.and_then(|i| display_message(state, self.rows[i].0));
+				let next = self.rows.get(index + 1).map(|row| row.0);
 				let deleted = state.timeline.is_deleted(id);
 				// ponytail: reuse only settled ordinary text; dynamic media, references,
 				// spoilers and reactions need explicit layout invalidation before caching.
@@ -3484,6 +3508,7 @@ impl TimelineView {
 						== row_height_key(
 							message,
 							previous,
+							next,
 							self.unread_boundary,
 							state,
 							deleted,
@@ -3501,8 +3526,15 @@ impl TimelineView {
 
 				let compact =
 					self.compact_messages || grouped(previous, message, self.unread_boundary);
-				let new_day = previous
-					.is_none_or(|previous| timestamp(previous.id).date() != timestamp(id).date());
+				// A deleted row kept between them is drawn on its own day.
+				let new_day = previous.is_none_or(|previous| {
+					let shown = self
+						.notes
+						.deleted_between(previous.id, Some(id))
+						.last()
+						.map_or(previous.id, |(_, row)| row.message);
+					timestamp(shown).date() != timestamp(id).date()
+				});
 				// Snowflakes rank rows as shown, so a selection outlives its rows' layout.
 				let order = |index| egui::text_selection::SelectionOrder { item: id.0, index };
 				let response = ui.scope_builder(egui::UiBuilder::new().scope_id(row_id), |ui| {
@@ -4416,16 +4448,32 @@ impl TimelineView {
 													);
 												});
 											}
-											for note in notes {
-												for row in &note.deleted {
-													archived_row(
+											let mut day = timestamp(id).date();
+											for (note, row) in self.notes.deleted_between(id, next)
+											{
+												let date = timestamp(row.message);
+												if date.date() != day {
+													day = date.date();
+													divider(
 														ui,
-														&note.name,
-														row,
-														self.notes.get(row.message),
-														&colors,
+														format!(
+															"{} {}, {}",
+															date.month(),
+															date.day(),
+															date.year()
+														),
+														false,
+														self.compact_messages,
+														None,
 													);
 												}
+												archived_row(
+													ui,
+													&note.name,
+													row,
+													self.notes.get(row.message),
+													&colors,
+												);
 											}
 											if !message.components.is_empty() {
 												let shown = ui.scope(|ui| {
@@ -5334,6 +5382,7 @@ impl TimelineView {
 					row_height_key(
 						message,
 						previous,
+						next,
 						self.unread_boundary,
 						state,
 						deleted,

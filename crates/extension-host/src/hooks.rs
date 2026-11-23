@@ -7,7 +7,7 @@ use extensions::{
 };
 use model::{Id, Message};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Channels with saved hooks in one account.
 pub const MAX_CHANNELS: usize = 512;
@@ -313,6 +313,8 @@ pub struct Annotations {
 	notes: HashMap<Id, Vec<Note>>,
 	order: VecDeque<Id>,
 	bytes: usize,
+	/// Every deleted row by its own id and plugin, with the message it was placed under.
+	deleted: BTreeMap<(Id, String), Id>,
 }
 
 /// Messages with additions kept, and the bytes of all of them.
@@ -341,14 +343,11 @@ impl Annotations {
 		rows.retain(|row| row.message > message);
 		let mut moved = Vec::new();
 		rows.retain(|row| {
-			let elsewhere = self.notes.iter().find_map(|(anchor, notes)| {
-				let held = notes.iter().any(|note| {
-					note.plugin == plugin
-						&& note.deleted.iter().any(|kept| kept.message == row.message)
-				});
-				(held && *anchor != message).then_some(*anchor)
-			});
-			match elsewhere {
+			let elsewhere = self
+				.deleted
+				.get(&(row.message, plugin.to_owned()))
+				.filter(|anchor| **anchor != message);
+			match elsewhere.copied() {
 				Some(anchor) if anchor > message => false,
 				Some(anchor) => {
 					moved.push((anchor, row.message));
@@ -389,6 +388,9 @@ impl Annotations {
 			Some(index) => {
 				let note = notes.remove(index);
 				self.bytes -= note.bytes();
+				for row in &note.deleted {
+					self.deleted.remove(&(row.message, note.plugin.clone()));
+				}
 				note
 			}
 			None => Note {
@@ -400,6 +402,10 @@ impl Annotations {
 		change(&mut note);
 		if !note.is_empty() {
 			self.bytes += note.bytes();
+			for row in &note.deleted {
+				self.deleted
+					.insert((row.message, note.plugin.clone()), message);
+			}
 			notes.push(note);
 			notes.sort_by(|a, b| a.plugin.cmp(&b.plugin));
 		}
@@ -415,6 +421,9 @@ impl Annotations {
 			};
 			for note in self.notes.remove(&old).unwrap_or_default() {
 				self.bytes -= note.bytes();
+				for row in &note.deleted {
+					self.deleted.remove(&(row.message, note.plugin.clone()));
+				}
 			}
 		}
 	}
@@ -431,9 +440,44 @@ impl Annotations {
 		self.notes.get(&message).map_or(&[], Vec::as_slice)
 	}
 
-	/// Changes whenever the notes under `message` change, including the earlier versions of
-	/// the deleted messages shown under it; 0 without notes. Row layouts cached by message
-	/// include it.
+	/// The deleted rows plugins kept that fall after message `after` and before `before`, by
+	/// their own ids, oldest first, with the note that holds each. A timeline draws them after
+	/// the message shown before them, whichever message a plugin placed them under: a plugin
+	/// is not given every message, such as one with only pictures.
+	pub fn deleted_between(
+		&self,
+		after: Id,
+		before: Option<Id>,
+	) -> impl Iterator<Item = (&Note, &Archived)> {
+		let end = before.unwrap_or(Id(u64::MAX));
+		let start = Id(after.0.saturating_add(1)).min(end);
+		self.deleted
+			.range((start, String::new())..(end, String::new()))
+			.filter_map(|((row, plugin), anchor)| {
+				let note = self
+					.get(*anchor)
+					.iter()
+					.find(|note| note.plugin == *plugin)?;
+				Some((note, note.deleted.iter().find(|kept| kept.message == *row)?))
+			})
+	}
+
+	/// Changes whenever [`Self::deleted_between`] would show something else; 0 without rows.
+	pub fn deleted_fingerprint(&self, after: Id, before: Option<Id>) -> u64 {
+		use std::hash::{Hash, Hasher};
+		let mut rows = self.deleted_between(after, before).peekable();
+		if rows.peek().is_none() {
+			return 0;
+		}
+		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		for (note, row) in rows {
+			(&note.name, row, self.get(row.message)).hash(&mut hasher);
+		}
+		hasher.finish()
+	}
+
+	/// Changes whenever the notes under `message` change; 0 without notes. Row layouts
+	/// cached by message include it.
 	pub fn fingerprint(&self, message: Id) -> u64 {
 		use std::hash::{Hash, Hasher};
 		let Some(notes) = self.notes.get(&message) else {
@@ -441,9 +485,6 @@ impl Annotations {
 		};
 		let mut hasher = std::collections::hash_map::DefaultHasher::new();
 		notes.hash(&mut hasher);
-		for row in notes.iter().flat_map(|note| &note.deleted) {
-			self.get(row.message).hash(&mut hasher);
-		}
 		hasher.finish()
 	}
 
@@ -604,7 +645,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_deleted_message_stays_under_the_closest_earlier_message() {
+	fn deleted_rows_show_once_by_their_own_time() {
 		let mut notes = Annotations::default();
 		let gone = |id| Archived {
 			message: Id(id),
@@ -632,8 +673,23 @@ mod tests {
 		notes.set_deleted("b", "B", Id(40), vec![gone(90)]);
 		assert_eq!((shown(&notes, 80), shown(&notes, 85)), (vec![], vec![90]));
 		assert_eq!(shown(&notes, 40), [45, 90]);
-		// Its earlier versions, kept under its own id, change the row it is shown under.
-		let before = notes.fingerprint(Id(85));
+		// Drawn by their own ids after the message shown before them, such as a picture the
+		// plugin was never given, whichever message they were placed under.
+		let between = |notes: &Annotations, after: u64, before: Option<u64>| {
+			notes
+				.deleted_between(Id(after), before.map(Id))
+				.map(|(note, row)| (note.plugin.clone(), row.message.0))
+				.collect::<Vec<_>>()
+		};
+		let row = |plugin: &str, id| (plugin.to_owned(), id);
+		assert_eq!(
+			between(&notes, 41, Some(100)),
+			[row("a", 45), row("a", 90), row("b", 90)]
+		);
+		assert_eq!(between(&notes, 45, Some(90)), [], "not the rows themselves");
+		assert_eq!(between(&notes, 88, None), [row("a", 90), row("b", 90)]);
+		// Its earlier versions, kept under its own id, change the rows it is drawn in.
+		let before = notes.deleted_fingerprint(Id(88), None);
 		notes.set_history(
 			"a",
 			"A",
@@ -643,6 +699,16 @@ mod tests {
 				text: "first".into(),
 			}],
 		);
-		assert_ne!(notes.fingerprint(Id(85)), before);
+		assert_ne!(notes.deleted_fingerprint(Id(88), None), before);
+		// Removing a plugin, or evicting its notes, drops its rows from the order too.
+		notes.remove_plugin("b");
+		assert_eq!(
+			between(&notes, 0, None),
+			[("a".to_owned(), 45), ("a".to_owned(), 90)]
+		);
+		for id in 0..MAX_NOTED as u64 {
+			notes.set("c", "C", Id(1000 + id), "x");
+		}
+		assert_eq!(between(&notes, 0, None), []);
 	}
 }

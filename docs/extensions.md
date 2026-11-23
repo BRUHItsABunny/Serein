@@ -853,9 +853,11 @@ alongside that channel's own switches and within the same four.
   plugin, with the deletion time when `deleted_ms` is given. The optional `revisions` (up
   to 8, oldest first, like a history) are shown above the last text; without them the row
   shows the history the plugin gave while the message was loaded. At most 25 rows per
-  result; a deleted row cannot be one of the given messages. When batches place one
-  deleted message under different messages, it stays under the closest earlier one.
-  An empty list removes the plugin's rows there.
+  result; a deleted row cannot be one of the given messages. The client draws each row by
+  its own id, after the message shown before it, with a day divider when its day differs;
+  `after_message_id` only tells it which of your rows to replace. When batches place one
+  deleted message under different messages, the closest earlier one keeps it. An empty
+  list removes the plugin's rows there.
 
 Texts follow page rows: at most 4 KiB, line breaks allowed. Like notes, they live in RAM
 within the same 2,000-message, 2 MiB budget and never reach Discord.
