@@ -2738,6 +2738,9 @@ impl TimelineView {
 				},
 				opening: self.opening.take(),
 				browser_opening: self.browser_opening.take(),
+				// Plugins are not asked again for messages they already annotated, so their
+				// notes, histories and deleted rows stay for when the conversation reopens.
+				notes: std::mem::take(&mut self.notes),
 				truncated_translation: self.truncated_translation.take(),
 				pending_viewer: self.pending_viewer.take(),
 				jump: following,
@@ -6732,12 +6735,15 @@ mod tests {
 		let mut channel = state.channels[0].clone();
 		channel.id = Id(21);
 		state.channels.push(channel);
+		view.notes.set("archive", "Archive", Id(10), "kept");
 		state.selected = Some(Id(21));
 		banner_frame(&ctx, &mut view, &mut state, vec![], false);
 		assert!(
 			view.video.posters.contains_key(&Id(10)),
 			"posters survive channel switches"
 		);
+		// Plugins are not asked again for what they annotated, so their notes stay too.
+		assert_eq!(view.notes.get(Id(10)).len(), 1);
 		assert!(view.video.poster_seen.contains(&Id(10)));
 		assert!(
 			view.video.active.is_none(),
