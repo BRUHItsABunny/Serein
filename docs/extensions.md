@@ -844,14 +844,18 @@ alongside that channel's own switches and within the same four.
 `deleted_messages`, under the same rules: each names a message the action was given, once.
 
 - `histories: [{"message_id", "revisions": [{"time_ms", "text"}]}]` gives up to 8 earlier
-  versions of a message, oldest first. The message's **(edited)** label then opens them,
-  labelled with the plugin's name; a message the client does not know as edited gets a
-  **(history)** label. An empty list removes the plugin's history for it.
+  versions of a message, oldest first. Each is shown under the message with its time,
+  marked "earlier version · kept by" the plugin. An empty list removes the plugin's
+  history for it.
 - `deleted_messages: [{"after_message_id", "messages": [{"message_id", "author",
-  "time_ms", "text"}]}]` shows deleted messages the plugin kept as struck-through rows
-  under the message they followed, marked "deleted · kept by" the plugin. At most 25 rows
-  per result; a deleted row cannot be one of the given messages. An empty list removes
-  the plugin's rows there.
+  "time_ms", "text", "deleted_ms", "revisions"}]}]` shows deleted messages the plugin kept
+  as struck-through rows under the message they followed, marked "deleted · kept by" the
+  plugin, with the deletion time when `deleted_ms` is given. The optional `revisions` (up
+  to 8, oldest first, like a history) are shown above the last text; without them the row
+  shows the history the plugin gave while the message was loaded. At most 25 rows per
+  result; a deleted row cannot be one of the given messages. When batches place one
+  deleted message under different messages, it stays under the closest earlier one.
+  An empty list removes the plugin's rows there.
 
 Texts follow page rows: at most 4 KiB, line breaks allowed. Like notes, they live in RAM
 within the same 2,000-message, 2 MiB budget and never reach Discord.

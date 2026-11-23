@@ -4081,6 +4081,7 @@ timeline-alternate-from = { $label } by { $plugin }
 timeline-alternate-show-sent = Show as sent
 timeline-alternate-show = Show { $label }
 timeline-plugin-deleted = deleted · kept by { $plugin }
+timeline-plugin-deleted-at = deleted { $time } · kept by { $plugin }
 # Context: show_with_scroll
 timeline-show-with-scroll-forwarded = ↪ Forwarded
 # Context: show_with_scroll

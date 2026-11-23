@@ -87,6 +87,12 @@ pub struct DeletedMessage {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub time_ms: Option<i64>,
 	pub text: String,
+	/// When it was deleted, shown with the row.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deleted_ms: Option<i64>,
+	/// Its earlier versions, oldest first, at most 8, shown above its last text.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub revisions: Vec<crate::PageRevision>,
 }
 
 /// Output of an `annotate` action, or of a `message` action annotating the chosen message.

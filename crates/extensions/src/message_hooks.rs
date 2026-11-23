@@ -124,6 +124,12 @@ pub struct DeletedMessage {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub time_ms: Option<i64>,
 	pub text: String,
+	/// When it was deleted.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deleted_ms: Option<i64>,
+	/// Its earlier versions, oldest first, at most 8.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub revisions: Vec<crate::pages::PageRevision>,
 }
 
 /// Most deleted rows one result may add under all its messages.
@@ -186,6 +192,12 @@ pub(crate) fn validate_history(
 				return Err(Error::Invalid);
 			}
 			text(&message.text)?;
+			if message.revisions.len() > crate::pages::MAX_PAGE_REVISIONS {
+				return Err(Error::Limit);
+			}
+			for revision in &message.revisions {
+				text(&revision.text)?;
+			}
 		}
 	}
 	Ok(())

@@ -4093,6 +4093,7 @@ timeline-alternate-from = { $label } từ { $plugin }
 timeline-alternate-show-sent = Xem như đã gửi
 timeline-alternate-show = Xem { $label }
 timeline-plugin-deleted = đã xóa · được { $plugin } lưu lại
+timeline-plugin-deleted-at = đã xóa lúc { $time } · được { $plugin } lưu lại
 # Context: show_with_scroll
 timeline-show-with-scroll-forwarded = ↪ Đã chuyển tiếp
 # Context: show_with_scroll

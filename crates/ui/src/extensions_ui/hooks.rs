@@ -683,6 +683,15 @@ impl ExtensionUi {
 						author: row.author.clone(),
 						time_ms: row.time_ms,
 						text: row.text.clone(),
+						deleted_ms: row.deleted_ms,
+						history: row
+							.revisions
+							.iter()
+							.map(|revision| extension_host::hooks::Revision {
+								time_ms: revision.time_ms,
+								text: revision.text.clone(),
+							})
+							.collect(),
 					})
 				})
 				.collect();

@@ -3949,6 +3949,7 @@ timeline-alternate-from = { $plugin }의 { $label }
 timeline-alternate-show-sent = 보낸 그대로 보기
 timeline-alternate-show = { $label } 보기
 timeline-plugin-deleted = 삭제됨 · { $plugin }에 보관됨
+timeline-plugin-deleted-at = { $time }에 삭제됨 · { $plugin }에 보관됨
 # Context: show_with_scroll
 timeline-show-with-scroll-forwarded = ↪ 전달됨
 # Context: show_with_scroll

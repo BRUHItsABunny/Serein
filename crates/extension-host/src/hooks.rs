@@ -266,6 +266,9 @@ pub struct Archived {
 	pub author: String,
 	pub time_ms: Option<i64>,
 	pub text: String,
+	pub deleted_ms: Option<i64>,
+	/// Oldest first.
+	pub history: Vec<Revision>,
 }
 
 impl Note {
@@ -281,7 +284,15 @@ impl Note {
 			+ self
 				.deleted
 				.iter()
-				.map(|row| size_of::<Archived>() + row.author.len() + row.text.len())
+				.map(|row| {
+					size_of::<Archived>()
+						+ row.author.len() + row.text.len()
+						+ row
+							.history
+							.iter()
+							.map(|revision| size_of::<Revision>() + revision.text.len())
+							.sum::<usize>()
+				})
 				.sum::<usize>()
 			+ self
 				.alternate
@@ -564,6 +575,8 @@ mod tests {
 				author: "Ada".into(),
 				time_ms: None,
 				text: "gone".into(),
+				deleted_ms: Some(5),
+				history: vec![revision.clone()],
 			}],
 		);
 		notes.set("a", "A", Id(1), "");
@@ -598,6 +611,8 @@ mod tests {
 			author: "Ada".into(),
 			time_ms: None,
 			text: "gone".into(),
+			deleted_ms: None,
+			history: Vec::new(),
 		};
 		let shown = |notes: &Annotations, anchor| {
 			notes

@@ -1506,6 +1506,8 @@ fn annotators_add_history_and_deleted_rows_only_around_their_messages_and_captio
 			author: "Ada".into(),
 			time_ms: None,
 			text: "gone".into(),
+			deleted_ms: None,
+			revisions: Vec::new(),
 		}],
 	};
 	let output = |histories, deleted_messages| Output {
@@ -1543,12 +1545,37 @@ fn annotators_add_history_and_deleted_rows_only_around_their_messages_and_captio
 			author: "Ada".into(),
 			time_ms: None,
 			text: "gone".into(),
+			deleted_ms: None,
+			revisions: Vec::new(),
 		})
 		.collect();
 	assert!(matches!(
 		output(vec![], vec![too_many]).validate(&manifest, &batch),
 		Err(Error::Limit)
 	));
+	// A deleted row's own earlier versions follow a history's limits.
+	let mut versions = deleted("10", "20");
+	versions.messages[0].revisions = (0..9)
+		.map(|n| PageRevision {
+			time_ms: None,
+			text: format!("v{n}"),
+		})
+		.collect();
+	assert!(matches!(
+		output(vec![], vec![versions.clone()]).validate(&manifest, &batch),
+		Err(Error::Limit)
+	));
+	versions.messages[0].revisions.truncate(8);
+	versions.messages[0].revisions[0].text = "bell\u{7}".into();
+	assert!(
+		output(vec![], vec![versions.clone()])
+			.validate(&manifest, &batch)
+			.is_err()
+	);
+	versions.messages[0].revisions[0].text = "two\nlines".into();
+	output(vec![], vec![versions])
+		.validate(&manifest, &batch)
+		.unwrap();
 	let open = Invocation {
 		action: "open".into(),
 		..Default::default()

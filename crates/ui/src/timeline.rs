@@ -530,55 +530,54 @@ fn plugin_history(
 				.color(colors.muted),
 		);
 	}
-	earlier_versions(ui, notes, colors);
-}
-
-/// Each earlier version a plugin kept of a message, oldest first.
-fn earlier_versions(
-	ui: &mut egui::Ui,
-	notes: &[extension_host::hooks::Note],
-	colors: &crate::design::Palette,
-) {
 	for note in notes {
-		for revision in &note.history {
-			egui::Frame::new()
-				.inner_margin(egui::Margin::symmetric(8, 4))
-				.corner_radius(4)
-				.stroke(egui::Stroke::new(1.0, colors.muted.gamma_multiply(0.35)))
-				.show(ui, |ui| {
-					ui.horizontal_wrapped(|ui| {
-						ui.spacing_mut().item_spacing.x = 6.0;
-						if let Some(time) = revision.time_ms.and_then(plugin_time) {
-							ui.label(
-								RichText::new(crate::local_time::full(time))
-									.small()
-									.color(colors.muted),
-							);
-						}
-						ui.label(
-							RichText::new(crate::i18n::translate_args(
-								"timeline-plugin-earlier",
-								&[("plugin", &note.name)],
-							))
-							.small()
-							.color(colors.muted),
-						);
-					});
-					ui.add(
-						egui::Label::new(RichText::new(&revision.text).color(colors.muted)).wrap(),
-					);
-				});
-		}
+		earlier_versions(ui, &note.name, &note.history, colors);
 	}
 }
 
-/// A deleted message a plugin kept, drawn plainly where it was, after the earlier versions
-/// plugins showed of it while it was loaded.
+/// Each earlier version `plugin` kept of a message, oldest first.
+fn earlier_versions(
+	ui: &mut egui::Ui,
+	plugin: &str,
+	history: &[extension_host::hooks::Revision],
+	colors: &crate::design::Palette,
+) {
+	for revision in history {
+		egui::Frame::new()
+			.inner_margin(egui::Margin::symmetric(8, 4))
+			.corner_radius(4)
+			.stroke(egui::Stroke::new(1.0, colors.muted.gamma_multiply(0.35)))
+			.show(ui, |ui| {
+				ui.horizontal_wrapped(|ui| {
+					ui.spacing_mut().item_spacing.x = 6.0;
+					if let Some(time) = revision.time_ms.and_then(plugin_time) {
+						ui.label(
+							RichText::new(crate::local_time::full(time))
+								.small()
+								.color(colors.muted),
+						);
+					}
+					ui.label(
+						RichText::new(crate::i18n::translate_args(
+							"timeline-plugin-earlier",
+							&[("plugin", plugin)],
+						))
+						.small()
+						.color(colors.muted),
+					);
+				});
+				ui.add(egui::Label::new(RichText::new(&revision.text).color(colors.muted)).wrap());
+			});
+	}
+}
+
+/// A deleted message a plugin kept, drawn plainly where it was, after its earlier versions:
+/// those the row carries, or else those plugins showed of it while it was loaded.
 fn archived_row(
 	ui: &mut egui::Ui,
 	plugin: &str,
 	row: &extension_host::hooks::Archived,
-	history: &[extension_host::hooks::Note],
+	notes: &[extension_host::hooks::Note],
 	colors: &crate::design::Palette,
 ) {
 	egui::Frame::new()
@@ -596,16 +595,25 @@ fn archived_row(
 							.color(colors.muted),
 					);
 				}
-				ui.label(
-					RichText::new(crate::i18n::translate_args(
+				let deleted = match row.deleted_ms.and_then(plugin_time) {
+					Some(time) => crate::i18n::translate_args(
+						"timeline-plugin-deleted-at",
+						&[("time", &crate::local_time::full(time)), ("plugin", plugin)],
+					),
+					None => crate::i18n::translate_args(
 						"timeline-plugin-deleted",
 						&[("plugin", plugin)],
-					))
-					.small()
-					.color(colors.danger),
-				);
+					),
+				};
+				ui.label(RichText::new(deleted).small().color(colors.danger));
 			});
-			earlier_versions(ui, history, colors);
+			if row.history.is_empty() {
+				for note in notes {
+					earlier_versions(ui, &note.name, &note.history, colors);
+				}
+			} else {
+				earlier_versions(ui, plugin, &row.history, colors);
+			}
 			ui.add(
 				egui::Label::new(RichText::new(&row.text).color(colors.muted).strikethrough())
 					.wrap(),
