@@ -221,6 +221,16 @@ fn entry(body: Option<String>) -> Option<Record> {
 	body.map(|body| Record::Entry { body, latest: None })
 }
 
+/// Whether `event` edits or deletes messages in `channel`: notes a journal consumer draws
+/// from its own records are stale once it has stored the event.
+pub fn changes_messages_in(event: &Event, channel: Id) -> bool {
+	match event {
+		Event::Patch(patch) => patch.channel == channel,
+		Event::Delete { channel: id, .. } | Event::DeleteBulk { channel: id, .. } => *id == channel,
+		_ => false,
+	}
+}
+
 /// Records for `event`, captured before the reducer applies it so the timeline still holds
 /// the version an edit or delete replaces. Call only for events of the current generation.
 pub fn capture(state: &State, event: &Event) -> Vec<Record> {
@@ -1005,6 +1015,10 @@ mod tests {
 		assert_eq!(edit["content"], "after");
 		assert_eq!(edit["edited_at_ms"], 1_700_000_000_000_i64);
 		assert_eq!(edit["previous"]["content"], "before");
+		// Notes in the edited channel go stale once a consumer stores this; elsewhere not.
+		let edited = Event::Patch(patch.clone());
+		assert!(changes_messages_in(&edited, patch.channel));
+		assert!(!changes_messages_in(&edited, Id(patch.channel.0 + 1)));
 		// An embed refresh is not an edit.
 		patch.content = Patch::Absent;
 		patch.edited = Patch::Absent;

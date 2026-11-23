@@ -253,6 +253,9 @@ pub struct Bridge {
 	journal_consumers: Vec<String>,
 	/// Consumers with entries to deliver.
 	journal_due: BTreeSet<String>,
+	/// Journal consumers annotating the open channel that are due fresh notes there once
+	/// they have stored an edit or deletion in it.
+	notes_after_journal: BTreeSet<String>,
 	journal_at: Option<Instant>,
 	/// Subscriptions the user approved in this account, as saved.
 	subscriptions: Vec<extension_host::broker::Subscription>,
@@ -661,6 +664,26 @@ impl Bridge {
 		}
 		extension_host::journal::capture(state, &event.event)
 	}
+	/// Marks the open channel's annotating journal consumers for fresh notes when `event`
+	/// edits or deletes messages there: their notes come from what they store, so asking
+	/// before they stored it, or never again for a deletion's neighbour, would miss it.
+	pub fn journal_changes_notes(&mut self, state: &State, event: &client_core::Envelope) {
+		let Some(channel) = state.selected.filter(|_| {
+			self.journal.is_some()
+				&& event.generation == state.generation
+				&& self.scope_current(state)
+		}) else {
+			return;
+		};
+		if !extension_host::journal::changes_messages_in(&event.event, channel) {
+			return;
+		}
+		for plugin in extension_host::hooks::annotators(&self.channel_hooks, channel) {
+			if self.journal_consumers.contains(&plugin) {
+				self.notes_after_journal.insert(plugin);
+			}
+		}
+	}
 	pub fn journal_active(&self) -> bool {
 		self.journal.is_some()
 	}
@@ -851,6 +874,7 @@ impl Bridge {
 		self.journal = None;
 		self.journal_consumers.clear();
 		self.journal_due.clear();
+		self.notes_after_journal.clear();
 	}
 	/// Drops account-scoped plugin state, including queued events, presence and interface tweaks,
 	/// and logs the plugin host out of the account's data.
@@ -1071,6 +1095,12 @@ impl Bridge {
 				Ok(Event::JournalDelivered { id, more }) => {
 					if more {
 						self.journal_due.insert(id);
+					} else if !self.journal_due.contains(&id)
+						&& self.notes_after_journal.remove(&id)
+					{
+						// It has stored everything recorded so far: ask for the open
+						// channel's notes again.
+						self.annotated.forget(&id);
 					}
 				}
 				Err(error)

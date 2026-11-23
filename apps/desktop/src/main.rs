@@ -5612,6 +5612,7 @@ impl Desktop {
 			}
 			let data_changes = extension_host::data_events::Changes::capture(&self.state, &event);
 			let journal_records = self.extensions.journal_capture(&self.state, &event);
+			self.extensions.journal_changes_notes(&self.state, &event);
 			let session_started = event.generation == self.state.generation
 				&& matches!(event.event, Event::Ready { .. } | Event::Resync);
 			// Readable channels this event may take away, with their server, for the journal.
