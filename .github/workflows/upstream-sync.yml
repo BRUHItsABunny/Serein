@@ -1,0 +1,298 @@
+name: Upstream sync
+run-name: Upstream sync by @${{ github.actor }}
+
+# Daily: merges upstream's latest nightly release into the fork through a PR, has Claude
+# resolve conflicts or fix the build when the merge needs it, merges the PR once CI passes
+# and publishes the fork release <upstream tag>-fork.1.
+#
+# Secrets (added by the owner):
+# - SEREIN_SYNC_TOKEN: fine-grained token for this repository only, with Contents, Pull
+#   requests, Workflows and Actions set to read and write. Pushes made with it run CI, and
+#   it can push upstream's workflow changes, which the Actions token cannot.
+# - ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`): used only when
+#   the merge conflicts or the merged code fails its check.
+on:
+  schedule:
+    # After upstream's nightly release, which starts at 03:17 UTC.
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: ViceVerse-cz/Serein
+  CLAUDE_CODE_VERSION: 2.1.325
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Require the sync token
+        env:
+          TOKEN: ${{ secrets.SEREIN_SYNC_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Add the SEREIN_SYNC_TOKEN secret (see the top of upstream-sync.yml)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find upstream's latest nightly and what is left to do
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.SEREIN_SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream=$(gh release list --repo "$UPSTREAM" --limit 30 --exclude-drafts --json tagName \
+            --jq '[.[].tagName | select(test("^v[0-9]+[.][0-9]+[.][0-9]+-nightly[.][0-9]+[.][0-9]+$"))][0] // ""')
+          if [ -z "$upstream" ]; then
+            echo "::error::Upstream has no nightly release."
+            exit 1
+          fi
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream "refs/tags/$upstream:refs/tags/$upstream"
+          tag="$upstream-fork.1"
+          branch="sync/$upstream"
+          merged=false
+          git merge-base --is-ancestor "$upstream" HEAD && merged=true
+          released=false
+          gh release view "$tag" >/dev/null 2>&1 && released=true
+          pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""')
+          if [ "$merged" = true ] && [ "$released" = true ]; then
+            step=done
+          elif [ "$merged" = true ]; then
+            step=release
+          elif [ -n "$pr" ]; then
+            step=pending
+          else
+            step=merge
+          fi
+          echo "Upstream $upstream: merged=$merged released=$released open PR=${pr:-none} -> $step"
+          {
+            echo "upstream=$upstream"
+            echo "tag=$tag"
+            echo "branch=$branch"
+            echo "pr=$pr"
+            echo "step=$step"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Start the merge
+        id: merge
+        if: steps.plan.outputs.step == 'merge'
+        env:
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          if git merge --no-ff --no-edit -m "Merge upstream $UPSTREAM_TAG into the fork" "$UPSTREAM_TAG"; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U
+          fi
+
+      - name: Linux native dependencies
+        if: steps.plan.outputs.step == 'merge'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev libvulkan-dev libasound2-dev libpulse-dev cmake libclang-dev python3 dpkg-dev desktop-file-utils
+      - uses: dtolnay/rust-toolchain@1.99.1
+        if: steps.plan.outputs.step == 'merge'
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+        if: steps.plan.outputs.step == 'merge'
+        with:
+          shared-key: upstream-sync
+
+      - name: Check the clean merge
+        id: check
+        if: steps.plan.outputs.step == 'merge' && steps.merge.outputs.conflicts == 'false'
+        run: |
+          mkdir -p target/upstream-sync
+          if cargo xtask check > target/upstream-sync/check.log 2>&1; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            tail -60 target/upstream-sync/check.log
+          fi
+
+      - name: Have Claude finish the merge
+        id: agent
+        if: >-
+          steps.plan.outputs.step == 'merge' &&
+          (steps.merge.outputs.conflicts == 'true' || steps.check.outputs.passed == 'false')
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ANTHROPIC_API_KEY$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::The merge needs Claude: add ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN."
+            exit 1
+          fi
+          mkdir -p target/upstream-sync
+          {
+            echo "# Upstream sync context"
+            echo
+            echo "Merging upstream tag \`$UPSTREAM_TAG\` into the fork's \`main\`."
+            echo
+            echo "## Files Git could not merge"
+            echo
+            git diff --name-only --diff-filter=U | sed 's/^/- /'
+            if [ -f target/upstream-sync/check.log ]; then
+              echo
+              echo "## The merge was clean, but \`cargo xtask check\` failed"
+              echo
+              echo '```'
+              tail -200 target/upstream-sync/check.log
+              echo '```'
+            fi
+          } > target/upstream-sync/context.md
+          npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          # The agent gets no GitHub token and the checkout keeps no credentials.
+          claude -p "$(cat .github/upstream-sync/prompt.md)" \
+            --permission-mode acceptEdits \
+            --max-turns 300 \
+            --allowedTools 'Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git rm:*),Bash(git checkout:*),Bash(git merge-base:*),Bash(git ls-files:*),Bash(git grep:*),Bash(cargo:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(sed -n:*),Bash(wc:*),Bash(find:*)' \
+            --output-format stream-json --verbose > target/upstream-sync/agent.jsonl
+          tail -1 target/upstream-sync/agent.jsonl | head -c 4000
+          echo
+
+      - name: Verify and commit the merge
+        id: verify
+        if: steps.plan.outputs.step == 'merge'
+        env:
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream }}
+          AGENT: ${{ steps.agent.outcome }}
+        run: |
+          set -euo pipefail
+          ok=true
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Files are still unmerged."
+            ok=false
+          fi
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)' -- ':!*.md'; then
+            echo "::error::Conflict markers remain."
+            ok=false
+          fi
+          git add -A -- . ':!target'
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit -m "Merge upstream $UPSTREAM_TAG into the fork" \
+              -m "Conflicts resolved by Claude in the Upstream sync workflow."
+          elif ! git diff --cached --quiet; then
+            git commit -m "fix: adapt the fork to upstream $UPSTREAM_TAG" \
+              -m "Made by Claude in the Upstream sync workflow after the merged code failed its check."
+          fi
+          if [ "$ok" = true ] && [ "$AGENT" != skipped ]; then
+            cargo xtask check || { echo "::error::cargo xtask check still fails."; ok=false; }
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Push and open the PR
+        id: pr
+        if: steps.plan.outputs.step == 'merge'
+        env:
+          GH_TOKEN: ${{ secrets.SEREIN_SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          OK: ${{ steps.verify.outputs.ok }}
+          AGENT: ${{ steps.agent.outcome }}
+        run: |
+          set -euo pipefail
+          # sync/* branches belong to this workflow; a PR closed without merging is redone.
+          git push --force "https://x-access-token:$GH_TOKEN@github.com/$GH_REPO.git" "HEAD:refs/heads/$BRANCH"
+          {
+            echo "## Summary"
+            echo
+            echo "Merges upstream [\`$UPSTREAM_TAG\`](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) into the fork. Once CI passes, the Upstream sync workflow merges this PR and publishes \`$UPSTREAM_TAG-fork.1\`."
+            echo
+            if [ "$AGENT" = skipped ]; then
+              echo "The merge was clean and \`cargo xtask check\` passed, so no agent ran."
+            else
+              echo "### What Claude changed"
+              echo
+              cat target/upstream-sync/summary.md 2>/dev/null || echo "Claude wrote no summary; review the merge commit."
+            fi
+            if [ "$OK" != true ]; then
+              echo
+              echo "## Needs attention"
+              echo
+              echo "The workflow's own verification failed (unmerged files, conflict markers or a failing \`cargo xtask check\`), so this PR is a draft and will not be merged automatically. See the workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            fi
+          } > "$RUNNER_TEMP/body.md"
+          draft=()
+          [ "$OK" = true ] || draft=(--draft)
+          url=$(gh pr create --base main --head "$BRANCH" "${draft[@]}" \
+            --title "chore(upstream): merge upstream $UPSTREAM_TAG" --body-file "$RUNNER_TEMP/body.md")
+          echo "$url"
+          echo "number=${url##*/}" >> "$GITHUB_OUTPUT"
+          if [ "$OK" != true ]; then
+            echo "::error::Opened $url as a draft for a human to finish."
+            exit 1
+          fi
+
+      - name: Wait for CI and merge the PR
+        if: steps.plan.outputs.step == 'merge' || steps.plan.outputs.step == 'pending'
+        env:
+          GH_TOKEN: ${{ secrets.SEREIN_SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number || steps.plan.outputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR" --json isDraft --jq .isDraft)" = true ]; then
+            echo "::warning::PR #$PR is a draft and needs a human; it is left as it is."
+            exit 1
+          fi
+          # Checks take a moment to register on a new push.
+          for _ in $(seq 20); do
+            [ "$(gh pr view "$PR" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0 ] && break
+            sleep 30
+          done
+          if ! gh pr checks "$PR" --watch --interval 60; then
+            echo "::error::CI failed on PR #$PR; it is left open for a human."
+            exit 1
+          fi
+          gh pr merge "$PR" --merge
+
+      - name: Publish the fork release
+        if: >-
+          steps.plan.outputs.step == 'release' || steps.plan.outputs.step == 'merge' ||
+          steps.plan.outputs.step == 'pending'
+        env:
+          GH_TOKEN: ${{ secrets.SEREIN_SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh run list --workflow fork-release.yml --limit 20 --json status,displayTitle \
+            --jq '.[] | select(.status != "completed") | .displayTitle' | grep -qF "$TAG"; then
+            echo "A release of $TAG is already running."
+            exit 0
+          fi
+          gh workflow run fork-release.yml --ref main -f tag="$TAG"
+          echo "Started the fork release $TAG."
+
+      - name: Keep the agent's transcript
+        if: always() && steps.agent.outcome != 'skipped'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: upstream-sync-agent
+          path: target/upstream-sync/
+          if-no-files-found: ignore
+          retention-days: 14
