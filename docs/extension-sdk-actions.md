@@ -155,6 +155,7 @@ Follow an operation for its fields, example and additional checks.
 | `leave_voice` | `voice_control` | [Leave the current call](extension-sdk-actions.md#control-the-current-call) |
 | `set_local_settings` | `local_settings` | [Change reading preferences](extension-sdk-actions.md#change-local-reading-settings) |
 | `set_notification_settings` | `notification_settings` | [Change device notifications](extension-sdk-actions.md#change-device-local-notification-settings) |
+| `set_channel_hooks` (Preview) | `message_annotations` and/or `send_hook` | [Switch your hooks in a conversation](extension-sdk-actions.md#switch-your-hooks-in-a-conversation-preview) |
 | `app_action` | Depends on nested action | [Messages, threads, accounts and media](extension-sdk-actions.md#app-actions) |
 | `tracked_app_action` | Nested action grant plus `action_feedback` | [Receive Apply admission results](extension-sdk-actions.md#tracked-actions) |
 
@@ -691,6 +692,27 @@ to the plugin `storage` output field.
 
 These are alternatives: two effects in one output are invalid. Ask the user to
 run a separate action for each operation.
+
+### Switch your hooks in a conversation (Preview)
+
+`set_channel_hooks` / `SetChannelHooks` lets a user switch your message hooks on
+in one conversation with a single Apply, instead of ticking them in the
+composer's **Extensions** menu. It only ever changes your own hooks.
+
+| Field | Meaning |
+| --- | --- |
+| `channel_id` | A conversation the user can open. |
+| `notes` | `true` switches your notes under messages on there, `false` off. Needs `message_annotations` and an `annotate` action. |
+| `send` | `"auto"` or `"preview"` switches your send hook on in that mode, replacing another plugin's send hook there; omitted switches yours off. Needs `send_hook` and a `send` action. |
+
+The confirmation names the conversation and what each hook will do. A send hook
+switched on this way keeps a fallback the user already chose for yours, else
+keeps the draft when your hook fails. Both off switches you off there; it is
+checked like switching notes on.
+
+```json
+{"effects":[{"type":"set_channel_hooks","channel_id":"20","notes":true,"send":"auto"}]}
+```
 
 ### Control the current call
 

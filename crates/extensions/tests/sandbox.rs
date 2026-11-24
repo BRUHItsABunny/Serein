@@ -11,6 +11,10 @@ fn plugin(wasm: &str) -> Package {
 			license: "MIT".into(),
 			source: "https://github.com/example/plugin".into(),
 			kind: ExtensionKind::Plugin,
+			network: Vec::new(),
+			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![Capability::Composer],
 			actions: vec![Action {
 				id: "run".into(),
@@ -133,6 +137,29 @@ fn diagnostics_distinguish_safe_runtime_input_and_output_failures() {
 		invoke(&returning(&panel.to_string()), &input()),
 		Err(Error::OutputLimit)
 	));
+	// A picker offers at least one kind, each once, and its value is empty or one canonical
+	// choice of an offered kind.
+	let picker = |kinds: &str, value: &str| {
+		returning(&format!(
+			r#"{{"panel":[{{"type":"picker","id":"who","label":"Who","kinds":{kinds},"value":"{value}"}}]}}"#
+		))
+	};
+	for (kinds, value) in [(r#"["user","server"]"#, ""), (r#"["user"]"#, "user:42")] {
+		invoke(&picker(kinds, value), &input()).unwrap();
+	}
+	for (kinds, value) in [
+		("[]", ""),
+		(r#"["user","user"]"#, ""),
+		(r#"["user"]"#, "server:42"),
+		(r#"["user"]"#, "user:042"),
+		(r#"["user"]"#, "user:0"),
+		(r#"["user"]"#, "user:Alice"),
+	] {
+		assert!(
+			invoke(&picker(kinds, value), &input()).is_err(),
+			"{kinds} {value}"
+		);
+	}
 }
 
 /// Checks that a menu action without its target, or with another kind of target, is
@@ -314,6 +341,7 @@ fn validates_themes_catalog_and_path_safe_identifiers() {
 		sha256: "a".repeat(64),
 		download_bytes: 100,
 		source_commit: "a".repeat(40),
+		catalog_source: None,
 	};
 	let catalog = Catalog {
 		api_version: API_VERSION,
@@ -674,4 +702,1241 @@ fn custom_rpc_package_preserves_drafts_and_controls_presence() {
 		.insert("button1-url".into(), "javascript:alert(1)".into());
 	let invalid = invoke(&package, &input).expect("invalid field stays a valid editor panel");
 	assert!(invalid.rich_presence.is_none() && invalid.storage.is_none());
+}
+
+/// Fixed services so import tests are deterministic.
+struct Fixed;
+impl HostImports for Fixed {
+	fn now_ms(&mut self) -> Option<i64> {
+		Some(1234)
+	}
+	fn fill_random(&mut self, out: &mut [u8]) -> bool {
+		out.fill(0xab);
+		true
+	}
+	/// Echoes JSON requests; a one-byte request fails with a long message and a two-byte
+	/// request succeeds with an oversized reply.
+	fn db_execute(&mut self, request: &[u8]) -> Reply {
+		match request.len() {
+			1 => Reply::Failed("é".repeat(1000)),
+			2 => Reply::Ok(vec![b'x'; 300 * 1024]),
+			_ => Reply::Ok(request.to_vec()),
+		}
+	}
+	fn journal_read(&mut self, max_entries: u32) -> Reply {
+		Reply::Ok(format!(r#"{{"entries":[],"max":{max_entries}}}"#).into_bytes())
+	}
+}
+
+/// A composer plugin with `capabilities` whose handler runs `body` (leaving an i32 on the
+/// stack) and replaces the draft with "ok" when it is non-zero, else "no".
+fn importing(imports: &str, capabilities: &[Capability], body: &str) -> Package {
+	let ok = r#"{"replacement":"ok"}"#;
+	let no = r#"{"replacement":"no"}"#;
+	let mut package = plugin(&format!(
+		r#"(module {imports} (memory (export "memory") 1)
+		(data (i32.const 1024) "{ok}") (data (i32.const 2048) "{no}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 4096))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(if (result i64) {body}
+				(then (i64.const {}))
+				(else (i64.const {})))))"#,
+		(1024_u64 << 32) | ok.len() as u64,
+		(2048_u64 << 32) | no.len() as u64,
+		ok = ok.replace('"', "\\\""),
+		no = no.replace('"', "\\\""),
+	));
+	package
+		.manifest
+		.capabilities
+		.extend_from_slice(capabilities);
+	package
+}
+
+const CLOCK: &str = r#"(import "serein" "clock_now_ms" (func $now (result i64)))"#;
+const RANDOM: &str = r#"(import "serein" "random_fill" (func $fill (param i32 i32) (result i32)))"#;
+
+const DATABASE: &str = r#"(import "serein" "db_execute" (func $db (param i32 i32) (result i32)))
+	(import "serein" "result_read" (func $read (param i32 i32) (result i32)))"#;
+
+fn run(package: &Package, grants: &[Capability]) -> Result<Option<String>, Error> {
+	invoke_with(package, &input(), grants, Box::new(Fixed)).map(|output| output.replacement)
+}
+
+#[test]
+fn host_imports_require_known_signatures_and_declared_capabilities() {
+	for imports in [
+		r#"(import "env" "clock_now_ms" (func (result i64)))"#,
+		r#"(import "serein" "open_file" (func (result i64)))"#,
+		r#"(import "serein" "clock_now_ms" (func (result i32)))"#,
+		r#"(import "serein" "clock_now_ms" (memory 1))"#,
+	] {
+		let package = importing(imports, &[Capability::Clock], "(i32.const 1)");
+		assert!(
+			matches!(package.validate(), Err(Error::Module)),
+			"{imports}"
+		);
+	}
+	let undeclared = importing(CLOCK, &[], "(i32.const 1)");
+	assert!(matches!(undeclared.validate(), Err(Error::Capability)));
+	let declared = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(i64.eq (call $now) (i64.const 1234))",
+	);
+	declared.validate().unwrap();
+	// Declared but not granted: nothing runs, with or without services.
+	assert!(matches!(
+		invoke(&declared, &input()),
+		Err(Error::Capability)
+	));
+	assert!(matches!(
+		run(&declared, &[Capability::Composer]),
+		Err(Error::Capability)
+	));
+	// A grant the manifest never declared does not unlock an import either.
+	let mut stripped = declared.clone();
+	stripped
+		.manifest
+		.capabilities
+		.retain(|c| *c != Capability::Clock);
+	assert!(matches!(
+		run(&stripped, &[Capability::Clock]),
+		Err(Error::Capability)
+	));
+	let grants = [Capability::Composer, Capability::Clock];
+	assert_eq!(run(&declared, &grants).unwrap().as_deref(), Some("ok"));
+	let unavailable = invoke_with(&declared, &input(), &grants, Box::new(NoHostImports));
+	assert_eq!(unavailable.unwrap().replacement.as_deref(), Some("no"));
+}
+
+#[test]
+fn random_fill_writes_only_bounded_in_range_memory() {
+	let grants = [Capability::Composer, Capability::Random];
+	let filled = importing(
+		RANDOM,
+		&[Capability::Random],
+		"(i32.and (i32.eqz (call $fill (i32.const 8192) (i32.const 4))) (i32.eq (i32.load (i32.const 8192)) (i32.const 0xabababab)))",
+	);
+	assert_eq!(run(&filled, &grants).unwrap().as_deref(), Some("ok"));
+	// Oversized and negative lengths are refused without writing.
+	for length in ["4097", "-1"] {
+		let refused = importing(
+			RANDOM,
+			&[Capability::Random],
+			&format!(
+				"(i32.and (i32.eq (call $fill (i32.const 8192) (i32.const {length})) (i32.const -1)) (i32.eqz (i32.load (i32.const 8192))))"
+			),
+		);
+		assert_eq!(
+			run(&refused, &grants).unwrap().as_deref(),
+			Some("ok"),
+			"{length}"
+		);
+	}
+	// Writing past the end of linear memory traps instead of touching host memory.
+	let out_of_bounds = importing(
+		RANDOM,
+		&[Capability::Random],
+		"(i32.eqz (call $fill (i32.const 65534) (i32.const 4)))",
+	);
+	assert!(matches!(run(&out_of_bounds, &grants), Err(Error::Trap)));
+}
+
+#[test]
+fn host_calls_are_budgeted_per_invocation() {
+	let spin = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(loop $again (drop (call $now)) (br $again)) (i32.const 1)",
+	);
+	let grants = [Capability::Composer, Capability::Clock];
+	assert!(matches!(run(&spin, &grants), Err(Error::Fuel)));
+	// The budget belongs to one invocation: the next one starts fresh.
+	let once = importing(
+		CLOCK,
+		&[Capability::Clock],
+		"(i64.eq (call $now) (i64.const 1234))",
+	);
+	assert_eq!(run(&once, &grants).unwrap().as_deref(), Some("ok"));
+}
+
+#[test]
+fn variable_replies_stay_pending_until_read_into_a_large_enough_buffer() {
+	let grants = [Capability::Composer, Capability::Database];
+	let read_only = r#"(import "serein" "result_read" (func $read (param i32 i32) (result i32)))"#;
+	// Reading needs no capability and fails when nothing is pending.
+	let nothing = importing(
+		read_only,
+		&[],
+		"(i32.eq (call $read (i32.const 8192) (i32.const 64)) (i32.const -1))",
+	);
+	nothing.validate().unwrap();
+	assert_eq!(
+		run(&nothing, &[Capability::Composer]).unwrap().as_deref(),
+		Some("ok")
+	);
+	assert!(matches!(
+		importing(DATABASE, &[], "(i32.const 1)").validate(),
+		Err(Error::Capability)
+	));
+	for body in [
+		// The 20-byte request at 1024 is echoed; a short buffer keeps it pending, and a read
+		// clears it.
+		"(i32.and (i32.and (i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const 20))
+			(i32.eq (call $read (i32.const 8192) (i32.const 19)) (i32.const -1)))
+		 (i32.and (i32.and (i32.eq (call $read (i32.const 8192) (i32.const 20)) (i32.const 20))
+			(i32.eq (i32.load (i32.const 8192)) (i32.load (i32.const 1024))))
+			(i32.eq (call $read (i32.const 8192) (i32.const 20)) (i32.const -1))))",
+		// Failure messages are cut to 1 KiB on a character boundary.
+		"(i32.and (i32.eq (call $db (i32.const 1024) (i32.const 1)) (i32.const -3))
+			(i32.eq (call $read (i32.const 8192) (i32.const 4096)) (i32.const 1024)))",
+		// An oversized reply becomes an error, and a new call drops the unread reply.
+		"(i32.and (i32.and (i32.eq (call $db (i32.const 1024) (i32.const 2)) (i32.const -3))
+			(i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const 20)))
+			(i32.eq (call $read (i32.const 8192) (i32.const 4096)) (i32.const 20)))",
+		// Requests over 256 KiB are refused before memory is read.
+		"(i32.eq (call $db (i32.const 0) (i32.const 262145)) (i32.const -1))",
+	] {
+		let package = importing(DATABASE, &[Capability::Database], body);
+		assert_eq!(
+			run(&package, &grants).unwrap().as_deref(),
+			Some("ok"),
+			"{body}"
+		);
+	}
+	let unavailable = importing(
+		DATABASE,
+		&[Capability::Database],
+		"(i32.eq (call $db (i32.const 1024) (i32.const 20)) (i32.const -2))",
+	);
+	let output = invoke_with(&unavailable, &input(), &grants, Box::new(NoHostImports)).unwrap();
+	assert_eq!(output.replacement.as_deref(), Some("ok"));
+	// A request that runs past linear memory traps.
+	let out_of_bounds = importing(
+		DATABASE,
+		&[Capability::Database],
+		"(i32.eqz (call $db (i32.const 65530) (i32.const 20)))",
+	);
+	assert!(matches!(run(&out_of_bounds, &grants), Err(Error::Trap)));
+}
+
+#[test]
+fn journal_actions_need_their_capability_and_return_only_storage() {
+	let read = r#"(import "serein" "journal_read" (func $journal (param i32) (result i32)))"#;
+	assert!(matches!(
+		importing(read, &[], "(i32.const 1)").validate(),
+		Err(Error::Capability)
+	));
+	let grants = [Capability::Composer, Capability::MessageJournal];
+	// 1 to 256 entries per call; other counts are refused.
+	let bounds = importing(
+		read,
+		&[Capability::MessageJournal],
+		"(i32.and (i32.and (i32.gt_s (call $journal (i32.const 256)) (i32.const 0))
+			(i32.eq (call $journal (i32.const 0)) (i32.const -1)))
+			(i32.eq (call $journal (i32.const 257)) (i32.const -1)))",
+	);
+	assert_eq!(run(&bounds, &grants).unwrap().as_deref(), Some("ok"));
+
+	let mut manifest = plugin("(module)").manifest;
+	let journal = Action {
+		id: "journal".into(),
+		label: "Journal".into(),
+		surface: Surface::Journal,
+	};
+	manifest.actions = vec![journal.clone()];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.capabilities.push(Capability::MessageJournal);
+	manifest.validate().unwrap();
+	let mut twice = manifest.clone();
+	twice.actions.push(Action {
+		id: "again".into(),
+		..journal
+	});
+	assert!(matches!(twice.validate(), Err(Error::Invalid)));
+
+	let input = Invocation {
+		action: "journal".into(),
+		..Default::default()
+	};
+	input.validate(&manifest).unwrap();
+	let mut with_values = input.clone();
+	with_values.values.insert("x".into(), "1".into());
+	assert!(with_values.validate(&manifest).is_err());
+	manifest.capabilities.push(Capability::Storage);
+	let storage: Output = serde_json::from_str(r#"{"storage":"saved"}"#).unwrap();
+	storage.validate(&manifest, &input).unwrap();
+	for output in [
+		r#"{"replacement":"x"}"#,
+		r#"{"panel":[{"type":"text","text":"x"}]}"#,
+	] {
+		let output: Output = serde_json::from_str(output).unwrap();
+		assert!(
+			matches!(output.validate(&manifest, &input), Err(Error::Capability)),
+			"{output:?}"
+		);
+	}
+}
+
+#[test]
+fn network_origins_and_capability_come_together() {
+	let request = r#"(import "serein" "https_request" (func $fetch (param i32 i32) (result i32)))"#;
+	let mut package = importing(request, &[Capability::Network], "(i32.const 1)");
+	// The capability without origins, or origins without the capability, is refused.
+	assert!(matches!(package.validate(), Err(Error::Capability)));
+	package.manifest.network = vec!["https://api.example.org".into()];
+	package.validate().unwrap();
+	package
+		.manifest
+		.capabilities
+		.retain(|c| *c != Capability::Network);
+	assert!(package.validate().is_err());
+	package.manifest.capabilities.push(Capability::Network);
+	for origins in [
+		vec!["http://api.example.org"],
+		vec!["https://api.example.org/path"],
+		vec!["https://10.0.0.1"],
+		vec!["https://api.example.org", "https://API.example.org/"],
+	] {
+		package.manifest.network = origins.iter().map(|o| o.to_string()).collect();
+		assert!(
+			matches!(package.validate(), Err(Error::Invalid)),
+			"{origins:?}"
+		);
+	}
+	package.manifest.network = (0..17)
+		.map(|i| format!("https://h{i}.example.org"))
+		.collect();
+	assert!(matches!(package.validate(), Err(Error::Limit)));
+}
+
+#[test]
+fn topics_are_named_versioned_and_subscribers_declare_a_delivery_action() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.broadcasts = vec!["serein.captions/1".into()];
+	manifest.validate().unwrap();
+	for invalid in [
+		vec!["captions"],
+		vec!["serein.captions/1", "serein.captions/1"],
+	] {
+		manifest.broadcasts = invalid.iter().map(|t| t.to_string()).collect();
+		assert!(manifest.validate().is_err(), "{invalid:?}");
+	}
+	manifest.broadcasts.clear();
+	// Subscribing needs a topic action, and a topic action needs subscriptions.
+	manifest.subscribes = vec!["serein.captions/1".into()];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions.push(Action {
+		id: "receive".into(),
+		label: "Receive".into(),
+		surface: Surface::Topic,
+	});
+	manifest.validate().unwrap();
+	manifest.subscribes.clear();
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	// The imports themselves need no capability; the host checks topics per call.
+	let importing_topics = importing(
+		r#"(import "serein" "broadcast" (func (param i32 i32) (result i32)))
+		(import "serein" "has_subscribers" (func (param i32 i32) (result i32)))
+		(import "serein" "topic_read" (func (param i32) (result i32)))"#,
+		&[],
+		"(i32.const 1)",
+	);
+	importing_topics.validate().unwrap();
+}
+
+#[test]
+fn message_hooks_get_only_their_draft_or_batch_and_annotate_only_what_they_were_given() {
+	let mut manifest = plugin("(module)").manifest;
+	let action = |id: &str, surface| Action {
+		id: id.into(),
+		label: id.into(),
+		surface,
+	};
+	manifest.capabilities = vec![Capability::SendHook, Capability::MessageAnnotations];
+	manifest.actions = vec![action("send", Surface::Send)];
+	// A send hook needs its action and the action its capability; annotations alone are a
+	// valid grant for `message` actions.
+	assert!(matches!(manifest.validate(), Ok(())));
+	manifest.capabilities = vec![Capability::MessageAnnotations];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.capabilities = vec![Capability::SendHook, Capability::MessageAnnotations];
+	manifest.actions = vec![action("notes", Surface::Annotate)];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions.push(action("send", Surface::Send));
+	manifest.validate().unwrap();
+
+	let target = || {
+		Some(Box::new(SendTarget {
+			channel_id: "20".into(),
+			guild_id: None,
+		}))
+	};
+	let send = Invocation {
+		action: "send".into(),
+		composer: Some("hallo".into()),
+		send_target: target(),
+		..Default::default()
+	};
+	// The draft is the hook's own grant; no `composer` capability is needed.
+	send.validate(&manifest).unwrap();
+	for invalid in [
+		Invocation {
+			send_target: None,
+			..send.clone()
+		},
+		Invocation {
+			composer: None,
+			..send.clone()
+		},
+		Invocation {
+			action: "notes".into(),
+			..send.clone()
+		},
+	] {
+		assert!(invalid.validate(&manifest).is_err());
+	}
+	let rewrite = Output {
+		replacement: Some("hello".into()),
+		..Default::default()
+	};
+	rewrite.validate(&manifest, &send).unwrap();
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..rewrite.clone()
+	};
+	assert!(matches!(
+		with_panel.validate(&manifest, &send),
+		Err(Error::Capability)
+	));
+
+	let message = |id: &str| AnnotateMessage {
+		message_id: id.into(),
+		author_id: "2".into(),
+		content: "hola".into(),
+		edited: false,
+	};
+	let batch = Invocation {
+		action: "notes".into(),
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: vec![message("1"), message("3")],
+		})),
+		..Default::default()
+	};
+	batch.validate(&manifest).unwrap();
+	let oversized = Invocation {
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: (0..26).map(|id| message(&(id + 1).to_string())).collect(),
+		})),
+		..batch.clone()
+	};
+	assert!(matches!(oversized.validate(&manifest), Err(Error::Limit)));
+	let note = |id: &str, text: &str| Annotation {
+		message_id: id.into(),
+		text: text.into(),
+	};
+	let notes = |annotations| Output {
+		annotations,
+		..Default::default()
+	};
+	notes(vec![note("1", "hello"), note("3", "")])
+		.validate(&manifest, &batch)
+		.unwrap();
+	// Only messages the plugin was given, once each, within the size limit.
+	for (invalid, error) in [
+		(vec![note("2", "hello")], "unrelated message"),
+		(vec![note("1", "a"), note("1", "b")], "duplicate"),
+		(vec![note("1", &"x".repeat(4097))], "oversized"),
+	] {
+		assert!(
+			notes(invalid).validate(&manifest, &batch).is_err(),
+			"{error}"
+		);
+	}
+	assert!(
+		notes(vec![note("1", "hello")])
+			.validate(&manifest, &send)
+			.is_err(),
+		"a send hook cannot annotate"
+	);
+
+	// A send hook may follow its message with a second one; nothing else may send one.
+	let follow = |text: &str| Output {
+		follow_up: Some(text.into()),
+		..Default::default()
+	};
+	follow("hola").validate(&manifest, &send).unwrap();
+	assert!(follow(" \n").validate(&manifest, &send).is_err());
+	assert!(matches!(
+		follow(&"x".repeat(16 * 1024 + 1)).validate(&manifest, &send),
+		Err(Error::Limit)
+	));
+	assert!(matches!(
+		follow("hola").validate(&manifest, &batch),
+		Err(Error::Capability)
+	));
+	// Alternates follow the annotation rules and need a plain label.
+	let alternate = |id: &str, label: &str, text: &str| Output {
+		alternates: vec![extensions::Alternate {
+			message_id: id.into(),
+			label: label.into(),
+			text: text.into(),
+		}],
+		..Default::default()
+	};
+	alternate("1", "Translation", "hello\nthere")
+		.validate(&manifest, &batch)
+		.unwrap();
+	alternate("1", "", "").validate(&manifest, &batch).unwrap();
+	for (invalid, error) in [
+		(alternate("2", "Translation", "hi"), "unrelated message"),
+		(alternate("1", " ", "hi"), "unlabelled"),
+		(alternate("1", "Trans\u{7}", "hi"), "control label"),
+		(
+			alternate("1", "Translation", &"x".repeat(4097)),
+			"oversized",
+		),
+		(alternate("1", &"x".repeat(65), "hi"), "long label"),
+	] {
+		assert!(invalid.validate(&manifest, &batch).is_err(), "{error}");
+	}
+	assert!(
+		alternate("1", "Translation", "hi")
+			.validate(&manifest, &send)
+			.is_err(),
+		"a send hook cannot replace messages"
+	);
+}
+
+#[test]
+fn notification_hooks_get_only_their_alert_and_may_only_reword_or_hide_it() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Notifications];
+	assert!(matches!(manifest.validate(), Err(Error::Capability)));
+	manifest.actions = vec![Action {
+		id: "alert".into(),
+		label: "Alert".into(),
+		surface: Surface::Notification,
+	}];
+	manifest.validate().unwrap();
+
+	let alert = NotificationInput {
+		source: NotificationSource::Gateway,
+		message_id: "1".into(),
+		channel_id: "20".into(),
+		guild_id: None,
+		author_id: Some("5".into()),
+		direct: true,
+		title: "Ada".into(),
+		body: "hola".into(),
+		upgrade: false,
+	};
+	let input = Invocation {
+		action: "alert".into(),
+		notification: Some(Box::new(alert.clone())),
+		..Default::default()
+	};
+	input.validate(&manifest).unwrap();
+	for invalid in [
+		Invocation {
+			notification: None,
+			..input.clone()
+		},
+		Invocation {
+			composer: Some("draft".into()),
+			..input.clone()
+		},
+		Invocation {
+			notification: Some(Box::new(NotificationInput {
+				body: "x".repeat(513),
+				..alert.clone()
+			})),
+			..input.clone()
+		},
+	] {
+		assert!(invalid.validate(&manifest).is_err());
+	}
+
+	let decide = |decision: NotificationDecision| Output {
+		notification: Some(decision),
+		..Default::default()
+	};
+	decide(NotificationDecision {
+		body: Some("hello".into()),
+		..Default::default()
+	})
+	.validate(&manifest, &input)
+	.unwrap();
+	// Line breaks could fake extra lines in the alert, and hiding takes no text.
+	for invalid in [
+		NotificationDecision {
+			body: Some("hello\nfrom your bank".into()),
+			..Default::default()
+		},
+		NotificationDecision {
+			title: Some(" ".into()),
+			..Default::default()
+		},
+		NotificationDecision {
+			hide: true,
+			body: Some("x".into()),
+			..Default::default()
+		},
+	] {
+		assert!(decide(invalid).validate(&manifest, &input).is_err());
+	}
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..decide(NotificationDecision::default())
+	};
+	assert!(matches!(
+		with_panel.validate(&manifest, &input),
+		Err(Error::Capability)
+	));
+
+	// The SDK's output decodes into the host's.
+	let sdk_output = serde_json::to_value(serein_extension_sdk::NotificationOutput {
+		notification: Some(serein_extension_sdk::NotificationDecision {
+			hide: true,
+			..Default::default()
+		}),
+		..Default::default()
+	})
+	.unwrap();
+	let output: Output = serde_json::from_value(sdk_output).unwrap();
+	output.validate(&manifest, &input).unwrap();
+	assert!(output.notification.unwrap().hide);
+}
+
+#[test]
+fn pages_need_their_grant_and_rows_answer_exactly_the_request() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Pages];
+	manifest.actions = vec![
+		Action {
+			id: "open".into(),
+			label: "Open".into(),
+			surface: Surface::Panel,
+		},
+		Action {
+			id: "rows".into(),
+			label: "Rows".into(),
+			surface: Surface::Panel,
+		},
+	];
+	manifest.validate().unwrap();
+	let row = |id: &str, text: &str| PageRow {
+		id: id.into(),
+		author: Some("Ada".into()),
+		time_ms: Some(1_700_000_000_000),
+		text: text.into(),
+		state: Some(PageRowState::Edited),
+		revisions: vec![PageRevision {
+			time_ms: None,
+			text: "first\nversion".into(),
+		}],
+	};
+	let page = |list: PageList| Output {
+		page: Some(Some(Page {
+			title: "Archive".into(),
+			elements: vec![Element::Button {
+				id: "open".into(),
+				label: "Refresh".into(),
+			}],
+			list: Some(list),
+		})),
+		..Default::default()
+	};
+	let list = PageList {
+		version: "v1".into(),
+		total: 3,
+		rows_action: "rows".into(),
+		click_action: None,
+		rows: vec![row("1", "hello\nthere")],
+		empty_text: None,
+	};
+	let open = Invocation {
+		action: "open".into(),
+		..Default::default()
+	};
+	page(list.clone()).validate(&manifest, &open).unwrap();
+	for (invalid, why) in [
+		(
+			PageList {
+				rows_action: "missing".into(),
+				..list.clone()
+			},
+			"undeclared rows action",
+		),
+		(
+			PageList {
+				total: 0,
+				..list.clone()
+			},
+			"inline rows past the total",
+		),
+		(
+			PageList {
+				rows: vec![row("1", "tab\there")],
+				..list.clone()
+			},
+			"control characters",
+		),
+		(
+			PageList {
+				version: String::new(),
+				..list.clone()
+			},
+			"blank version",
+		),
+	] {
+		assert!(page(invalid).validate(&manifest, &open).is_err(), "{why}");
+	}
+	// Closing needs the grant too, and pages come only from activation and panel actions.
+	let close = Output {
+		page: Some(None),
+		..Default::default()
+	};
+	close.validate(&manifest, &open).unwrap();
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities.clear();
+	assert!(close.validate(&ungranted, &open).is_err());
+
+	let request = PageRequest {
+		version: "v1".into(),
+		start: 1,
+		count: 2,
+	};
+	let fetch = Invocation {
+		action: "rows".into(),
+		page_request: Some(Box::new(request.clone())),
+		..Default::default()
+	};
+	fetch.validate(&manifest).unwrap();
+	assert!(fetch.validate(&ungranted).is_err());
+	let answer = |version: &str, start, count| Output {
+		page_rows: Some(PageRows {
+			version: version.into(),
+			start,
+			rows: (0..count)
+				.map(|id: u32| row(&id.to_string(), "x"))
+				.collect(),
+		}),
+		..Default::default()
+	};
+	answer("v1", 1, 2).validate(&manifest, &fetch).unwrap();
+	for (invalid, why) in [
+		(answer("v0", 1, 2), "another version"),
+		(answer("v1", 0, 2), "another start"),
+		(answer("v1", 1, 3), "more rows than asked"),
+	] {
+		assert!(invalid.validate(&manifest, &fetch).is_err(), "{why}");
+	}
+	assert!(
+		answer("v1", 1, 1).validate(&manifest, &open).is_err(),
+		"rows only answer a request"
+	);
+	let with_panel = Output {
+		panel: vec![Element::Separator],
+		..answer("v1", 1, 1)
+	};
+	assert!(
+		with_panel.validate(&manifest, &fetch).is_err(),
+		"a fetch opens no window"
+	);
+
+	// The SDK's `null` closes the page.
+	let sdk_close = serde_json::to_value(serein_extension_sdk::PageOutput {
+		page: Some(None),
+		..Default::default()
+	})
+	.unwrap();
+	let output: Output = serde_json::from_value(sdk_close).unwrap();
+	assert!(matches!(output.page, Some(None)));
+}
+
+#[test]
+fn annotators_add_history_and_deleted_rows_only_around_their_messages_and_captions_need_a_grant() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::MessageAnnotations, Capability::CallCaptions];
+	manifest.actions = vec![
+		Action {
+			id: "notes".into(),
+			label: "Notes".into(),
+			surface: Surface::Annotate,
+		},
+		Action {
+			id: "open".into(),
+			label: "Open".into(),
+			surface: Surface::Panel,
+		},
+	];
+	manifest.validate().unwrap();
+	let message = |id: &str| AnnotateMessage {
+		message_id: id.into(),
+		author_id: "2".into(),
+		content: "hola".into(),
+		edited: true,
+	};
+	let batch = Invocation {
+		action: "notes".into(),
+		annotate: Some(Box::new(AnnotateBatch {
+			channel_id: "20".into(),
+			guild_id: None,
+			messages: vec![message("10"), message("30")],
+		})),
+		..Default::default()
+	};
+	let history = |id: &str| MessageHistory {
+		message_id: id.into(),
+		revisions: vec![PageRevision {
+			time_ms: Some(1),
+			text: "earlier\ntext".into(),
+		}],
+	};
+	let deleted = |after: &str, id: &str| DeletedMessages {
+		after_message_id: after.into(),
+		messages: vec![DeletedMessage {
+			message_id: id.into(),
+			author: "Ada".into(),
+			time_ms: None,
+			text: "gone".into(),
+			deleted_ms: None,
+			revisions: Vec::new(),
+		}],
+	};
+	let output = |histories, deleted_messages| Output {
+		histories,
+		deleted_messages,
+		..Default::default()
+	};
+	output(vec![history("10")], vec![deleted("10", "20")])
+		.validate(&manifest, &batch)
+		.unwrap();
+	for (invalid, why) in [
+		(
+			output(vec![history("99")], vec![]),
+			"history of a message not given",
+		),
+		(
+			output(vec![history("10"), history("10")], vec![]),
+			"duplicate history",
+		),
+		(
+			output(vec![], vec![deleted("99", "20")]),
+			"anchor not given",
+		),
+		(
+			output(vec![], vec![deleted("10", "30")]),
+			"a loaded message is not deleted",
+		),
+	] {
+		assert!(invalid.validate(&manifest, &batch).is_err(), "{why}");
+	}
+	let mut too_many = deleted("10", "20");
+	too_many.messages = (0..26)
+		.map(|id| DeletedMessage {
+			message_id: (100 + id).to_string(),
+			author: "Ada".into(),
+			time_ms: None,
+			text: "gone".into(),
+			deleted_ms: None,
+			revisions: Vec::new(),
+		})
+		.collect();
+	assert!(matches!(
+		output(vec![], vec![too_many]).validate(&manifest, &batch),
+		Err(Error::Limit)
+	));
+	// A deleted row's own earlier versions follow a history's limits.
+	let mut versions = deleted("10", "20");
+	versions.messages[0].revisions = (0..9)
+		.map(|n| PageRevision {
+			time_ms: None,
+			text: format!("v{n}"),
+		})
+		.collect();
+	assert!(matches!(
+		output(vec![], vec![versions.clone()]).validate(&manifest, &batch),
+		Err(Error::Limit)
+	));
+	versions.messages[0].revisions.truncate(8);
+	versions.messages[0].revisions[0].text = "bell\u{7}".into();
+	assert!(
+		output(vec![], vec![versions.clone()])
+			.validate(&manifest, &batch)
+			.is_err()
+	);
+	versions.messages[0].revisions[0].text = "two\nlines".into();
+	output(vec![], vec![versions])
+		.validate(&manifest, &batch)
+		.unwrap();
+	let open = Invocation {
+		action: "open".into(),
+		..Default::default()
+	};
+	assert!(
+		output(vec![history("10")], vec![])
+			.validate(&manifest, &open)
+			.is_err(),
+		"only annotate and message actions add history"
+	);
+
+	let captions = |text: &str| Output {
+		captions: Some(vec![Caption {
+			speaker_id: Some("5".into()),
+			text: text.into(),
+			done: true,
+		}]),
+		..Default::default()
+	};
+	captions("hello").validate(&manifest, &open).unwrap();
+	assert!(captions("two\nlines").validate(&manifest, &open).is_err());
+	assert!(
+		captions("hello").validate(&manifest, &batch).is_err(),
+		"hooks do not caption"
+	);
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities = vec![Capability::MessageAnnotations];
+	assert!(captions("hello").validate(&ungranted, &open).is_err());
+}
+
+#[test]
+fn picks_need_the_files_grant_a_declared_action_and_come_from_the_foreground() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![Capability::Files, Capability::MessageEvents];
+	manifest.actions = vec![
+		Action {
+			id: "picked".into(),
+			label: "Picked".into(),
+			surface: Surface::Panel,
+		},
+		Action {
+			id: "event".into(),
+			label: "Event".into(),
+			surface: Surface::MessageEvent,
+		},
+	];
+	manifest.validate().unwrap();
+	let pick = |pick: FilePick| Output {
+		pick: Some(pick),
+		..Default::default()
+	};
+	let export = FilePick {
+		kind: PickKind::SaveFile,
+		write: true,
+		purpose: "Export the archive".into(),
+		name: Some("archive.json".into()),
+		action: "picked".into(),
+	};
+	let panel = Invocation {
+		action: "picked".into(),
+		..Default::default()
+	};
+	pick(export.clone()).validate(&manifest, &panel).unwrap();
+	for (invalid, why) in [
+		(
+			FilePick {
+				action: "missing".into(),
+				..export.clone()
+			},
+			"undeclared action",
+		),
+		(
+			FilePick {
+				kind: PickKind::Folder,
+				..export.clone()
+			},
+			"a name only for save pickers",
+		),
+		(
+			FilePick {
+				name: Some("../x.json".into()),
+				..export.clone()
+			},
+			"a name, not a path",
+		),
+	] {
+		assert!(pick(invalid).validate(&manifest, &panel).is_err(), "{why}");
+	}
+	let mut ungranted = manifest.clone();
+	ungranted.capabilities = vec![Capability::MessageEvents];
+	assert!(pick(export.clone()).validate(&ungranted, &panel).is_err());
+	// Archiving writes into the private folder, so it needs `files`.
+	let mut archiving = manifest.clone();
+	archiving.capabilities = vec![Capability::MediaArchive, Capability::MessageEvents];
+	assert!(matches!(archiving.validate(), Err(Error::Capability)));
+	archiving.capabilities.push(Capability::Files);
+	archiving.validate().unwrap();
+}
+
+#[test]
+fn media_actions_pair_with_their_grant_take_bounded_batches_and_only_caption() {
+	let mut manifest = plugin("(module)").manifest;
+	manifest.capabilities = vec![
+		Capability::MediaWorker,
+		Capability::CallCaptions,
+		Capability::Storage,
+	];
+	assert!(
+		matches!(manifest.validate(), Err(Error::Capability)),
+		"grant without action"
+	);
+	manifest.actions = vec![Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	}];
+	manifest.validate().unwrap();
+	let chunk = |stream: &str, offset, length| MediaItem::Chunk {
+		stream: stream.into(),
+		codec: "opus".into(),
+		time_us: 0,
+		offset,
+		length,
+		rtp_timestamp: Some(960),
+		sequence: Some(1),
+		keyframe: false,
+	};
+	let batch = |items: Vec<MediaItem>, data_bytes| Invocation {
+		action: "media".into(),
+		media: Some(Box::new(MediaBatch {
+			seq: 1,
+			dropped: 0,
+			data_bytes,
+			items,
+		})),
+		..Default::default()
+	};
+	let input = batch(
+		vec![
+			MediaItem::Event {
+				time_us: 0,
+				event: CallEvent::Joined {
+					user_id: "5".into(),
+				},
+			},
+			chunk("user:5", 0, 10),
+		],
+		10,
+	);
+	input.validate(&manifest).unwrap();
+	for (invalid, why) in [
+		(
+			batch(vec![chunk("user:5", 6, 5)], 10),
+			"chunk past the data",
+		),
+		(
+			batch(vec![chunk("user:5", u32::MAX, 2)], 10),
+			"overflowing offset",
+		),
+		(batch(vec![chunk("user 5", 0, 1)], 10), "stream name"),
+		(
+			batch(vec![], extensions::media::MAX_MEDIA_DATA_BYTES + 1),
+			"data size",
+		),
+		(
+			batch(
+				(0..257)
+					.map(|_| MediaItem::Event {
+						time_us: 0,
+						event: CallEvent::Ended,
+					})
+					.collect(),
+				0,
+			),
+			"item count",
+		),
+		(
+			Invocation {
+				media: None,
+				..input.clone()
+			},
+			"a media action without a batch",
+		),
+	] {
+		assert!(invalid.validate(&manifest).is_err(), "{why}");
+	}
+	let captions = Output {
+		captions: Some(vec![Caption {
+			speaker_id: Some("5".into()),
+			text: "hello".into(),
+			done: false,
+		}]),
+		..Default::default()
+	};
+	captions.validate(&manifest, &input).unwrap();
+	for invalid in [
+		Output {
+			storage: Some("{}".into()),
+			..Default::default()
+		},
+		Output {
+			panel: vec![Element::Separator],
+			..Default::default()
+		},
+	] {
+		assert!(invalid.validate(&manifest, &input).is_err());
+	}
+
+	// Keyframe requests need `media_packets` and name a camera or screen share; the media
+	// taps need the worker they run in.
+	let keyframes = |streams: &[&str]| Output {
+		keyframes: streams.iter().map(|stream| stream.to_string()).collect(),
+		..Default::default()
+	};
+	assert!(
+		keyframes(&["camera:5"])
+			.validate(&manifest, &input)
+			.is_err()
+	);
+	let chunks = Output {
+		media_chunks: Some(false),
+		..Default::default()
+	};
+	assert!(
+		chunks.validate(&manifest, &input).is_err(),
+		"pausing chunks needs a media tap"
+	);
+	manifest.capabilities.push(Capability::MediaPackets);
+	chunks.validate(&manifest, &input).unwrap();
+	manifest.validate().unwrap();
+	keyframes(&["camera:5", "screen:6"])
+		.validate(&manifest, &input)
+		.unwrap();
+	for invalid in [&["voice:5"][..], &["camera:x"], &["camera"]] {
+		assert!(keyframes(invalid).validate(&manifest, &input).is_err());
+	}
+
+	// Other actions tell the worker its state, bounded; the worker cannot set its own.
+	let state = |text: String| Output {
+		media_state: Some(serde_json::json!({ "record": text })),
+		..Default::default()
+	};
+	assert!(state(String::new()).validate(&manifest, &input).is_err());
+	manifest.actions.push(Action {
+		id: "record".into(),
+		label: "Record".into(),
+		surface: Surface::Panel,
+	});
+	let panel = Invocation {
+		action: "record".into(),
+		..Default::default()
+	};
+	state("call".into()).validate(&manifest, &panel).unwrap();
+	let large = "x".repeat(extensions::media::MAX_MEDIA_STATE_BYTES);
+	assert!(matches!(
+		state(large.clone()).validate(&manifest, &panel),
+		Err(Error::Limit)
+	));
+	assert!(
+		batch(
+			vec![MediaItem::State {
+				time_us: 0,
+				state: serde_json::json!(large),
+			}],
+			0
+		)
+		.validate(&manifest)
+		.is_err(),
+		"an oversized state never reaches the worker"
+	);
+	let mut workerless = manifest.clone();
+	workerless.capabilities = vec![Capability::CallCaptions];
+	workerless
+		.actions
+		.retain(|action| action.surface == Surface::Panel);
+	assert!(state("call".into()).validate(&workerless, &panel).is_err());
+
+	let mut unpaired = manifest.clone();
+	unpaired.capabilities = vec![Capability::MediaAudio];
+	unpaired.actions.clear();
+	assert!(matches!(unpaired.validate(), Err(Error::Capability)));
+}
+
+/// A media worker moves every byte of the call through `media_read` and `file_write`, so
+/// those copies cost what Wasm's own do: reading a full 4 MiB batch eight times and
+/// writing it out would take 151,000,000 fuel at the general per-byte price.
+#[test]
+fn media_workers_copy_large_batches_at_the_price_of_wasm_copies() {
+	const FULL: usize = extensions::media::MAX_MEDIA_DATA_BYTES as usize;
+	let mut package = plugin(&format!(
+		r#"(module
+		(import "serein" "media_read" (func $read (param i32 i32 i32) (result i32)))
+		(import "serein" "file_write" (func $write (param i32 i32 i32 i32) (result i32)))
+		(memory (export "memory") 80)
+		(data (i32.const 16) "{{}}")
+		(data (i32.const 32) "{{\"root\":\"private\",\"path\":\"a\"}}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 4096))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(local $n i32) (local $length i32)
+			(local.set $length (call $read (i32.const 65536) (i32.const 0) (i32.const {FULL})))
+			(local.set $n (i32.const 7))
+			(loop $reads
+				(drop (call $read (i32.const 65536) (i32.const 0) (local.get $length)))
+				(br_if $reads (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(local.set $n (i32.const 4))
+			(loop $writes
+				(drop (call $write (i32.const 32) (i32.const 29) (i32.const 65536) (i32.const 1048576)))
+				(br_if $writes (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(i64.const {}))
+		)"#,
+		(16_u64 << 32) | 2,
+	));
+	package.manifest.capabilities = vec![Capability::MediaWorker, Capability::Files];
+	package.manifest.actions = vec![Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	}];
+	let grants = package.manifest.capabilities.clone();
+	let mut worker = MediaInstance::new(package, &grants, Box::new(Fixed)).unwrap();
+	let batch = |data_bytes| Invocation {
+		action: "media".into(),
+		media: Some(Box::new(MediaBatch {
+			seq: 1,
+			dropped: 0,
+			data_bytes,
+			items: Vec::new(),
+		})),
+		..Default::default()
+	};
+	worker
+		.invoke(&batch(FULL as u32), vec![7; FULL])
+		.expect("a full batch has fuel to move its data");
+}
+
+/// Decoding its input is work every plugin must do, and the input's size is mostly the
+/// snapshot the host chose to send, so an invocation's fuel grows with it: work that
+/// does not fit next to a small input fits next to a large one.
+#[test]
+fn invocations_get_fuel_for_the_input_they_must_decode() {
+	let mut package = plugin(&format!(
+		r#"(module
+		(memory (export "memory") 8)
+		(data (i32.const 16) "{{}}")
+		(func (export "serein_alloc") (param i32) (result i32) (i32.const 65536))
+		(func (export "serein_invoke") (param i32 i32) (result i64)
+			(local $n i32)
+			;; Work worth 12,000,000 fuel: six per turn.
+			(local.set $n (i32.const 2000000))
+			(loop $work
+				(br_if $work (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+			(i64.const {}))
+		)"#,
+		(16_u64 << 32) | 2,
+	));
+	package.manifest.capabilities.push(Capability::Storage);
+	let input = |storage: usize| Invocation {
+		action: "run".into(),
+		storage: Some("x".repeat(storage)),
+		..Default::default()
+	};
+	assert!(matches!(invoke(&package, &input(10)), Err(Error::Fuel)));
+	invoke(&package, &input(150 * 1024)).expect("a large input brings its fuel");
 }

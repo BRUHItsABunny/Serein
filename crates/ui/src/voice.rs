@@ -1233,6 +1233,7 @@ impl MessagingUi {
 			egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
 		));
 		if connected {
+			self.caption_bar(ui, state, channel, rect.x_range(), bar.top());
 			bar_ui.set_opacity(reveal);
 			self.call_controls(&mut bar_ui, state, channel, commands);
 		} else {
@@ -1241,6 +1242,79 @@ impl MessagingUi {
 				self.call_button(ui, state, channel, commands);
 			});
 		}
+	}
+
+	/// Plugin caption lines just above the call controls, over the stage; nothing without any.
+	fn caption_bar(
+		&mut self,
+		ui: &mut egui::Ui,
+		state: &State,
+		channel: Id,
+		across: egui::Rangef,
+		bottom: f32,
+	) {
+		if let Some(wait) = self.call_captions.expire(std::time::Instant::now()) {
+			ui.ctx().request_repaint_after(wait);
+		}
+		if self.call_captions.is_empty() {
+			return;
+		}
+		let width = (across.span() - 2.0 * STAGE_MARGIN).clamp(0.0, 720.0);
+		let left = across.center() - width / 2.0;
+		let mut job = egui::text::LayoutJob::default();
+		for (index, (plugin, caption)) in self.call_captions.lines().enumerate() {
+			if index > 0 {
+				job.append(
+					"
+",
+					0.0,
+					egui::TextFormat::default(),
+				);
+			}
+			let speaker = caption.speaker_id.as_deref().and_then(|id| {
+				let id = Id(id.parse().ok()?);
+				let entry = state
+					.voice
+					.roster
+					.iter()
+					.find(|entry| entry.channel == channel && entry.participant.user == id)?;
+				Some(resolve_member(state, entry).1.to_owned())
+			});
+			let label = speaker.unwrap_or_else(|| plugin.to_owned());
+			job.append(
+				&format!("{label}: "),
+				0.0,
+				egui::TextFormat {
+					font_id: egui::FontId::proportional(14.0),
+					color: STAGE_MUTED,
+					..Default::default()
+				},
+			);
+			job.append(
+				&caption.text,
+				0.0,
+				egui::TextFormat {
+					font_id: egui::FontId::proportional(15.0),
+					color: if caption.done {
+						egui::Color32::WHITE
+					} else {
+						STAGE_TEXT
+					},
+					..Default::default()
+				},
+			);
+		}
+		job.wrap.max_width = width - 24.0;
+		job.wrap.max_rows = 6;
+		let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+		let size = galley.size() + egui::vec2(24.0, 14.0);
+		let rect = egui::Rect::from_min_size(
+			egui::pos2(left + (width - size.x) / 2.0, bottom - size.y - 8.0),
+			size,
+		);
+		let painter = ui.painter().with_clip_rect(ui.clip_rect());
+		painter.rect_filled(rect, 8, PILL_FILL.gamma_multiply(0.88));
+		painter.galley(rect.min + egui::vec2(12.0, 7.0), galley, STAGE_TEXT);
 	}
 
 	/// Which stage tiles a channel would show, in stage order.
@@ -3660,6 +3734,17 @@ impl MessagingUi {
 				egui::Popup::menu(&more)
 					.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
 					.show(|ui| {
+						// Plugin entries for this call, such as starting a recording.
+						crate::extensions_ui::context_menu_items(
+							ui,
+							extensions::MenuTarget::Call {
+								channel_id: channel.to_string(),
+								guild_id: state
+									.channel(channel)
+									.and_then(|channel| channel.guild)
+									.map(|guild| guild.to_string()),
+							},
+						);
 						let label = crate::i18n::translate_if_key(if deafened {
 							"Undeafen"
 						} else {
@@ -4017,6 +4102,7 @@ impl MessagingUi {
 							.max_rect(bar)
 							.layout(egui::Layout::left_to_right(egui::Align::Center)),
 					);
+					self.caption_bar(ui, state, channel, rect.x_range(), bar.top() - TILE_GAP);
 					bar_ui.set_opacity(reveal);
 					self.call_controls(&mut bar_ui, state, channel, commands);
 				});

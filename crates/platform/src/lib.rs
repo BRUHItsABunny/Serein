@@ -14,6 +14,7 @@ mod login_keyring;
 pub mod memory;
 pub mod notifications;
 pub mod plaintext_login;
+pub mod plugin_secrets;
 pub mod pointer;
 pub mod processes;
 pub mod proxy_credentials;

@@ -47,6 +47,14 @@ installation, and CI runs the committed packages through the same code.
 PNG previews share the package file stem and must fit 256 KiB. Full-size covers stay
 embedded in their packages.
 
+## Publishing from your own repository
+
+A plugin can live in its own repository, public or private, and be added in Serein as a
+catalog source. [`templates/publish-plugin.yml`](templates/publish-plugin.yml) is a
+workflow for such a repository: a pushed version tag builds the plugin, packages it with a
+copy of `pack.py`, attaches it to a release, and commits a `catalog.json` that pins the
+release asset's hash. See "Catalog sources" in `docs/extensions.md`.
+
 ## History
 
 These packages were maintained in `ViceVerse-cz/Serein-extensions` until they moved

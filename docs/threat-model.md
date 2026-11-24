@@ -1,8 +1,40 @@
 # Threat model
 
-Community extensions add an untrusted-code boundary. Wasmi runs without imports,
-WASI or native handles, with compilation, fuel, stack, linear-memory and output
-limits. Only explicitly granted, user-selected context crosses that boundary.
+Community extensions add an untrusted-code boundary. Wasmi runs without WASI or
+native handles, with compilation, fuel, stack, linear-memory and output limits. The
+only imports are the capability-gated `serein` host functions (preview), each declared
+in the manifest and granted by the user, which copy bytes into plugin memory and never
+expose host pointers. With `network` (preview) a plugin reaches only the exact HTTPS
+origins it declares and the user approved, through public, pinned addresses without
+cookies, proxies or Serein credentials; anything the same plugin can read, including
+the `message_journal`, can therefore leave the device to those origins, and the consent
+dialog says so. Plugin secrets never enter Wasm: the host fills `{{secret.<id>}}`
+placeholders only for each secret's declared origins and redacts echoed values from
+responses, though a declared origin that is hostile receives the value by design.
+Plugins exchange data only through topics the user approved per provider, subscriber and
+topic; a subscriber sees only what a provider broadcasts, but data a reading plugin
+broadcasts can leave the device through a subscriber with `network`, which the
+Connections list warns about. Message hooks run only in channels where the user switched
+them on: a send hook reads and may rewrite drafts there, and, with automatic sending
+chosen, its rewrite is sent without review; an annotating plugin reads that channel's
+messages and can only add notes the host renders as plain text. A notification plugin
+sees the sender and preview of every alert Serein would show and may reword or hide it,
+but cannot create alerts, silence sounds or delay one past 1.5 s. Plugin pages show only
+text the plugin returns, drawn by the host as plain text in bounded rows; they read nothing
+from the client themselves. Histories, kept deleted rows and call captions are likewise
+plugin-supplied plain text, labelled with the plugin's name and never sent to Discord. A
+`files` plugin reaches only its private folder and the folders and files the user picked
+for it through the system picker; paths are relative, `..` and symbolic links are refused,
+and the plugin never learns full paths. A media worker stays loaded only during a call,
+inside the same sandbox with a 64 MiB memory cap and per-batch fuel, and sees only what
+the host puts in its batches. An archiving plugin can make the host download only signed Discord CDN attachment links
+it names, without redirects or credentials, into its own folder within its data limit.
+Catalog source tokens stay in the system credential store
+and are sent only to the origins the user set for that source, rechecked on every
+redirect; packages from any source keep their pinned hashes. With `media_packets` or `media_audio` that includes the
+decrypted audio and video of everyone else in the call, which a plugin with `network` or
+`files` can send away or keep; the consent dialog says so, and nothing is tapped unless
+such a plugin runs. Only explicitly granted, user-selected context crosses that boundary.
 The host renders validated descriptions and requires Apply for composer changes;
 plugins cannot dispatch arbitrary Discord commands. Optional app snapshots have
 separate grants for account/conversation context, channel directory, ordinary loaded

@@ -901,6 +901,9 @@ pub struct State {
 	#[doc(hidden)]
 	pub parked_replies: ParkedReplies,
 	pub send_sequence: u64,
+	/// The latest confirmed sends as (nonce, message), newest last, so a follow-up can wait
+	/// for the message it follows.
+	pub confirmed_sends: std::collections::VecDeque<(String, Id)>,
 	pub request: u64,
 	pub history_before: Option<Id>,
 	pub history_after: Option<Id>,
@@ -1120,6 +1123,7 @@ impl Default for State {
 			reply: None,
 			parked_replies: ParkedReplies::default(),
 			send_sequence: 0,
+			confirmed_sends: Default::default(),
 			request: 0,
 			history_before: None,
 			history_after: None,
@@ -1968,6 +1972,10 @@ impl State {
 	pub fn prepare_text_send(&mut self, content: &str) -> Option<Command> {
 		self.prepare_message_content(&[], None, true, Some(content), None)
 	}
+	/// Queue explicit text in `channel`, open or not, without touching any draft.
+	pub fn prepare_text_send_in(&mut self, channel: Id, content: &str) -> Option<Command> {
+		self.prepare_content_in(channel, &[], None, true, Some(content), None)
+	}
 	/// Queue an explicit reply without consuming the composer draft or its reply target.
 	pub fn prepare_reply_send(
 		&mut self,
@@ -2013,6 +2021,24 @@ impl State {
 		explicit_reply: Option<Reply>,
 	) -> Option<Command> {
 		let channel = self.selected?;
+		self.prepare_content_in(
+			channel,
+			filenames,
+			sticker,
+			preserve_draft,
+			explicit_content,
+			explicit_reply,
+		)
+	}
+	fn prepare_content_in(
+		&mut self,
+		channel: Id,
+		filenames: &[&str],
+		sticker: Option<&Sticker>,
+		preserve_draft: bool,
+		explicit_content: Option<&str>,
+		explicit_reply: Option<Reply>,
+	) -> Option<Command> {
 		if !self.can_send(channel) || (!filenames.is_empty() && !self.can_attach(channel)) {
 			self.status = "Sending is unavailable with the current connection or permissions";
 			return None;
@@ -4059,6 +4085,9 @@ impl State {
 							p.delivery = Delivery::Confirmed;
 							p.confirmed = Some(m.id);
 						}
+						if correlated {
+							self.confirmed_send(nonce.clone(), m.id);
+						}
 						if accepted_reference
 							&& self.selected == Some(m.channel)
 							&& let Err(status) = self.timeline.observe_deleted_reference(&m)
@@ -4375,8 +4404,27 @@ impl State {
 			{
 				self.remember_sticker(sticker);
 			}
+			let before = self.pending.len();
 			self.pending
 				.retain(|p| !(p.nonce == *nonce && p.channel == message.channel));
+			// The gateway echo often beats the send's own reply; what waits for the
+			// confirmation, such as a plugin's follow-up, must still see it.
+			if self.pending.len() != before {
+				self.confirmed_send(nonce.clone(), message.id);
+			}
+		}
+	}
+	fn confirmed_send(&mut self, nonce: String, message: Id) {
+		if self
+			.confirmed_sends
+			.iter()
+			.any(|(known, _)| *known == nonce)
+		{
+			return;
+		}
+		self.confirmed_sends.push_back((nonce, message));
+		if self.confirmed_sends.len() > 16 {
+			self.confirmed_sends.pop_front();
 		}
 	}
 	fn fail(&mut self, failure: auth::Failure) {

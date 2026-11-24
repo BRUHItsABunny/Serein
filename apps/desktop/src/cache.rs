@@ -103,6 +103,8 @@ pub enum Operation {
 		ids: Vec<Id>,
 	},
 	ClearHistory,
+	/// Removes only these channels' cached history, at most 512.
+	ClearChannels(Vec<Id>),
 	Forget,
 }
 #[allow(clippy::large_enum_variant)]
@@ -535,7 +537,10 @@ fn execute(
 	let history_cleanup = matches!(operation, Operation::ClearHistory);
 	let history_unsafe = matches!(
 		operation,
-		Operation::DeleteMessages { .. } | Operation::ClearHistory | Operation::Forget
+		Operation::DeleteMessages { .. }
+			| Operation::ClearHistory
+			| Operation::ClearChannels(_)
+			| Operation::Forget
 	);
 	let failure_message = match &operation {
 		Operation::LoadAppearance => "Could not load saved appearance; using system theme",
@@ -550,6 +555,9 @@ fn execute(
 		}
 		Operation::DeleteMessages { .. } => {
 			"Could not remove deleted cached messages; history cache disabled until restart; messages may remain on disk"
+		}
+		Operation::ClearChannels(_) => {
+			"Could not remove cached history of conversations you lost; history cache disabled until restart; messages may remain on disk"
 		}
 		Operation::SaveDraft { .. } => {
 			"Could not save a draft; latest text may exist only in memory"
@@ -649,6 +657,9 @@ fn execute(
 			Operation::ClearHistory => store
 				.clear_history(account)
 				.map(|_| Outcome::HistoryCleared),
+			Operation::ClearChannels(channels) => store
+				.clear_channels(account, &channels)
+				.map(|_| Outcome::Saved),
 			Operation::Forget => store.forget_account(account).map(|_| Outcome::Saved),
 		},
 		Err(error) => Err(*error),

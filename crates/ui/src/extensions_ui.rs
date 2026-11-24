@@ -5,6 +5,12 @@ use extensions::{Capability, Element, ExtensionKind, Invocation, Manifest, Outpu
 use model::Id;
 use std::{collections::BTreeMap, sync::Arc};
 
+mod hooks;
+mod pages;
+mod picker;
+mod sources;
+pub(crate) use hooks::Outcome as SendOutcome;
+
 #[derive(Clone)]
 pub struct ExtensionEntry {
 	pub description: String,
@@ -73,6 +79,8 @@ impl ExtensionContext {
 	}
 }
 
+// At most a few requests wait per frame, so the inline invocation is cheaper than a box.
+#[allow(clippy::large_enum_variant)]
 pub enum ExtensionRequest {
 	EditTheme {
 		id: String,
@@ -106,6 +114,52 @@ pub enum ExtensionRequest {
 	},
 	Disable {
 		id: String,
+		/// Also delete the plugin's data instead of keeping it for a reinstall.
+		delete_data: bool,
+	},
+	/// Delete the data a removed plugin left behind.
+	DeleteData {
+		id: String,
+		connection: bool,
+	},
+	/// Approve or revoke one subscription between two installed plugins.
+	SetSubscription {
+		subscription: extension_host::broker::Subscription,
+		approved: bool,
+	},
+	/// Save, or with `None` remove, a secret the plugin declares.
+	SetSecret {
+		id: String,
+		connection: bool,
+		secret: String,
+		value: Option<zeroize::Zeroizing<String>>,
+	},
+	/// Replace the message hooks switched on in one channel.
+	SetChannelHooks {
+		hooks: extension_host::hooks::ChannelHooks,
+	},
+	/// Add or edit a catalog source; see `Job::SetCatalogSource`.
+	SetCatalogSource {
+		source: extension_host::sources::CatalogSource,
+		token: Option<Option<zeroize::Zeroizing<String>>>,
+	},
+	RemoveCatalogSource {
+		id: String,
+	},
+	RefreshCatalogSource {
+		id: String,
+	},
+	/// Take a picked folder or file away from a plugin.
+	RemoveFileHandle {
+		id: String,
+		connection: bool,
+		root: String,
+	},
+	/// Change how large a plugin's database may grow.
+	SetDatabaseQuota {
+		id: String,
+		connection: bool,
+		bytes: u64,
 	},
 	Invoke {
 		id: String,
@@ -287,6 +341,44 @@ pub struct ExtensionUi {
 	theme_editor: Option<crate::theme_editor::ThemeEditor>,
 	theme_editor_visible: bool,
 	gallery_preview: Option<String>,
+	/// Size and quota of each plugin's data in the current scopes, installed or kept.
+	pub plugin_data: Vec<extension_host::store::PluginData>,
+	/// A plugin waiting for the user to keep or delete its data before it is disabled.
+	confirm_disable: Option<String>,
+	/// Kept data waiting for the user to confirm deletion: plugin ID and connection scope.
+	confirm_delete_data: Option<(String, bool)>,
+	/// The secret being typed: plugin ID, secret ID and the masked value so far.
+	secret_edit: Option<(String, String, zeroize::Zeroizing<String>)>,
+	/// Subscriptions the user approved in this account.
+	pub subscriptions: Vec<extension_host::broker::Subscription>,
+	/// Message hooks switched on in this account's channels.
+	pub channel_hooks: Vec<extension_host::hooks::ChannelHooks>,
+	send: hooks::SendState,
+	/// Notes that arrived for the timeline.
+	notes: Vec<hooks::NoteUpdate>,
+	/// The plugin page shown in the main area.
+	page: Option<pages::OpenPage>,
+	/// Catalogs the user added, with their last refresh.
+	pub catalog_sources: Vec<extension_host::sources::SourceStatus>,
+	/// Entries found in an added catalog, by ID, with that source's name.
+	pub catalog_origins: BTreeMap<String, String>,
+	source_form: Option<sources::SourceForm>,
+}
+
+/// "1.5 MiB"-style size for data shown to the user.
+fn data_size(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let mut value = bytes as f64;
+	let mut unit = 0;
+	while value >= 1024.0 && unit + 1 < UNITS.len() {
+		value /= 1024.0;
+		unit += 1;
+	}
+	if unit == 0 {
+		format!("{bytes} B")
+	} else {
+		format!("{value:.1} {}", UNITS[unit])
+	}
 }
 impl ExtensionUi {
 	pub fn editing_theme(&self) -> bool {
@@ -1061,6 +1153,7 @@ impl ExtensionUi {
 		self.result = None;
 		self.details = None;
 		self.consent = None;
+		self.page = None;
 		self.requests.clear();
 		self.previews.clear();
 		self.enlarged = None;
@@ -1068,6 +1161,9 @@ impl ExtensionUi {
 	pub fn remove_runtime(&mut self, id: &str) {
 		if self.result.as_ref().is_some_and(|result| result.id == id) {
 			self.result = None;
+		}
+		if self.page.as_ref().is_some_and(|page| page.plugin == id) {
+			self.page = None;
 		}
 		if self.details.as_deref() == Some(id) {
 			self.details = None;
@@ -1145,6 +1241,39 @@ impl ExtensionUi {
 		mut output: Output,
 		state: &State,
 	) {
+		if invocation.send_target.is_some() {
+			self.send_result(&id, &invocation, output.replacement, output.follow_up);
+			return;
+		}
+		if self.receive_page(&id, &invocation, &mut output, state) {
+			return;
+		}
+		// The conversation the plugin was given: the batch's, the chosen message's, or the
+		// one open when it ran.
+		let channel = invocation
+			.annotate
+			.as_ref()
+			.map(|batch| batch.channel_id.as_str())
+			.or(invocation
+				.selected_message_ref
+				.as_ref()
+				.map(|message| message.channel_id.as_str()))
+			.and_then(|channel| channel.parse().ok())
+			.map(Id)
+			.or(context.channel);
+		self.receive_annotations(&id, channel, &output);
+		// Notes need no review: a batch, or a message action that only annotated.
+		if invocation.annotate.is_some()
+			|| (!output.annotations.is_empty()
+				|| !output.histories.is_empty()
+				|| !output.deleted_messages.is_empty()
+				|| !output.alternates.is_empty())
+				&& output.panel.is_empty()
+				&& output.effects.is_empty()
+				&& output.replacement.is_none()
+		{
+			return;
+		}
 		if !context.is_current(state) {
 			self.status = "Result discarded because the conversation or draft changed.".into();
 			return;
@@ -1223,14 +1352,15 @@ impl ExtensionUi {
 		);
 	}
 	pub(crate) fn composer_menu(&mut self, ui: &mut egui::Ui, state: &State) {
-		if !self.entries.iter().any(|entry| {
-			entry.enabled
-				&& entry
-					.manifest
-					.actions
-					.iter()
-					.any(|action| action.surface == Surface::Composer)
-		}) {
+		if !self.has_channel_hooks()
+			&& !self.entries.iter().any(|entry| {
+				entry.enabled
+					&& entry
+						.manifest
+						.actions
+						.iter()
+						.any(|action| action.surface == Surface::Composer)
+			}) {
 			return;
 		}
 		let mut selected = None;
@@ -1263,6 +1393,7 @@ impl ExtensionUi {
 						}
 					}
 				}
+				self.channel_hooks_menu(ui, state);
 			},
 		);
 		if let Some((id, action, composer)) = selected {
@@ -1710,19 +1841,254 @@ impl ExtensionUi {
 					});
 				});
 		}
+		if !self.themes {
+			self.connections(ui, &colors);
+			self.kept_data(ui, &colors);
+		}
+		self.catalog_sources(ui, &colors);
 		self.preview_modal(ui.ctx());
 		self.details_modal(ui.ctx(), &mut enable, &mut disable, &mut invoke);
 		if let Some(entry) = enable {
 			self.offer_import(entry);
 		}
 		if let Some(id) = disable {
-			self.remove_runtime(&id);
-			self.queue(ui.ctx(), ExtensionRequest::Disable { id });
+			self.request_disable(ui.ctx(), id);
 		}
+		self.data_modals(ui.ctx());
 		if let Some((id, action)) = invoke {
 			self.invoke_panel(ui.ctx(), state, id, action);
 		}
 		self.consent_modal(ui.ctx(), &colors);
+	}
+	/// The data a plugin keeps on this device, if any.
+	fn data_of(&self, id: &str) -> Option<&extension_host::store::PluginData> {
+		let connection = self.entries.iter().any(|entry| {
+			entry.manifest.id == id && entry.manifest.capabilities.contains(&Capability::ApiProxy)
+		});
+		self.plugin_data
+			.iter()
+			.find(|data| data.id == id && data.connection == connection)
+	}
+	/// Disables a plugin, first asking whether to keep its data when it has any.
+	fn request_disable(&mut self, ctx: &egui::Context, id: String) {
+		let plugin = self
+			.entries
+			.iter()
+			.any(|entry| entry.manifest.id == id && entry.manifest.kind == ExtensionKind::Plugin);
+		if plugin && self.data_of(&id).is_some() {
+			self.confirm_disable = Some(id);
+			return;
+		}
+		self.remove_runtime(&id);
+		self.queue(
+			ctx,
+			ExtensionRequest::Disable {
+				id,
+				delete_data: false,
+			},
+		);
+	}
+	fn name_of(&self, id: &str) -> String {
+		self.entries
+			.iter()
+			.find(|entry| entry.manifest.id == id)
+			.map_or_else(|| id.to_owned(), |entry| entry.manifest.name.clone())
+	}
+	/// The keep-or-delete choice when disabling, and confirmation of deleting kept data.
+	fn data_modals(&mut self, ctx: &egui::Context) {
+		if let Some(id) = self.confirm_disable.clone() {
+			let size = self.data_of(&id).map_or(0, |data| data.bytes);
+			let name = self.name_of(&id);
+			let mut choice = None;
+			let response = crate::dialog::Dialog::new(
+				"extension-disable-data",
+				crate::i18n::translate_args("extensions-ui-data-disable-title", &[("name", &name)]),
+			)
+			.width(440.0)
+			.show(ctx, |d| {
+				d.content(|ui| {
+					ui.add(
+						egui::Label::new(crate::i18n::translate_args(
+							"extensions-ui-data-disable-body",
+							&[("size", &data_size(size))],
+						))
+						.wrap(),
+					);
+				});
+				d.footer(|ui| {
+					if crate::dialog::action(
+						ui,
+						"extensions-ui-data-keep",
+						crate::dialog::Action::Primary,
+					)
+					.clicked()
+					{
+						choice = Some(false);
+					}
+					if crate::dialog::action(
+						ui,
+						"extensions-ui-data-delete",
+						crate::dialog::Action::Danger,
+					)
+					.clicked()
+					{
+						choice = Some(true);
+					}
+					if crate::dialog::action(
+						ui,
+						"dialog-module-cancel",
+						crate::dialog::Action::Neutral,
+					)
+					.clicked()
+					{
+						self.confirm_disable = None;
+					}
+				});
+			});
+			if response.close {
+				self.confirm_disable = None;
+			}
+			if let Some(delete_data) = choice {
+				self.confirm_disable = None;
+				self.remove_runtime(&id);
+				self.queue(ctx, ExtensionRequest::Disable { id, delete_data });
+			}
+		}
+		if let Some((id, connection)) = self.confirm_delete_data.clone() {
+			let size = self
+				.plugin_data
+				.iter()
+				.find(|data| data.id == id && data.connection == connection)
+				.map_or(0, |data| data.bytes);
+			match crate::dialog::Confirm::new(
+				"extension-delete-data",
+				crate::i18n::translate_args("extensions-ui-data-delete-title", &[("name", &id)]),
+				crate::i18n::translate_args(
+					"extensions-ui-data-delete-body",
+					&[("size", &data_size(size))],
+				),
+			)
+			.confirm_label("extensions-ui-data-delete")
+			.danger()
+			.show(ctx)
+			{
+				Some(crate::dialog::Choice::Confirmed) => {
+					self.confirm_delete_data = None;
+					self.queue(ctx, ExtensionRequest::DeleteData { id, connection });
+				}
+				Some(crate::dialog::Choice::Cancelled) => self.confirm_delete_data = None,
+				None => {}
+			}
+		}
+	}
+	/// Every provider, subscriber and topic the enabled plugins could connect, each with a
+	/// switch; nothing flows until the user turns one on.
+	fn connections(&mut self, ui: &mut egui::Ui, colors: &design::Palette) {
+		let enabled: Vec<&ExtensionEntry> = self
+			.entries
+			.iter()
+			.filter(|entry| entry.enabled && entry.manifest.kind == ExtensionKind::Plugin)
+			.collect();
+		let mut candidates = Vec::new();
+		for subscriber in &enabled {
+			for topic in &subscriber.manifest.subscribes {
+				for provider in &enabled {
+					if provider.manifest.id != subscriber.manifest.id
+						&& provider.manifest.broadcasts.contains(topic)
+					{
+						candidates.push((
+							extension_host::broker::Subscription {
+								subscriber: subscriber.manifest.id.clone(),
+								provider: provider.manifest.id.clone(),
+								topic: topic.clone(),
+							},
+							provider.manifest.name.clone(),
+							subscriber.manifest.name.clone(),
+							subscriber.manifest.network.join(", "),
+						));
+					}
+				}
+			}
+		}
+		if candidates.is_empty() {
+			return;
+		}
+		ui.add_space(16.0);
+		ui.label(design::eyebrow(
+			ui,
+			crate::i18n::translate("extensions-ui-connections-title"),
+			colors.muted,
+		));
+		crate::dialog::hint(ui, "extensions-ui-connections-hint");
+		for (subscription, provider, subscriber, hosts) in candidates {
+			let mut approved = self.subscriptions.contains(&subscription);
+			let label = crate::i18n::translate_args(
+				"extensions-ui-connection",
+				&[
+					("provider", &provider),
+					("subscriber", &subscriber),
+					("topic", &subscription.topic),
+				],
+			);
+			let warning = (!hosts.is_empty()).then(|| {
+				crate::i18n::translate_args(
+					"extensions-ui-connection-network",
+					&[("subscriber", &subscriber), ("hosts", &hosts)],
+				)
+			});
+			let response = ui.add_enabled_ui(!self.busy, |ui| {
+				design::switch(ui, &label, warning.as_deref(), &mut approved)
+			});
+			if response.inner.changed() {
+				self.queue(
+					ui.ctx(),
+					ExtensionRequest::SetSubscription {
+						subscription,
+						approved,
+					},
+				);
+			}
+		}
+	}
+	/// Data left by plugins that are no longer installed, each with a delete action.
+	fn kept_data(&mut self, ui: &mut egui::Ui, colors: &design::Palette) {
+		let installed: std::collections::BTreeSet<&str> = self
+			.entries
+			.iter()
+			.filter(|entry| entry.enabled || entry.cleanup_pending)
+			.map(|entry| entry.manifest.id.as_str())
+			.collect();
+		let kept: Vec<_> = self
+			.plugin_data
+			.iter()
+			.filter(|data| !installed.contains(data.id.as_str()))
+			.cloned()
+			.collect();
+		if kept.is_empty() {
+			return;
+		}
+		ui.add_space(16.0);
+		ui.label(design::eyebrow(
+			ui,
+			crate::i18n::translate("extensions-ui-data-kept-title"),
+			colors.muted,
+		));
+		crate::dialog::hint(ui, "extensions-ui-data-kept-hint");
+		for data in kept {
+			ui.horizontal(|ui| {
+				ui.label(egui::RichText::new(&data.id).color(colors.text));
+				ui.label(egui::RichText::new(data_size(data.bytes)).color(colors.muted));
+				if ui
+					.add_enabled(
+						!self.busy,
+						egui::Button::new(crate::i18n::translate("extensions-ui-data-delete")),
+					)
+					.clicked()
+				{
+					self.confirm_delete_data = Some((data.id.clone(), data.connection));
+				}
+			});
+		}
 	}
 	fn details_modal(
 		&mut self,
@@ -1752,6 +2118,14 @@ impl ExtensionUi {
 			.cloned()
 			.collect();
 		let usable = entry.enabled && !entry.cleanup_pending && !self.busy;
+		let data = self.data_of(&id).cloned();
+		let quota_editable = usable && entry.manifest.capabilities.contains(&Capability::Database);
+		let mut quota = None;
+		let mut remove_handle = None;
+		let mut secret_request: Option<(String, Option<zeroize::Zeroizing<String>>)> = None;
+		let set_secrets: Vec<String> = data
+			.as_ref()
+			.map_or_else(Vec::new, |data| data.secrets.clone());
 		let mut close = false;
 		let response = crate::dialog::Dialog::new("extension-details", &entry.manifest.name)
 			.subtitle(crate::i18n::translate(
@@ -1855,6 +2229,189 @@ impl ExtensionUi {
 						for capability in &entry.manifest.capabilities {
 							ui.add(egui::Label::new(capability_label(*capability)).wrap());
 						}
+						for origin in &entry.manifest.network {
+							ui.add(
+								egui::Label::new(
+									egui::RichText::new(format!("• {origin}")).color(colors.muted),
+								)
+								.wrap(),
+							);
+						}
+					}
+					if data.is_some() || quota_editable {
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-data-section"),
+							colors.muted,
+						));
+						ui.label(crate::i18n::translate_args(
+							"extensions-ui-data-size",
+							&[(
+								"size",
+								&data_size(data.as_ref().map_or(0, |data| data.bytes)),
+							)],
+						));
+						if quota_editable {
+							let current = data
+								.as_ref()
+								.map_or(extension_host::database::DEFAULT_QUOTA, |data| {
+									data.database_quota
+								});
+							ui.horizontal(|ui| {
+								ui.label(crate::i18n::translate("extensions-ui-data-quota"));
+								egui::ComboBox::from_id_salt(("extension-quota", &id))
+									.selected_text(data_size(current))
+									.show_ui(ui, |ui| {
+										for bytes in extension_host::database::QUOTAS {
+											if ui
+												.selectable_label(
+													bytes == current,
+													data_size(bytes),
+												)
+												.clicked() && bytes != current
+											{
+												quota = Some(bytes);
+											}
+										}
+									});
+							});
+						}
+					}
+					if let Some(handles) = data
+						.as_ref()
+						.map(|data| &data.handles)
+						.filter(|handles| !handles.is_empty())
+					{
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-files-section"),
+							colors.muted,
+						));
+						for handle in handles {
+							ui.horizontal_wrapped(|ui| {
+								ui.label(egui::RichText::new(&handle.name).color(colors.text));
+								ui.label(
+									egui::RichText::new(format!(
+										"{} · {}",
+										handle.purpose,
+										crate::i18n::translate(if handle.write {
+											"extensions-ui-files-read-write"
+										} else {
+											"extensions-ui-files-read-only"
+										})
+									))
+									.color(colors.muted),
+								);
+								if ui
+									.small_button(crate::i18n::translate(
+										"extensions-ui-files-remove",
+									))
+									.clicked()
+								{
+									remove_handle = Some(handle.root.clone());
+								}
+							});
+						}
+					}
+					if !entry.manifest.secrets.is_empty() {
+						ui.separator();
+						ui.label(design::eyebrow(
+							ui,
+							crate::i18n::translate("extensions-ui-secrets-section"),
+							colors.muted,
+						));
+						for spec in &entry.manifest.secrets {
+							let set = set_secrets.contains(&spec.id);
+							ui.horizontal_wrapped(|ui| {
+								ui.label(egui::RichText::new(&spec.label).color(colors.text));
+								ui.label(
+									egui::RichText::new(crate::i18n::translate(if set {
+										"extensions-ui-secret-set"
+									} else {
+										"extensions-ui-secret-not-set"
+									}))
+									.color(if set {
+										colors.positive
+									} else {
+										colors.muted
+									}),
+								);
+							});
+							crate::dialog::hint(
+								ui,
+								&crate::i18n::translate_args(
+									"extensions-ui-secret-hint",
+									&[("origins", &spec.origins.join(", "))],
+								),
+							);
+							let editing =
+								self.secret_edit
+									.as_ref()
+									.is_some_and(|(plugin, secret, _)| {
+										*plugin == id && *secret == spec.id
+									});
+							if editing {
+								let (_, _, value) = self.secret_edit.as_mut().expect("editing");
+								ui.add(
+									egui::TextEdit::singleline(&mut **value)
+										.password(true)
+										.desired_width(f32::INFINITY),
+								);
+								ui.horizontal(|ui| {
+									let valid = extension_host::secrets::valid_value(value);
+									if ui
+										.add_enabled(
+											usable && valid,
+											egui::Button::new(crate::i18n::translate(
+												"extensions-ui-secret-save",
+											)),
+										)
+										.clicked()
+									{
+										secret_request =
+											Some((spec.id.clone(), Some(std::mem::take(value))));
+									}
+									if ui
+										.button(crate::i18n::translate("dialog-module-cancel"))
+										.clicked()
+									{
+										secret_request = Some((String::new(), None));
+									}
+								});
+							} else {
+								ui.horizontal(|ui| {
+									if ui
+										.add_enabled(
+											usable,
+											egui::Button::new(crate::i18n::translate(
+												"extensions-ui-secret-edit",
+											)),
+										)
+										.clicked()
+									{
+										self.secret_edit = Some((
+											id.clone(),
+											spec.id.clone(),
+											zeroize::Zeroizing::default(),
+										));
+									}
+									if set
+										&& ui
+											.add_enabled(
+												usable,
+												egui::Button::new(crate::i18n::translate(
+													"extensions-ui-secret-remove",
+												)),
+											)
+											.clicked()
+									{
+										secret_request = Some((spec.id.clone(), None));
+									}
+								});
+							}
+						}
 					}
 					ui.separator();
 					ui.label(design::eyebrow(
@@ -1926,8 +2483,46 @@ impl ExtensionUi {
 					}
 				});
 			});
+		let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
+		if let Some((secret, value)) = secret_request {
+			// An empty ID is Cancel: the typed value is dropped (and zeroized) unsent.
+			self.secret_edit = None;
+			if !secret.is_empty() {
+				self.queue(
+					ctx,
+					ExtensionRequest::SetSecret {
+						id: id.clone(),
+						connection,
+						secret,
+						value,
+					},
+				);
+			}
+		}
+		if let Some(root) = remove_handle {
+			self.queue(
+				ctx,
+				ExtensionRequest::RemoveFileHandle {
+					id: id.clone(),
+					connection: entry.manifest.capabilities.contains(&Capability::ApiProxy),
+					root,
+				},
+			);
+		}
+		if let Some(bytes) = quota {
+			let connection = entry.manifest.capabilities.contains(&Capability::ApiProxy);
+			self.queue(
+				ctx,
+				ExtensionRequest::SetDatabaseQuota {
+					id: id.clone(),
+					connection,
+					bytes,
+				},
+			);
+		}
 		if close || response.close || enable.is_some() || disable.is_some() || invoke.is_some() {
 			self.details = None;
+			self.secret_edit = None;
 		}
 	}
 	fn card_body(
@@ -2017,9 +2612,11 @@ impl ExtensionUi {
 						ui.add(
 							egui::Label::new(
 								egui::RichText::new(format!(
-									"{} {}",
+									"{} {}{}",
 									crate::i18n::translate("extensions-ui-card-body-by"),
-									entry.manifest.author
+									entry.manifest.author,
+									self.source_label(&entry.manifest.id)
+										.map_or_else(String::new, |source| format!(" · {source}"))
 								))
 								.size(12.0)
 								.color(colors.muted),
@@ -2074,9 +2671,11 @@ impl ExtensionUi {
 			ui.add(
 				egui::Label::new(
 					egui::RichText::new(format!(
-						"{} {}",
+						"{} {}{}",
 						crate::i18n::translate("extensions-ui-card-body-by"),
-						entry.manifest.author
+						entry.manifest.author,
+						self.source_label(&entry.manifest.id)
+							.map_or_else(String::new, |source| format!(" · {source}"))
 					))
 					.size(12.0)
 					.color(colors.muted),
@@ -2339,6 +2938,7 @@ impl ExtensionUi {
 			return;
 		};
 		let mut close = false;
+		let flows = data_flows(&self.entries, &consent.entry.manifest);
 		let theme = consent.entry.manifest.kind == ExtensionKind::Theme;
 		let illustrated =
 			consent.entry.theme_preview.is_some()
@@ -2536,11 +3136,19 @@ impl ExtensionUi {
 						colors.muted,
 					));
 					ui.spacing_mut().item_spacing.y = 8.0;
+					let hosts = consent.entry.manifest.network.join(", ");
 					for capability in &consent.entry.manifest.capabilities {
 						let mut granted = consent.grants.contains(capability);
-						let changed =
-							design::switch(ui, capability_label(*capability), None, &mut granted)
-								.changed();
+						// The user approves the network capability for these exact servers.
+						let description =
+							(*capability == Capability::Network).then_some(hosts.as_str());
+						let changed = design::switch(
+							ui,
+							capability_label(*capability),
+							description,
+							&mut granted,
+						)
+						.changed();
 						if changed {
 							if granted {
 								consent.grants.push(*capability);
@@ -2549,6 +3157,61 @@ impl ExtensionUi {
 							}
 						}
 					}
+				}
+				for (key, topics) in [
+					(
+						"extensions-ui-consent-broadcasts",
+						&consent.entry.manifest.broadcasts,
+					),
+					(
+						"extensions-ui-consent-subscribes",
+						&consent.entry.manifest.subscribes,
+					),
+				] {
+					if !topics.is_empty() {
+						ui.label(
+							egui::RichText::new(crate::i18n::translate_args(
+								key,
+								&[("topics", &topics.join(", "))],
+							))
+							.size(13.0)
+							.color(colors.text),
+						);
+					}
+				}
+				for warning in &flows {
+					ui.label(
+						egui::RichText::new(warning)
+							.size(13.0)
+							.color(colors.warning),
+					);
+				}
+				if !consent.entry.manifest.secrets.is_empty() {
+					let labels: Vec<&str> = consent
+						.entry
+						.manifest
+						.secrets
+						.iter()
+						.map(|spec| spec.label.as_str())
+						.collect();
+					ui.label(
+						egui::RichText::new(crate::i18n::translate_args(
+							"extensions-ui-consent-secrets",
+							&[("labels", &labels.join(", "))],
+						))
+						.size(13.0)
+						.color(colors.text),
+					);
+				}
+				if !consent.entry.manifest.network.is_empty() {
+					design::notice(
+						ui,
+						design::Level::Warning,
+						&crate::i18n::translate_args(
+							"extensions-ui-consent-network-warning",
+							&[("hosts", &consent.entry.manifest.network.join(", "))],
+						),
+					);
 				}
 				ui.label(
 					egui::RichText::new(crate::i18n::translate(
@@ -2636,7 +3299,13 @@ impl ExtensionUi {
 			self.queue(ctx, ExtensionRequest::SelectTheme { id: None });
 		}
 		for id in disable {
-			self.queue(ctx, ExtensionRequest::Disable { id });
+			self.queue(
+				ctx,
+				ExtensionRequest::Disable {
+					id,
+					delete_data: false,
+				},
+			);
 		}
 	}
 	/// Shows the result window of the last foreground plugin action: its panel, proposed draft
@@ -2738,8 +3407,19 @@ impl ExtensionUi {
 					if let Some(effect) = result.output.effects.first() {
 						crate::dialog::label(ui, "extensions-ui-show-result-proposed-app-action");
 						ui.add(
-							egui::Label::new(crate::extension_app::effect_description(effect))
-								.wrap(),
+							egui::Label::new(crate::extension_app::effect_description_in(
+								effect,
+								state,
+								&self
+									.entries
+									.iter()
+									.find(|entry| entry.manifest.id == result.id)
+									.map_or_else(
+										|| result.id.clone(),
+										|entry| entry.manifest.name.clone(),
+									),
+							))
+							.wrap(),
 						);
 						ui.add_space(10.0);
 					}
@@ -2757,7 +3437,13 @@ impl ExtensionUi {
 						});
 						return;
 					}
-					render_elements(ui, &result.output.panel, &mut result.values, &mut action);
+					render_elements(
+						ui,
+						state,
+						&result.output.panel,
+						&mut result.values,
+						&mut action,
+					);
 					if proxy {
 						ui.separator();
 						self.proxy_auth.show(
@@ -2861,7 +3547,33 @@ fn request_bytes(request: &ExtensionRequest) -> usize {
 			ExtensionRequest::Enable {
 				id, sha256, grants, ..
 			} => id.len() + sha256.len() + grants.len() * std::mem::size_of::<Capability>(),
-			ExtensionRequest::Disable { id } | ExtensionRequest::Preview { id } => id.len(),
+			ExtensionRequest::Disable { id, .. }
+			| ExtensionRequest::DeleteData { id, .. }
+			| ExtensionRequest::SetDatabaseQuota { id, .. }
+			| ExtensionRequest::Preview { id } => id.len(),
+			ExtensionRequest::RemoveFileHandle { id, root, .. } => id.len() + root.len(),
+			ExtensionRequest::SetCatalogSource { source, token } => {
+				source.name.len()
+					+ source.url.len()
+					+ source.token_origins.iter().map(String::len).sum::<usize>()
+					+ token
+						.as_ref()
+						.and_then(Option::as_ref)
+						.map_or(0, |token| token.len())
+			}
+			ExtensionRequest::RemoveCatalogSource { id }
+			| ExtensionRequest::RefreshCatalogSource { id } => id.len(),
+			ExtensionRequest::SetSecret {
+				id, secret, value, ..
+			} => id.len() + secret.len() + value.as_ref().map_or(0, |value| value.len()),
+			ExtensionRequest::SetChannelHooks { hooks } => {
+				hooks.plugins().map(str::len).sum::<usize>()
+			}
+			ExtensionRequest::SetSubscription { subscription, .. } => {
+				subscription.subscriber.len()
+					+ subscription.provider.len()
+					+ subscription.topic.len()
+			}
 			ExtensionRequest::Invoke {
 				id,
 				invocation,
@@ -3298,9 +4010,95 @@ fn badge(ui: &mut egui::Ui, text: &str, foreground: egui::Color32, background: e
 		.galley(rect.center() - galley.size() / 2.0, galley, foreground);
 }
 
+/// Warnings for data that could pass between this plugin and enabled ones over shared
+/// topics once the user approves the connection, and then leave the device: into this
+/// plugin from providers when it can use the network or files, and from it to subscribers
+/// that can.
+fn data_flows(entries: &[ExtensionEntry], manifest: &Manifest) -> Vec<String> {
+	let leaves = |manifest: &Manifest| {
+		manifest.capabilities.contains(&Capability::Network)
+			|| manifest.capabilities.contains(&Capability::Files)
+	};
+	let others = || {
+		entries
+			.iter()
+			.filter(|entry| entry.enabled && entry.manifest.id != manifest.id)
+	};
+	let names = |names: Vec<&str>| names.join(", ");
+	let mut warnings = Vec::new();
+	let providers: Vec<&str> = others()
+		.filter(|entry| {
+			entry
+				.manifest
+				.broadcasts
+				.iter()
+				.any(|topic| manifest.subscribes.contains(topic))
+		})
+		.map(|entry| entry.manifest.name.as_str())
+		.collect();
+	if !providers.is_empty() && leaves(manifest) {
+		warnings.push(crate::i18n::translate_args(
+			"extensions-ui-consent-flow-in",
+			&[("plugins", &names(providers))],
+		));
+	}
+	let subscribers: Vec<&str> = others()
+		.filter(|entry| {
+			leaves(&entry.manifest)
+				&& entry
+					.manifest
+					.subscribes
+					.iter()
+					.any(|topic| manifest.broadcasts.contains(topic))
+		})
+		.map(|entry| entry.manifest.name.as_str())
+		.collect();
+	if !subscribers.is_empty() {
+		warnings.push(crate::i18n::translate_args(
+			"extensions-ui-consent-flow-out",
+			&[("plugins", &names(subscribers))],
+		));
+	}
+	warnings
+}
+
 /// User-facing description of what granting a capability allows.
 fn capability_label(capability: Capability) -> &'static str {
 	match capability {
+		Capability::Clock => "Read the current date and time",
+		Capability::Random => "Generate random numbers, such as unique IDs",
+		Capability::Database => "Keep a private database on this device (up to 64 MiB)",
+		Capability::Network => "Connect to the internet servers listed below",
+		Capability::SendHook => {
+			"Read and rewrite messages you send in channels where you switch it on"
+		}
+		Capability::MessageAnnotations => {
+			"Read messages in channels where you switch it on and add notes under them"
+		}
+		Capability::Pages => "Show its own pages in the main area",
+		Capability::MediaPackets => {
+			"Receive the audio and video of everyone in your calls, decrypted, and ask for fresh pictures"
+		}
+		Capability::MediaAudio => "Hear what everyone says in your calls, as audio per speaker",
+		Capability::MediaArchive => {
+			"Save original attachments of messages it receives into its own folder"
+		}
+		Capability::MediaOwn => {
+			"Also receive your own microphone, camera and screen share in your calls, as sent"
+		}
+		Capability::MediaWorker => {
+			"Stay running during your calls and hear who joins and leaves, and call media once available"
+		}
+		Capability::Files => {
+			"Keep files in its own folder, and use folders and files you pick for it"
+		}
+		Capability::CallCaptions => "Show caption lines above the call controls during calls",
+		Capability::Notifications => {
+			"See every desktop notification, including its message preview, and reword or hide it"
+		}
+		Capability::MessageJournal => {
+			"Receive every message, edit and deletion in all your conversations, including earlier text of edited and deleted messages"
+		}
 		Capability::ApiProxy => {
 			"Route the Discord REST API through a proxy across accounts (not calls or media)"
 		}
@@ -3409,6 +4207,7 @@ fn capability_label(capability: Capability) -> &'static str {
 }
 pub(crate) fn render_elements(
 	ui: &mut egui::Ui,
+	state: &State,
 	elements: &[Element],
 	values: &mut BTreeMap<String, String>,
 	action: &mut Option<String>,
@@ -3428,7 +4227,7 @@ pub(crate) fn render_elements(
 				ui.separator();
 			}
 			Element::Row { children } => {
-				ui.horizontal_wrapped(|ui| render_elements(ui, children, values, action));
+				ui.horizontal_wrapped(|ui| render_elements(ui, state, children, values, action));
 			}
 			Element::Button { id, label } => {
 				if ui.push_id(id, |ui| ui.button(label)).inner.clicked() {
@@ -3499,6 +4298,14 @@ pub(crate) fn render_elements(
 					*stored = value.to_string();
 				}
 			}
+			Element::Picker {
+				id,
+				label,
+				kinds,
+				value,
+			} => {
+				picker::show(ui, state, id, label, kinds, value, values);
+			}
 		}
 	}
 }
@@ -3527,7 +4334,7 @@ fn apply_proposal(state: &mut State, context: &ExtensionContext, replacement: &s
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	#[test]
@@ -3630,7 +4437,7 @@ mod tests {
 		assert!(shop.status.contains("discarded"), "{}", shop.status);
 	}
 
-	fn entry() -> ExtensionEntry {
+	pub(crate) fn entry() -> ExtensionEntry {
 		ExtensionEntry {
 			cover_image: None,
 			local_theme: false,
@@ -3646,6 +4453,10 @@ mod tests {
 				license: "MIT".into(),
 				source: "https://example.com/source".into(),
 				kind: ExtensionKind::Plugin,
+				network: Vec::new(),
+				secrets: Vec::new(),
+				broadcasts: Vec::new(),
+				subscribes: Vec::new(),
 				capabilities: vec![Capability::Composer],
 				actions: vec![],
 			},
@@ -3776,12 +4587,68 @@ mod tests {
 		);
 		assert!(matches!(
 			shop.requests.as_slice(),
-			[ExtensionRequest::Disable { id }] if id == "synthetic.words"
+			[ExtensionRequest::Disable { id, .. }] if id == "synthetic.words"
 		));
 		assert!(shop.details.is_none(), "disable closes its details");
 		shop.open_details(&plugin.manifest.id);
 		shop.set_entries(vec![]);
 		assert!(shop.details.is_none(), "removed plugin closes its details");
+	}
+
+	#[test]
+	fn disabling_a_plugin_with_data_asks_whether_to_keep_it() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut plugin = entry();
+		plugin.enabled = true;
+		shop.set_entries(vec![plugin.clone()]);
+		shop.plugin_data = vec![extension_host::store::PluginData {
+			id: plugin.manifest.id.clone(),
+			connection: false,
+			bytes: 3 * 1024 * 1024,
+			database_quota: extension_host::database::DEFAULT_QUOTA,
+			handles: Vec::new(),
+			secrets: Vec::new(),
+		}];
+		let ask = |shop: &mut ExtensionUi| {
+			shop.open_details(&plugin.manifest.id);
+			frame(&ctx, shop, 320.0, vec![]);
+			let labels = frame(&ctx, shop, 320.0, vec![]);
+			click(
+				&ctx,
+				shop,
+				320.0,
+				&labels,
+				&crate::i18n::translate("extensions-ui-details-modal-disable"),
+			);
+			// Nothing is disabled until the user chooses what happens to the data.
+			assert!(shop.requests.is_empty());
+			frame(&ctx, shop, 320.0, vec![]);
+			frame(&ctx, shop, 320.0, vec![])
+		};
+		for (choice, delete) in [
+			("extensions-ui-data-keep", false),
+			("extensions-ui-data-delete", true),
+		] {
+			let labels = ask(&mut shop);
+			click(
+				&ctx,
+				&mut shop,
+				320.0,
+				&labels,
+				&crate::i18n::translate(choice),
+			);
+			assert!(matches!(
+				shop.requests.as_slice(),
+				[ExtensionRequest::Disable { id, delete_data }] if id == "synthetic.words" && *delete_data == delete
+			));
+			shop.requests.clear();
+		}
+		// Once the plugin is gone, its kept data is listed for deletion.
+		shop.set_entries(vec![]);
+		let labels = frame(&ctx, &mut shop, 320.0, vec![]);
+		assert!(labels.iter().any(|(text, _)| text == "synthetic.words"));
+		assert!(labels.iter().any(|(text, _)| text == "3.0 MiB"));
 	}
 
 	/// Runs one frame that publishes context actions and draws `target`'s plugin entries, and
@@ -4494,6 +5361,204 @@ mod tests {
 			);
 		}
 	}
+	#[test]
+	fn secrets_are_typed_masked_and_sent_only_as_a_request() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut plugin = entry();
+		plugin.enabled = true;
+		plugin.manifest.capabilities.push(Capability::Network);
+		plugin.manifest.network = vec!["https://api.example.org".into()];
+		plugin.manifest.secrets = vec![extensions::network::SecretSpec {
+			id: "api_key".into(),
+			label: "Example API key".into(),
+			origins: vec!["https://api.example.org".into()],
+		}];
+		shop.set_entries(vec![plugin.clone()]);
+		shop.open_details(&plugin.manifest.id);
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		let has =
+			|labels: &[(String, egui::Rect)], text: &str| labels.iter().any(|(t, _)| t == text);
+		assert!(has(&labels, "Example API key"));
+		assert!(has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-not-set")
+		));
+		assert!(!has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-remove")
+		));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-edit"),
+		);
+		let (_, _, value) = shop.secret_edit.as_mut().expect("editing");
+		value.push_str("typed-secret");
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		// The field is masked.
+		assert!(!labels.iter().any(|(text, _)| text.contains("typed-secret")));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-save"),
+		);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSecret { id, secret, value: Some(value), .. }]
+				if id == "synthetic.words" && secret == "api_key" && value.as_str() == "typed-secret"
+		));
+		assert!(shop.secret_edit.is_none());
+		shop.requests.clear();
+		// Once set, it can be removed.
+		shop.plugin_data = vec![extension_host::store::PluginData {
+			id: plugin.manifest.id.clone(),
+			connection: false,
+			bytes: 0,
+			database_quota: extension_host::database::DEFAULT_QUOTA,
+			handles: Vec::new(),
+			secrets: vec!["api_key".into()],
+		}];
+		shop.open_details(&plugin.manifest.id);
+		frame(&ctx, &mut shop, 600.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 600.0, vec![]);
+		assert!(has(
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-set")
+		));
+		click(
+			&ctx,
+			&mut shop,
+			600.0,
+			&labels,
+			&crate::i18n::translate("extensions-ui-secret-remove"),
+		);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSecret { value: None, .. }]
+		));
+	}
+
+	/// The consent dialog warns only about flows that can leave the device: from enabled
+	/// providers into a plugin with network or files, and from it to enabled subscribers
+	/// with network or files.
+	#[test]
+	fn consent_warns_when_shared_topics_could_carry_data_off_the_device() {
+		let plugin = |id: &str, enabled, broadcasts: &[&str], subscribes: &[&str], caps| {
+			let mut entry = entry();
+			entry.manifest.id = id.into();
+			entry.manifest.name = id.into();
+			entry.enabled = enabled;
+			entry.manifest.broadcasts = broadcasts.iter().map(|t| t.to_string()).collect();
+			entry.manifest.subscribes = subscribes.iter().map(|t| t.to_string()).collect();
+			entry.manifest.capabilities = caps;
+			entry
+		};
+		let entries = vec![
+			plugin("Archive", true, &["serein.messages/1"], &[], vec![]),
+			plugin(
+				"Uploader",
+				true,
+				&[],
+				&["serein.captions/1"],
+				vec![Capability::Network],
+			),
+			plugin("Viewer", true, &[], &["serein.captions/1"], vec![]),
+			plugin("Off", false, &["serein.messages/1"], &[], vec![]),
+		];
+		let new = plugin(
+			"New",
+			false,
+			&["serein.captions/1"],
+			&["serein.messages/1"],
+			vec![Capability::Files],
+		)
+		.manifest;
+		let warnings = data_flows(&entries, &new);
+		assert_eq!(warnings.len(), 2);
+		assert!(warnings[0].contains("Archive") && !warnings[0].contains("Off"));
+		assert!(warnings[1].contains("Uploader") && !warnings[1].contains("Viewer"));
+		let mut offline = new.clone();
+		offline.capabilities.clear();
+		offline.broadcasts.clear();
+		assert!(
+			data_flows(&entries, &offline).is_empty(),
+			"nothing can leave through it"
+		);
+	}
+
+	#[test]
+	fn connections_list_each_shared_topic_and_warn_when_data_can_leave() {
+		let ctx = egui::Context::default();
+		let mut shop = ExtensionUi::default();
+		let mut provider = entry();
+		provider.enabled = true;
+		provider.manifest.id = "captioner".into();
+		provider.manifest.name = "Captioner".into();
+		provider.manifest.broadcasts = vec!["serein.captions/1".into()];
+		let mut subscriber = entry();
+		subscriber.enabled = true;
+		subscriber.manifest.id = "uploader".into();
+		subscriber.manifest.name = "Uploader".into();
+		subscriber.manifest.subscribes = vec!["serein.captions/1".into()];
+		subscriber.manifest.network = vec!["https://upload.example.org".into()];
+		shop.set_entries(vec![provider, subscriber]);
+		frame(&ctx, &mut shop, 900.0, vec![]);
+		let labels = frame(&ctx, &mut shop, 900.0, vec![]);
+		let row = crate::i18n::translate_args(
+			"extensions-ui-connection",
+			&[
+				("provider", "Captioner"),
+				("subscriber", "Uploader"),
+				("topic", "serein.captions/1"),
+			],
+		);
+		assert!(labels.iter().any(|(text, _)| *text == row), "{labels:?}");
+		assert!(
+			labels
+				.iter()
+				.any(|(text, _)| text.contains("https://upload.example.org"))
+		);
+		click(&ctx, &mut shop, 900.0, &labels, &row);
+		assert!(matches!(
+			shop.requests.as_slice(),
+			[ExtensionRequest::SetSubscription { subscription, approved: true }]
+				if subscription.provider == "captioner" && subscription.subscriber == "uploader"
+		));
+	}
+
+	#[test]
+	fn network_consent_names_the_servers_and_warns_about_data_leaving() {
+		let ctx = egui::Context::default();
+		let mut extensions = ExtensionUi::default();
+		let mut networked = entry();
+		networked.manifest.capabilities.push(Capability::Network);
+		networked.manifest.network = vec!["https://api.example.org".into()];
+		extensions.set_entries(vec![networked.clone()]);
+		extensions.offer_import(networked);
+		frame(&ctx, &mut extensions, 900.0, vec![]);
+		let labels = frame(&ctx, &mut extensions, 900.0, vec![]);
+		let text: String = labels
+			.iter()
+			.map(|(text, _)| text.as_str())
+			.collect::<Vec<_>>()
+			.join(
+				"
+",
+			);
+		assert!(text.contains(capability_label(Capability::Network)));
+		assert!(text.contains(&crate::i18n::translate_args(
+			"extensions-ui-consent-network-warning",
+			&[("hosts", "https://api.example.org")]
+		)));
+	}
+
 	#[test]
 	fn consent_requires_explicit_grant_and_cleanup_stays_available() {
 		for width in [320.0, 900.0] {

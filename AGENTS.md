@@ -73,8 +73,28 @@ a quick read of the code would not. Prefer extending an existing test over addin
 - `crates/discord-api`, `discord-gateway`, `discord-voice`: transports and voice.
 - `crates/deepfilternet`: DeepFilterNet3 noise suppression with embedded weights.
 - `crates/local-store`, `platform`: persistence and native integrations.
+- `crates/extensions`, `extension-host`: Wasm sandbox and wire contract; toolkit-free plugin host
+  (package store, worker, snapshots, event admission) shared by front ends.
 - `crates/ui`, `apps/desktop`: interface and app wiring.
 - `crates/test-support`, `tools/replay-bench`: synthetic fixtures and workloads.
+
+## Fork
+
+This checkout is the fork `BRUHItsABunny/Serein`, pushed as `origin`. The original project is
+the `upstream` remote, `ViceVerse-cz/Serein`, for fetching only; its push URL is disabled.
+
+- Never push to upstream or open, edit or comment on its PRs, issues or wiki. PRs target
+  `origin` only, with base `main` or the branch a stacked PR builds on.
+- With an `upstream` remote, `gh` can pick the upstream repository. Keep
+  `gh repo set-default BRUHItsABunny/Serein` and pass `--repo BRUHItsABunny/Serein` to
+  every `gh pr` and `gh api` call that targets a repository.
+- Bring upstream changes in by fetching `upstream` and merging them on a fork task branch
+  through an ordinary fork PR.
+- The plugin host's fork-only features (host imports, plugin networking, files, media taps,
+  catalog sources and the other preview capabilities) are allowed here and stay labeled
+  Preview. They are not proposed upstream.
+- In this guide, the remote default branch is `origin`'s, and "upstream" in a branch check
+  means the tracking branch, not the `upstream` remote.
 
 ## Git
 

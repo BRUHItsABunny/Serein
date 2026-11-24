@@ -12,6 +12,10 @@ fn manifest() -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
+		secrets: Vec::new(),
+		broadcasts: Vec::new(),
+		subscribes: Vec::new(),
 		capabilities: vec![Capability::ApiProxy, Capability::Storage],
 		actions: vec![Action {
 			id: "apply".into(),

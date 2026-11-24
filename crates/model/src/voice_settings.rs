@@ -19,7 +19,7 @@ impl CameraFrameRate {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InputProfile {
 	#[default]
 	VoiceIsolation,
@@ -27,7 +27,7 @@ pub enum InputProfile {
 	Custom,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NoiseSuppression {
 	Off,
 	RnNoise,
@@ -48,7 +48,7 @@ impl NoiseSuppression {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Processing {
 	pub suppression: NoiseSuppression,
@@ -85,7 +85,7 @@ impl Processing {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceProcessing {
 	pub profile: InputProfile,

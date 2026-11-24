@@ -1,7 +1,9 @@
 //! Maps the bounded extension worker to native UI requests; no plugin runs here.
-use crate::extensions::{Event, ExtensionHost, InstallSource, InstalledExtension, Job, Starter};
 use client_core::State;
 use eframe::egui;
+use extension_host::store::{
+	Event, ExtensionHost, InstallSource, InstalledExtension, Job, Starter,
+};
 use extensions::{
 	ActionResult, AppEventKind, Capability, CatalogEntry, ExtensionKind, Invocation, Manifest,
 	MessageEvent, Surface,
@@ -14,6 +16,35 @@ use std::{
 };
 use ui::{ExtensionContext, ExtensionEntry, ExtensionRequest};
 
+/// Plugin secrets in the OS credential store.
+struct OsSecrets;
+impl extension_host::secrets::SecretStore for OsSecrets {
+	fn load(&self, key: &str) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+		platform::plugin_secrets::load(key).map_err(secret_error)
+	}
+	fn save(&self, key: &str, value: &str) -> Result<(), String> {
+		platform::plugin_secrets::save(key, value).map_err(secret_error)
+	}
+	fn forget(&self, key: &str) -> Result<(), String> {
+		platform::plugin_secrets::forget(key).map_err(secret_error)
+	}
+}
+fn secret_error(error: platform::CredentialError) -> String {
+	match error {
+		platform::CredentialError::NoStore => {
+			"No system credential store is available for plugin secrets".into()
+		}
+		platform::CredentialError::Invalid => "The secret is not valid".into(),
+		_ => "The system credential store is unavailable".into(),
+	}
+}
+
+/// Wakes the UI thread to poll a finished extension job.
+fn repaint(ctx: &egui::Context) -> extension_host::store::Wake {
+	let ctx = ctx.clone();
+	std::sync::Arc::new(move || ctx.request_repaint())
+}
+
 struct Pending {
 	catalog: bool,
 	theme_save: bool,
@@ -23,6 +54,8 @@ struct Pending {
 	preview: Option<(String, String)>,
 	invocation: Option<(String, Invocation, ExtensionContext)>,
 	tick: Option<String>,
+	/// The plugin a background `journal` or `topic` delivery runs for.
+	delivery: Option<String>,
 }
 impl Pending {
 	fn reactive(&self) -> bool {
@@ -110,6 +143,12 @@ fn parse_rgb_hex(text: &str) -> Option<[u8; 3]> {
 const MAX_MESSAGE_EVENTS: usize = 32;
 const MAX_MESSAGE_EVENT_BYTES: usize = 64 * 1024;
 const MESSAGE_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+/// Shortest pause between two message journal deliveries.
+const JOURNAL_INTERVAL: Duration = Duration::from_millis(100);
+/// Pause before a subscriber whose topic delivery failed receives messages again.
+const TOPIC_RETRY: Duration = Duration::from_secs(10);
+/// Minimum delay between `annotate` deliveries.
+const ANNOTATE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// `interface` is the plugin's last restated interface; with the invocation it picks the
 /// channel directory's focus server.
@@ -120,13 +159,13 @@ fn attach_app_data(
 	manifest: &Manifest,
 	interface: Option<&extensions::InterfaceUi>,
 ) {
-	let focus = crate::extension_app::focus_guild(state, invocation, interface);
-	invocation.app = crate::extension_app::snapshot(state, messaging, manifest, focus);
-	invocation.queries = crate::extension_app::query_snapshot(state, manifest);
+	let focus = extension_host::snapshot::focus_guild(state, invocation, interface);
+	invocation.app = extension_host::snapshot::snapshot(state, messaging, manifest, focus);
+	invocation.queries = extension_host::snapshot::query_snapshot(state, manifest);
 	invocation.messaging_settings =
-		crate::extension_app::messaging_settings_snapshot(state, manifest);
-	invocation.guild_folders = crate::extension_app::guild_folders_snapshot(state, manifest);
-	crate::extensions::trim_extended_input(invocation, extensions::MAX_IO_BYTES - 8 * 1024);
+		extension_host::snapshot::messaging_settings_snapshot(state, manifest);
+	invocation.guild_folders = extension_host::snapshot::guild_folders_snapshot(state, manifest);
+	extension_host::store::trim_extended_input(invocation, extensions::MAX_IO_BYTES - 8 * 1024);
 }
 
 enum ReactiveEvent {
@@ -137,8 +176,8 @@ enum ReactiveEvent {
 impl ReactiveEvent {
 	fn available(&self, state: &State) -> bool {
 		match self {
-			Self::Message(_) => crate::extension_events::available(state),
-			Self::App(_) | Self::ActionResult(_) => crate::extension_app::available(state),
+			Self::Message(_) => extension_host::message_events::available(state),
+			Self::App(_) | Self::ActionResult(_) => extension_host::snapshot::available(state),
 		}
 	}
 }
@@ -193,11 +232,11 @@ pub struct Bridge {
 	message_events: VecDeque<QueuedEvent>,
 	message_event_at: Option<Instant>,
 	message_events_dropped: bool,
-	app_key: Option<crate::extension_app::ChangeKey>,
+	app_key: Option<extension_host::snapshot::ChangeKey>,
 	extended_key: Option<u64>,
 	app_context_changed: bool,
-	data_changes: crate::extension_data_events::Changes,
-	data_key: Option<crate::extension_data_events::DataKey>,
+	data_changes: extension_host::data_events::Changes,
+	data_key: Option<extension_host::data_events::DataKey>,
 	connection_observed: bool,
 	connection_interrupted: bool,
 	ticks: BTreeMap<String, TickSchedule>,
@@ -208,7 +247,63 @@ pub struct Bridge {
 	/// The interface last handed to the UI, so an unchanged tree is not re-published
 	/// (deep-copied) every frame.
 	published_interface: Option<ui::PluginInterface>,
+	/// The account's message journal writer, open while an installed plugin consumes it.
+	journal: Option<extension_host::journal::Recorder>,
+	/// Installed journal consumers, each with a cursor in the journal.
+	journal_consumers: Vec<String>,
+	/// Consumers with entries to deliver.
+	journal_due: BTreeSet<String>,
+	/// Journal consumers annotating the open channel that are due fresh notes there once
+	/// they have stored an edit or deletion in it.
+	notes_after_journal: BTreeSet<String>,
+	journal_at: Option<Instant>,
+	/// Subscriptions the user approved in this account, as saved.
+	subscriptions: Vec<extension_host::broker::Subscription>,
+	/// The subscriptions last handed to the broker: approved ones whose plugins both run.
+	live_subscriptions: BTreeSet<extension_host::broker::Subscription>,
+	/// Subscribers whose last topic delivery failed, and when they may try again.
+	topic_retry: BTreeMap<String, Instant>,
+	/// Message hooks switched on in this account's channels, as saved.
+	channel_hooks: Vec<extension_host::hooks::ChannelHooks>,
+	/// Which messages each annotating plugin was given.
+	annotated: extension_host::hooks::AnnotateTracker,
+	annotate_at: Option<Instant>,
+	/// Desktop alerts on their way to the OS through the enabled `notification` plugins, with
+	/// each alert's avatar key and image.
+	notify: extension_host::notify::Pipeline<(String, Option<String>)>,
+	/// The plugin and message the running notification invocation is for.
+	notify_running: Option<(String, String)>,
+	/// A pick a plugin asked for, waiting for the picker to open.
+	pick_request: Option<(String, extensions::FilePick)>,
+	/// The open picker, for that plugin and pick.
+	file_pick: Option<(
+		String,
+		extensions::FilePick,
+		mpsc::Receiver<Option<PathBuf>>,
+	)>,
+	/// Media workers of the current call, by plugin.
+	media: BTreeMap<String, MediaSession>,
+	/// Plugins whose media worker failed, and when one may start again.
+	media_retry: BTreeMap<String, Instant>,
+	/// Hands tapped call media to the workers that may receive it.
+	media_tap: crate::media_tap::Pump,
+	/// What each plugin last told its media worker with `media_state`, until it is
+	/// disabled or Serein closes.
+	media_states: BTreeMap<String, serde_json::Value>,
 }
+
+/// A plugin's media worker for one call.
+struct MediaSession {
+	worker: extension_host::media::MediaWorker,
+	channel: model::Id,
+	participants: BTreeSet<model::Id>,
+	started: Instant,
+	/// Whether the worker wants media chunks or, for now, only events.
+	chunks: bool,
+}
+
+/// How long a failed media worker waits before it starts again in the same call.
+const MEDIA_RETRY: Duration = Duration::from_secs(10);
 impl Bridge {
 	fn tick_pending(&self, generation: u64, id: &str) -> bool {
 		self.pending
@@ -323,7 +418,7 @@ impl Bridge {
 			.unwrap_or_default();
 	}
 
-	pub fn data_changed(&mut self, mut changes: crate::extension_data_events::Changes) {
+	pub fn data_changed(&mut self, mut changes: extension_host::data_events::Changes) {
 		if let Some(connected) = changes.connection() {
 			self.observe_connection(connected, &mut changes);
 		}
@@ -332,7 +427,7 @@ impl Bridge {
 	fn observe_connection(
 		&mut self,
 		connected: bool,
-		changes: &mut crate::extension_data_events::Changes,
+		changes: &mut extension_host::data_events::Changes,
 	) {
 		if connected {
 			if self.connection_interrupted {
@@ -361,7 +456,7 @@ impl Bridge {
 			self.pending.retain(|_, pending| pending.cleanup);
 		}
 		for entry in &self.installed {
-			if crate::extension_app::uses_app(&entry.manifest.capabilities) {
+			if extension_host::snapshot::uses_app(&entry.manifest.capabilities) {
 				messaging.extensions.remove_runtime(&entry.manifest.id);
 			}
 		}
@@ -375,13 +470,13 @@ impl Bridge {
 		})
 	}
 	fn app_events(&mut self, state: &State, messaging: &ui::MessagingUi) {
-		if self.scope_current(state) && crate::extension_app::available(state) {
+		if self.scope_current(state) && extension_host::snapshot::available(state) {
 			let mut changes = Default::default();
 			self.observe_connection(state.gateway_connected, &mut changes);
 			self.data_changes.merge(changes);
 		}
 		if !self.scope_current(state)
-			|| !crate::extension_app::available(state)
+			|| !extension_host::snapshot::available(state)
 			|| !self.installed.iter().any(|entry| {
 				entry.error.is_none()
 					&& !self.disabled.contains(&entry.manifest.id)
@@ -393,13 +488,13 @@ impl Bridge {
 			self.data_key = None;
 			return;
 		}
-		let data_key = crate::extension_data_events::DataKey::capture(state);
+		let data_key = extension_host::data_events::DataKey::capture(state);
 		if let Some(old) = &self.data_key {
 			self.data_changes.merge(data_key.changed(old));
 		}
 		self.data_key = Some(data_key);
 		let changes = std::mem::take(&mut self.data_changes);
-		let key = crate::extension_app::ChangeKey::capture(state, messaging);
+		let key = extension_host::snapshot::ChangeKey::capture(state, messaging);
 		let invalidated = std::mem::take(&mut self.app_context_changed);
 		let extended = self.installed.iter().any(|entry| {
 			entry.error.is_none()
@@ -413,7 +508,8 @@ impl Bridge {
 					)
 				})
 		});
-		let next_extended_key = extended.then(|| crate::extension_app::extended_change_key(state));
+		let next_extended_key =
+			extended.then(|| extension_host::snapshot::extended_change_key(state));
 		let extended_changed = next_extended_key.is_some()
 			&& self.extended_key.is_some()
 			&& next_extended_key != self.extended_key;
@@ -497,7 +593,7 @@ impl Bridge {
 	}
 	pub fn has_message_events(&self, state: &State) -> bool {
 		self.installed.iter().any(|entry| self.subscribes(entry))
-			&& crate::extension_events::available(state)
+			&& extension_host::message_events::available(state)
 			&& self.scope_current(state)
 	}
 	pub fn message_event(&mut self, state: &State, event: MessageEvent) {
@@ -548,22 +644,250 @@ impl Bridge {
 						!available
 							|| !context.is_current(state)
 							|| input.message_event.is_some()
-								&& !crate::extension_events::available(state)
-							|| input.app_event.is_some() && !crate::extension_app::available(state)
+								&& !extension_host::message_events::available(state)
+							|| input.app_event.is_some()
+								&& !extension_host::snapshot::available(state)
 					})
 		}) && let Some(host) = &mut self.host
 		{
 			host.cancel();
 		}
 	}
+	/// Journal records for `event`, captured before the reducer applies it so edits and
+	/// deletes can carry the version the timeline holds. Empty unless a plugin consumes the
+	/// journal in the current account.
+	pub fn journal_capture(
+		&self,
+		state: &State,
+		event: &client_core::Envelope,
+	) -> Vec<extension_host::journal::Record> {
+		if self.journal.is_none()
+			|| event.generation != state.generation
+			|| !self.scope_current(state)
+		{
+			return Vec::new();
+		}
+		extension_host::journal::capture(state, &event.event)
+	}
+	/// Marks the open channel's annotating journal consumers for fresh notes when `event`
+	/// edits or deletes messages there: their notes come from what they store, so asking
+	/// before they stored it, or never again for a deletion's neighbour, would miss it.
+	pub fn journal_changes_notes(&mut self, state: &State, event: &client_core::Envelope) {
+		let Some(channel) = state.selected.filter(|_| {
+			self.journal.is_some()
+				&& event.generation == state.generation
+				&& self.scope_current(state)
+		}) else {
+			return;
+		};
+		if !extension_host::journal::changes_messages_in(&event.event, channel) {
+			return;
+		}
+		for plugin in extension_host::hooks::annotators(&self.channel_hooks, channel) {
+			if self.journal_consumers.contains(&plugin) {
+				self.notes_after_journal.insert(plugin);
+			}
+		}
+	}
+	pub fn journal_active(&self) -> bool {
+		self.journal.is_some()
+	}
+	/// Queues captured records, `access_lost` entries for channels the event made unreadable,
+	/// and a new session's channel positions once the reducer applied it.
+	pub fn journal_record(
+		&mut self,
+		state: &State,
+		mut records: Vec<extension_host::journal::Record>,
+		session_started: bool,
+		lost: &[(model::Id, Option<model::Id>)],
+	) {
+		let Some(journal) = &self.journal else {
+			return;
+		};
+		if self.scope_current(state) {
+			records.extend(extension_host::journal::access_lost(lost));
+		}
+		if session_started && self.scope_current(state) {
+			records.extend(extension_host::journal::capture_after(
+				state,
+				&client_core::Event::Resync,
+			));
+		}
+		if !records.is_empty() {
+			journal.record(records);
+		}
+	}
+	fn journal_action(entry: &InstalledExtension) -> Option<&str> {
+		if !entry
+			.manifest
+			.capabilities
+			.contains(&Capability::MessageJournal)
+		{
+			return None;
+		}
+		entry
+			.manifest
+			.actions
+			.iter()
+			.find(|action| action.surface == Surface::Journal)
+			.map(|action| action.id.as_str())
+	}
+	/// Keeps the journal writer and its consumer cursors in step with the installed plugins,
+	/// and starts one delivery when entries are due.
+	fn journal(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let generation = state.generation;
+		let consumers: Vec<String> = if account.is_some() && self.start_screen_loaded {
+			self.installed
+				.iter()
+				.filter(|entry| Self::journal_action(entry).is_some())
+				.map(|entry| entry.manifest.id.clone())
+				.collect()
+		} else {
+			Vec::new()
+		};
+		if consumers != self.journal_consumers {
+			if consumers.is_empty() {
+				self.journal = None;
+			} else if let Some(account) = account {
+				match &self.journal {
+					Some(journal) => journal.set_consumers(consumers.clone()),
+					None => match self.host.as_ref().unwrap().journal_path(account) {
+						Ok(path) => {
+							let recorder = extension_host::journal::Recorder::open(
+								path,
+								consumers.clone(),
+								repaint(ctx),
+							);
+							// The session's Ready usually arrived before the plugins loaded.
+							recorder.record(extension_host::journal::opened(state));
+							self.journal = Some(recorder);
+						}
+						Err(error) => messaging.extensions.report_error(error),
+					},
+				}
+			}
+			self.journal_due = consumers.iter().cloned().collect();
+			self.journal_consumers = consumers;
+		}
+		let Some(journal) = &self.journal else {
+			self.journal_due.clear();
+			return;
+		};
+		if journal.take_appended() {
+			self.journal_due
+				.extend(self.journal_consumers.iter().cloned());
+		}
+		let Some(account) = account else {
+			return;
+		};
+		let wait = self.journal_at.map_or(Duration::ZERO, |at| {
+			JOURNAL_INTERVAL.saturating_sub(at.elapsed())
+		});
+		if self.journal_due.is_empty()
+			|| self.host.as_ref().unwrap().busy()
+			|| !self.message_events.is_empty()
+			|| self
+				.pending
+				.values()
+				.any(|pending| pending.delivery.is_some())
+		{
+			return;
+		}
+		if !wait.is_zero() {
+			ctx.request_repaint_after(wait);
+			return;
+		}
+		let disabled = &self.disabled;
+		let Some((id, action)) = self.journal_due.iter().find_map(|id| {
+			self.installed
+				.iter()
+				.find(|entry| {
+					entry.manifest.id == *id && entry.error.is_none() && !disabled.contains(id)
+				})
+				.and_then(|entry| Some((id.clone(), Self::journal_action(entry)?.to_owned())))
+		}) else {
+			// Due consumers that cannot run now keep their cursor and wait for new entries.
+			self.journal_due.clear();
+			return;
+		};
+		self.journal_due.remove(&id);
+		self.journal_at = Some(Instant::now());
+		let job = Job::Invoke {
+			id: id.clone(),
+			account: account.clone(),
+			invocation: Invocation {
+				action,
+				..Default::default()
+			},
+		};
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
+			Ok(token) => {
+				self.pending.insert(
+					token,
+					Pending {
+						catalog: false,
+						theme_save: false,
+						generation,
+						cleanup: false,
+						reconcile: false,
+						preview: None,
+						invocation: None,
+						tick: None,
+						delivery: Some(id),
+					},
+				);
+			}
+			Err(error) => messaging.extensions.report_error(error),
+		}
+	}
+	/// Re-reads plugin data sizes after something added or removed a plugin.
+	fn refresh_data_usage(
+		&mut self,
+		account: &Option<String>,
+		generation: u64,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		self.submit(
+			Job::DataUsage {
+				account: account.clone(),
+			},
+			None,
+			generation,
+			ctx,
+			messaging,
+		);
+	}
 	pub fn cleanup_pending(&self) -> bool {
 		// Start-screen writes are waited out too, so closing cannot cut one short.
 		self.pending.values().any(|pending| pending.cleanup) || self.start_screen.pending()
 	}
+	/// Stops the journal writer after it wrote what was queued; the next scope reopens it.
+	fn close_journal(&mut self) {
+		self.subscriptions.clear();
+		self.topic_retry.clear();
+		self.live_subscriptions.clear();
+		if let Some(host) = &self.host {
+			host.broker().set_subscriptions(BTreeSet::new());
+		}
+		self.journal = None;
+		self.journal_consumers.clear();
+		self.journal_due.clear();
+		self.notes_after_journal.clear();
+	}
 	/// Drops account-scoped plugin state, including queued events, presence and interface tweaks,
 	/// and logs the plugin host out of the account's data.
 	pub fn logout(&mut self, ctx: &egui::Context) -> Result<(), String> {
+		self.close_journal();
 		self.message_events.clear();
+		self.channel_hooks.clear();
+		self.annotated.clear();
 		self.app_key = None;
 		self.app_context_changed = false;
 		self.data_changes = Default::default();
@@ -595,7 +919,7 @@ impl Bridge {
 					Job::Logout {
 						account: account.clone(),
 					},
-					ctx,
+					&repaint(ctx),
 				)?;
 				self.pending.insert(
 					token,
@@ -608,6 +932,7 @@ impl Bridge {
 						preview: None,
 						invocation: None,
 						tick: None,
+						delivery: None,
 					},
 				);
 			}
@@ -643,11 +968,30 @@ impl Bridge {
 				return;
 			};
 			self.start_screen = crate::extension_start_screen::DeviceStartScreen::load(&root, ctx);
+			// The demo never touches the OS credential store.
+			extension_host::secrets::install(if demo {
+				Arc::new(extension_host::secrets::MemoryStore::default())
+			} else {
+				Arc::new(OsSecrets)
+			});
 			self.host = Some(ExtensionHost::new(root));
 		}
 		let scope = (state.generation, account.clone());
 		if self.scope.as_ref() != Some(&scope) {
+			self.close_journal();
 			self.message_events.clear();
+			self.channel_hooks.clear();
+			self.annotated.clear();
+			messaging.call_captions.clear();
+			self.notify.dismiss(true);
+			self.notify_running = None;
+			self.pick_request = None;
+			self.file_pick = None;
+			self.media.clear();
+			self.media_retry.clear();
+			self.media_states.clear();
+			messaging.extensions.channel_hooks.clear();
+			messaging.extensions.forget_annotations(None);
 			self.app_key = None;
 			self.app_context_changed = false;
 			self.data_changes = Default::default();
@@ -689,7 +1033,7 @@ impl Bridge {
 				.is_some_and(|(_, input, context)| {
 					!context.is_current(state)
 						|| input.message_event.is_some()
-							&& !crate::extension_events::available(state)
+							&& !extension_host::message_events::available(state)
 				})
 		}) {
 			self.cancel_previews(messaging);
@@ -746,6 +1090,53 @@ impl Bridge {
 				continue;
 			}
 			match outcome {
+				Err(error) if pending.as_ref().is_some_and(|p| p.delivery.is_some()) => {
+					// The cursor did not move; the entries are delivered again with the next ones.
+					let id = pending.and_then(|p| p.delivery).unwrap_or_default();
+					self.topic_retry
+						.insert(id.clone(), Instant::now() + TOPIC_RETRY);
+					messaging.extensions.status =
+						format!("{id} could not process the message journal. {error}");
+				}
+				Ok(Event::JournalDelivered { id, more }) => {
+					if more {
+						self.journal_due.insert(id);
+					} else if !self.journal_due.contains(&id)
+						&& self.notes_after_journal.remove(&id)
+					{
+						// It has stored everything recorded so far: ask for the open
+						// channel's notes again.
+						self.annotated.forget(&id);
+					}
+				}
+				Err(error)
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| input.notification.is_some()) =>
+				{
+					// The alert shows without this plugin's say.
+					let (id, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					let message = invocation.notification.map(|alert| alert.message_id);
+					self.notify
+						.failed(&id, message.as_deref().unwrap_or_default());
+					self.notify_running = None;
+					messaging.extensions.status = format!("{id}: {error}");
+				}
+				Err(error)
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| {
+							input.send_target.is_some() || input.annotate.is_some()
+						}) =>
+				{
+					// A hook failing on one message leaves the plugin running; its fallback
+					// decides what happens to the draft.
+					let (id, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					messaging.extensions.send_failed(&id, &invocation);
+					messaging.extensions.status = format!("{id}: {error}");
+				}
 				Err(error) => {
 					if let Some(id) = pending.as_ref().and_then(|pending| pending.tick.as_ref()) {
 						if let Some(schedule) = self.ticks.get_mut(id) {
@@ -764,7 +1155,10 @@ impl Bridge {
 						);
 						continue;
 					}
-					if let Some((id, _, _)) = pending.as_ref().and_then(|p| p.invocation.as_ref()) {
+					if let Some((id, input, _)) =
+						pending.as_ref().and_then(|p| p.invocation.as_ref())
+					{
+						messaging.extensions.page_failed(id, input);
 						if let Some(entry) = self.installed.iter_mut().find(|entry| {
 							entry.manifest.id == *id
 								&& entry.manifest.capabilities.contains(&Capability::ApiProxy)
@@ -796,11 +1190,49 @@ impl Bridge {
 						);
 					}
 				}
+				Ok(Event::DataUsage(data)) => messaging.extensions.plugin_data = data,
+				Ok(Event::FileHandleAdded {
+					id,
+					root,
+					action,
+					usage,
+				}) => {
+					messaging.extensions.plugin_data = usage;
+					Self::pick_answer(state, messaging, id, action, ("root", root));
+				}
+				Ok(Event::ChannelHooks(hooks)) => {
+					messaging.extensions.channel_hooks.clone_from(&hooks);
+					self.channel_hooks = hooks;
+				}
+				Ok(Event::Subscriptions(subscriptions)) => {
+					messaging
+						.extensions
+						.subscriptions
+						.clone_from(&subscriptions);
+					self.subscriptions = subscriptions;
+				}
+				Ok(Event::TopicDelivered { id, captions, .. }) => {
+					self.topic_retry.remove(&id);
+					self.show_captions(state, messaging, &id, captions);
+				}
 				Ok(Event::Loaded {
 					catalog,
 					installed,
 					starters,
+					data,
+					subscriptions,
+					hooks,
+					sources,
 				}) => {
+					messaging.extensions.catalog_sources = sources;
+					messaging.extensions.channel_hooks.clone_from(&hooks);
+					self.channel_hooks = hooks;
+					messaging.extensions.plugin_data = data;
+					messaging
+						.extensions
+						.subscriptions
+						.clone_from(&subscriptions);
+					self.subscriptions = subscriptions;
 					if let Some(catalog) = catalog {
 						self.catalog = catalog
 							.entries
@@ -828,16 +1260,25 @@ impl Bridge {
 					self.apply_theme(ctx);
 					self.entries(messaging);
 				}
-				Ok(Event::Catalog(catalog)) => {
-					self.catalog = catalog
-						.entries
-						.into_iter()
-						.filter(|entry| entry.manifest.id != "emoji-sticker-images")
-						.map(|entry| (entry.manifest.id.clone(), entry))
-						.collect();
+				Ok(Event::Catalog { catalog, sources }) => {
+					if let Some(catalog) = catalog {
+						self.catalog = catalog
+							.entries
+							.into_iter()
+							.filter(|entry| entry.manifest.id != "emoji-sticker-images")
+							.map(|entry| (entry.manifest.id.clone(), entry))
+							.collect();
+					}
+					messaging.extensions.catalog_sources = sources;
 					self.entries(messaging);
-					// A finished refresh is visible in the grid; only failures need a status line.
+					// A finished refresh is visible in the grid; only failures need a status line,
+					// and a failing source shows its error beside it.
 					messaging.extensions.status.clear();
+				}
+				Ok(Event::CatalogSources(sources)) => {
+					messaging.extensions.catalog_sources = sources;
+					// A new or edited source shows its packages after the next refresh.
+					self.submit(Job::RefreshCatalog, None, state.generation, ctx, messaging);
 				}
 				Ok(Event::Imported {
 					manifest,
@@ -909,8 +1350,22 @@ impl Bridge {
 					self.apply_theme(ctx);
 					self.entries(messaging);
 					messaging.extensions.status = "Extension enabled.".into();
+					self.refresh_data_usage(&account, state.generation, ctx, messaging);
 				}
 				Ok(Event::Disabled(id)) => {
+					// The host switched its hooks off everywhere.
+					for hooks in [
+						&mut self.channel_hooks,
+						&mut messaging.extensions.channel_hooks,
+					] {
+						for channel in hooks.iter_mut() {
+							channel.remove(&id);
+						}
+						hooks.retain(|channel| !channel.is_empty());
+					}
+					self.annotated.forget(&id);
+					messaging.extensions.forget_annotations(Some(&id));
+					messaging.call_captions.remove_plugin(&id);
 					self.ticks.remove(&id);
 					self.transitions.remove(&id);
 					let theme = self.installed.iter().any(|entry| {
@@ -918,9 +1373,11 @@ impl Bridge {
 					});
 					self.installed.retain(|entry| entry.manifest.id != id);
 					self.disabled.remove(&id);
+					self.refresh_data_usage(&account, state.generation, ctx, messaging);
 					self.refresh_api_proxy();
 					self.refresh_start_screen();
 					messaging.extensions.remove_runtime(&id);
+					self.media_states.remove(&id);
 					self.apply_theme(ctx);
 					self.entries(messaging);
 					// The gallery reports the outcome; an open theme editor is a different task.
@@ -932,11 +1389,13 @@ impl Bridge {
 						};
 					}
 				}
-				Ok(Event::Invoked { id, output })
+				Ok(Event::Invoked { id, mut output })
 					if pending
 						.as_ref()
 						.is_some_and(|pending| pending.tick.as_deref() == Some(id.as_str())) =>
 				{
+					self.show_captions(state, messaging, &id, output.captions.take());
+					self.set_media_state(&id, output.media_state.take());
 					let now = Instant::now();
 					if let Some(schedule) = self.ticks.get_mut(&id) {
 						schedule.next_due =
@@ -969,6 +1428,22 @@ impl Bridge {
 							self.apply_theme(ctx);
 						}
 					}
+				}
+				Ok(Event::Invoked { id, output })
+					if pending
+						.as_ref()
+						.and_then(|p| p.invocation.as_ref())
+						.is_some_and(|(_, input, _)| input.notification.is_some()) =>
+				{
+					let (_, invocation, _) = pending.and_then(|p| p.invocation).unwrap();
+					let message = invocation.notification.map(|alert| alert.message_id);
+					let message = message.as_deref().unwrap_or_default();
+					if self.disabled.contains(&id) {
+						self.notify.failed(&id, message);
+					} else {
+						self.notify.answer(&id, message, output.notification);
+					}
+					self.notify_running = None;
 				}
 				Ok(Event::Invoked { id, mut output }) => {
 					if let Some((requested, invocation, context)) =
@@ -1027,6 +1502,7 @@ impl Bridge {
 				Err(mpsc::TryRecvError::Empty) => {}
 			}
 		}
+		self.file_picker(&account, state, ctx, runtime, window, messaging);
 		if let Some(receiver) = &self.theme_picker {
 			match receiver.try_recv() {
 				Ok(result) => {
@@ -1101,7 +1577,7 @@ impl Bridge {
 					runtime.spawn(async move {
 						let result = if let Some(path) = future.await {
 							tokio::task::spawn_blocking(move || {
-								crate::extensions::read_background(&path)
+								extension_host::store::read_background(&path)
 									.map(|(bytes, image)| Some((bytes, Arc::new(image))))
 							})
 							.await
@@ -1121,7 +1597,7 @@ impl Bridge {
 					runtime.spawn(async move {
 						let result = if let Some(path) = future.await {
 							tokio::task::spawn_blocking(move || {
-								crate::extensions::read_cover(&path)
+								extension_host::store::read_cover(&path)
 									.map(|(bytes, image)| Some((bytes, Arc::new(image))))
 							})
 							.await
@@ -1224,7 +1700,129 @@ impl Bridge {
 							"Refresh the catalog or import this package again.".into();
 					}
 				}
-				ExtensionRequest::Disable { id } => {
+				ExtensionRequest::DeleteData { id, connection } => {
+					self.submit(
+						Job::DeleteData {
+							id,
+							account: account.clone(),
+							connection,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::SetSubscription {
+					subscription,
+					approved,
+				} => {
+					if let Some(account) = &account {
+						self.submit(
+							Job::SetSubscription {
+								account: account.clone(),
+								subscription,
+								approved,
+							},
+							None,
+							state.generation,
+							ctx,
+							messaging,
+						);
+					}
+				}
+				ExtensionRequest::SetChannelHooks { hooks } => {
+					if let Some(account) = &account {
+						self.submit(
+							Job::SetChannelHooks {
+								account: account.clone(),
+								hooks,
+							},
+							None,
+							state.generation,
+							ctx,
+							messaging,
+						);
+					}
+				}
+				ExtensionRequest::SetSecret {
+					id,
+					connection,
+					secret,
+					value,
+				} => {
+					self.submit(
+						Job::SetSecret {
+							id,
+							account: account.clone(),
+							connection,
+							secret,
+							value,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::SetCatalogSource { source, token } => self.submit(
+					Job::SetCatalogSource { source, token },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
+				ExtensionRequest::RemoveCatalogSource { id } => self.submit(
+					Job::RemoveCatalogSource { id },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
+				ExtensionRequest::RefreshCatalogSource { id } => self.submit(
+					Job::RefreshCatalogSource { id },
+					None,
+					state.generation,
+					ctx,
+					messaging,
+				),
+				ExtensionRequest::RemoveFileHandle {
+					id,
+					connection,
+					root,
+				} => {
+					self.submit(
+						Job::RemoveFileHandle {
+							id,
+							account: account.clone(),
+							connection,
+							root,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::SetDatabaseQuota {
+					id,
+					connection,
+					bytes,
+				} => {
+					self.submit(
+						Job::SetDatabaseQuota {
+							id,
+							account: account.clone(),
+							connection,
+							bytes,
+						},
+						None,
+						state.generation,
+						ctx,
+						messaging,
+					);
+				}
+				ExtensionRequest::Disable { id, delete_data } => {
 					self.message_events.retain(|event| event.id != id);
 					if let Some(entry) = self.installed.iter().find(|e| e.manifest.id == id) {
 						let kind = entry.manifest.kind;
@@ -1246,6 +1844,7 @@ impl Bridge {
 								} else {
 									account.clone()
 								},
+								delete_data,
 							},
 							None,
 							state.generation,
@@ -1262,9 +1861,16 @@ impl Bridge {
 					if !context.is_current(state)
 						|| self.disabled.contains(&id)
 						|| !self.installed.iter().any(|e| e.manifest.id == id)
+						|| invocation.send_target.is_some() && account.is_none()
 					{
+						// A draft waiting for its hook falls back instead of waiting forever.
+						messaging.extensions.send_failed(&id, &invocation);
+						messaging.extensions.page_failed(&id, &invocation);
 						continue;
 					}
+					// Hooks and page row fetches get only their own input.
+					let hook =
+						invocation.send_target.is_some() || invocation.page_request.is_some();
 					let connection_plugin = self.installed.iter().any(|entry| {
 						entry.manifest.id == id
 							&& entry.manifest.capabilities.contains(&Capability::ApiProxy)
@@ -1272,7 +1878,7 @@ impl Bridge {
 					if account.is_some() || connection_plugin {
 						let entry = self.installed.iter().find(|e| e.manifest.id == id).unwrap();
 						let manifest = &entry.manifest;
-						if !connection_plugin {
+						if !connection_plugin && !hook {
 							attach_app_data(
 								&mut invocation,
 								state,
@@ -1281,7 +1887,7 @@ impl Bridge {
 								entry.interface_ui.as_ref(),
 							);
 						}
-						if crate::extension_app::uses_app(&manifest.capabilities) {
+						if extension_host::snapshot::uses_app(&manifest.capabilities) {
 							// App snapshots and proposals belong to the conversation that produced them.
 							context.app_wide = false;
 							context.channel = state.selected;
@@ -1488,6 +2094,624 @@ impl Bridge {
 			}
 		}
 		self.schedule_ticks(&account, state.generation, ctx, messaging);
+		// Captions belong to the call they were shown in.
+		if state.voice.active.is_none() {
+			messaging.call_captions.clear();
+		}
+		self.notifications(&account, state, ctx, messaging);
+		self.media_workers(&account, state, ctx, messaging);
+		self.journal(&account, state, ctx, messaging);
+		self.topics(&account, state.generation, ctx, messaging);
+		self.annotate(&account, state, ctx, messaging);
+	}
+	/// Hands the open channel's new and edited messages to the plugins annotating it, one
+	/// batch at a time after everything else.
+	fn annotate(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let (Some(account), Some(channel)) = (account, state.selected) else {
+			return;
+		};
+		let annotators = extension_host::hooks::annotators(&self.channel_hooks, channel);
+		if annotators.is_empty() {
+			return;
+		}
+		if self.host.as_ref().unwrap().busy()
+			|| !self.pending.is_empty()
+			|| !self.message_events.is_empty()
+			|| !self.start_screen_loaded
+		{
+			return;
+		}
+		let wait = self.annotate_at.map_or(Duration::ZERO, |at| {
+			ANNOTATE_INTERVAL.saturating_sub(at.elapsed())
+		});
+		if !wait.is_zero() {
+			ctx.request_repaint_after(wait);
+			return;
+		}
+		let due = annotators.iter().find_map(|id| {
+			let entry = self.installed.iter().find(|entry| {
+				entry.manifest.id == *id && entry.error.is_none() && !self.disabled.contains(id)
+			})?;
+			let action = entry
+				.manifest
+				.actions
+				.iter()
+				.find(|action| action.surface == Surface::Annotate)?;
+			let batch = self.annotated.due(state, id)?;
+			Some((id.clone(), action.id.clone(), batch))
+		});
+		let Some((id, action, batch)) = due else {
+			return;
+		};
+		self.annotated.given(state, &id, &batch);
+		let invocation = Invocation {
+			action,
+			annotate: Some(Box::new(batch)),
+			..Default::default()
+		};
+		self.submit(
+			Job::Invoke {
+				id: id.clone(),
+				account: account.clone(),
+				invocation: invocation.clone(),
+			},
+			Some((id, invocation, ExtensionContext::capture(state, false))),
+			state.generation,
+			ctx,
+			messaging,
+		);
+		self.annotate_at = Some(Instant::now());
+	}
+	/// Hands the enabled `notification` plugins to the pipeline and runs the next one on a
+	/// waiting alert, ahead of other background work.
+	fn notifications(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let handlers = if account.is_some() && self.start_screen_loaded {
+			self.installed
+				.iter()
+				.filter(|entry| {
+					entry.error.is_none() && !self.disabled.contains(&entry.manifest.id)
+				})
+				.filter_map(|entry| {
+					let action = entry
+						.manifest
+						.actions
+						.iter()
+						.find(|action| action.surface == Surface::Notification)?;
+					Some((entry.manifest.id.clone(), action.id.clone()))
+				})
+				.collect()
+		} else {
+			Vec::new()
+		};
+		self.notify.set_handlers(handlers);
+		// A run whose job was cancelled or belonged to an earlier session fails open.
+		if let Some((plugin, message)) = &self.notify_running
+			&& !self.pending.values().any(|pending| {
+				pending
+					.invocation
+					.as_ref()
+					.is_some_and(|(_, input, _)| input.notification.is_some())
+			}) {
+			self.notify.failed(plugin, message);
+			self.notify_running = None;
+		}
+		let Some(account) = account else {
+			return;
+		};
+		if self.notify_running.is_some() || self.host.as_ref().unwrap().busy() {
+			return;
+		}
+		let Some(request) = self.notify.next_request() else {
+			return;
+		};
+		self.notify_running = Some((request.plugin.clone(), request.input.message_id.clone()));
+		let invocation = Invocation {
+			action: request.action,
+			notification: Some(Box::new(request.input)),
+			..Default::default()
+		};
+		self.submit(
+			Job::Invoke {
+				id: request.plugin.clone(),
+				account: account.clone(),
+				invocation: invocation.clone(),
+			},
+			Some((
+				request.plugin,
+				invocation,
+				ExtensionContext::capture(state, false),
+			)),
+			state.generation,
+			ctx,
+			messaging,
+		);
+	}
+	/// Runs a media worker per enabled `media` plugin during a call: it hears the call start,
+	/// who joins and leaves, and the end, and its captions show in the call.
+	fn media_workers(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let call = state
+			.voice
+			.active
+			.as_ref()
+			.map(|call| call.channel)
+			.filter(|_| account.is_some() && self.start_screen_loaded);
+		let wanted: Vec<String> = match call {
+			Some(_) => self
+				.installed
+				.iter()
+				.filter(|entry| {
+					entry.error.is_none()
+						&& !self.disabled.contains(&entry.manifest.id)
+						&& entry
+							.manifest
+							.capabilities
+							.contains(&Capability::MediaWorker)
+						&& entry
+							.manifest
+							.actions
+							.iter()
+							.any(|action| action.surface == Surface::Media)
+				})
+				.map(|entry| entry.manifest.id.clone())
+				.collect(),
+			None => Vec::new(),
+		};
+		self.media.retain(|id, session| {
+			let keep = wanted.contains(id) && Some(session.channel) == call;
+			if !keep {
+				session.worker.push(
+					vec![extensions::MediaItem::Event {
+						time_us: session.started.elapsed().as_micros() as u64,
+						event: extensions::CallEvent::Ended,
+					}],
+					Vec::new(),
+				);
+			}
+			keep
+		});
+		if call.is_none() {
+			self.media_retry.clear();
+		}
+		let (Some(channel), Some(account)) = (call, account) else {
+			self.update_media_tap();
+			return;
+		};
+		let present: BTreeSet<model::Id> = state
+			.voice
+			.roster
+			.iter()
+			.filter(|entry| entry.channel == channel)
+			.map(|entry| entry.participant.user)
+			.collect();
+		let now = Instant::now();
+		self.media_retry.retain(|_, at| *at > now);
+		for id in &wanted {
+			if self.media.contains_key(id) || self.media_retry.contains_key(id) {
+				continue;
+			}
+			let repaint = ctx.clone();
+			// A worker that writes files gets a longer queue, so a disk that stalls for a
+			// moment does not cut holes into what it records.
+			let backlog = if self.installed.iter().any(|entry| {
+				entry.manifest.id == *id && entry.manifest.capabilities.contains(&Capability::Files)
+			}) {
+				extension_host::media::Backlog::FILES
+			} else {
+				extension_host::media::Backlog::LIVE
+			};
+			let worker = self.host.as_ref().unwrap().start_media(
+				id,
+				account,
+				backlog,
+				Arc::new(move || repaint.request_repaint()),
+			);
+			let guild = state.channel(channel).and_then(|channel| channel.guild);
+			let mut first = vec![extensions::MediaItem::Event {
+				time_us: 0,
+				event: extensions::CallEvent::Started {
+					channel_id: channel.0.to_string(),
+					guild_id: guild.map(|guild| guild.0.to_string()),
+				},
+			}];
+			if let Some(state) = self.media_states.get(id) {
+				first.push(extensions::MediaItem::State {
+					time_us: 0,
+					state: state.clone(),
+				});
+			}
+			worker.push(first, Vec::new());
+			self.media.insert(
+				id.clone(),
+				MediaSession {
+					worker,
+					channel,
+					participants: BTreeSet::new(),
+					started: now,
+					chunks: true,
+				},
+			);
+		}
+		let mut failed = Vec::new();
+		for (id, session) in &mut self.media {
+			let time_us = session.started.elapsed().as_micros() as u64;
+			let event = |event| extensions::MediaItem::Event { time_us, event };
+			let mut items: Vec<_> = present
+				.difference(&session.participants)
+				.map(|user| {
+					event(extensions::CallEvent::Joined {
+						user_id: user.0.to_string(),
+					})
+				})
+				.chain(session.participants.difference(&present).map(|user| {
+					event(extensions::CallEvent::Left {
+						user_id: user.0.to_string(),
+					})
+				}))
+				.collect();
+			items.truncate(extensions::media::MAX_MEDIA_ITEMS);
+			if !items.is_empty() {
+				session.worker.push(items, Vec::new());
+				session.participants.clone_from(&present);
+			}
+			while let Some(event) = session.worker.try_event() {
+				match event {
+					extension_host::media::MediaEvent::Captions(captions) => {
+						if let Some(entry) =
+							self.installed.iter().find(|entry| entry.manifest.id == *id)
+						{
+							messaging.call_captions.set(
+								id,
+								&entry.manifest.name,
+								captions,
+								Instant::now(),
+							);
+						}
+					}
+					extension_host::media::MediaEvent::Keyframes(streams) => {
+						for stream in streams {
+							let Some((kind, user)) = stream.split_once(':') else {
+								continue;
+							};
+							let source = match kind {
+								"camera" => discord_voice::tap::Source::Camera,
+								"screen" => discord_voice::tap::Source::Screen,
+								_ => continue,
+							};
+							if let Ok(user) = user.parse() {
+								discord_voice::tap::request_keyframe(source, user);
+							}
+						}
+					}
+					extension_host::media::MediaEvent::Chunks(chunks) => session.chunks = chunks,
+					extension_host::media::MediaEvent::Failed(error) => {
+						messaging.extensions.status =
+							format!("{id} stopped handling the call and restarts shortly. {error}");
+						failed.push(id.clone());
+					}
+				}
+			}
+		}
+		for id in failed {
+			self.media.remove(&id);
+			self.media_retry.insert(id, now + MEDIA_RETRY);
+		}
+		self.update_media_tap();
+	}
+	/// Keeps what a plugin tells its media worker, and hands it to the running one.
+	fn set_media_state(&mut self, id: &str, state: Option<serde_json::Value>) {
+		let Some(state) = state else {
+			return;
+		};
+		if let Some(session) = self.media.get(id) {
+			session.worker.push(
+				vec![extensions::MediaItem::State {
+					time_us: session.started.elapsed().as_micros() as u64,
+					state: state.clone(),
+				}],
+				Vec::new(),
+			);
+		}
+		self.media_states.insert(id.to_owned(), state);
+	}
+	/// Points the media tap at the running workers granted packets or audio that want them.
+	fn update_media_tap(&mut self) {
+		let targets = self
+			.media
+			.iter()
+			.filter_map(|(id, session)| {
+				let grants = &self
+					.installed
+					.iter()
+					.find(|entry| entry.manifest.id == *id)?
+					.manifest
+					.capabilities;
+				Some(crate::media_tap::Target {
+					plugin: id.clone(),
+					sender: session.worker.sender(),
+					packets: session.chunks && grants.contains(&Capability::MediaPackets),
+					audio: session.chunks && grants.contains(&Capability::MediaAudio),
+					own: grants.contains(&Capability::MediaOwn),
+					started: session.started,
+				})
+			})
+			.collect();
+		self.media_tap.set_targets(targets);
+	}
+	/// Opens the picker a plugin asked for, and saves what the user picked.
+	fn file_picker(
+		&mut self,
+		account: &Option<String>,
+		state: &State,
+		ctx: &egui::Context,
+		runtime: &tokio::runtime::Runtime,
+		window: &Arc<winit::window::Window>,
+		messaging: &mut ui::MessagingUi,
+	) {
+		if self.file_pick.is_none()
+			&& let Some((id, pick)) = self.pick_request.take()
+		{
+			let Some(name) = self
+				.installed
+				.iter()
+				.find(|entry| entry.manifest.id == id && !self.disabled.contains(&id))
+				.map(|entry| entry.manifest.name.clone())
+			else {
+				return;
+			};
+			let kind = match pick.kind {
+				extensions::PickKind::Folder => platform::save::Pick::Folder,
+				extensions::PickKind::File => platform::save::Pick::File,
+				extensions::PickKind::SaveFile => {
+					platform::save::Pick::Save(pick.name.clone().unwrap_or_default())
+				}
+			};
+			let (send, receive) = mpsc::sync_channel(1);
+			let future = platform::save::plugin_pick(
+				window.clone(),
+				kind,
+				format!("{name}: {}", pick.purpose),
+			);
+			let repaint = ctx.clone();
+			runtime.spawn(async move {
+				let _ = send.send(future.await);
+				repaint.request_repaint();
+			});
+			self.file_pick = Some((id, pick, receive));
+		}
+		let picked = match self
+			.file_pick
+			.as_ref()
+			.map(|(_, _, receive)| receive.try_recv())
+		{
+			Some(Ok(picked)) => picked,
+			Some(Err(mpsc::TryRecvError::Disconnected)) => None,
+			_ => return,
+		};
+		let Some((id, pick, _)) = self.file_pick.take() else {
+			return;
+		};
+		let connection = self.installed.iter().any(|entry| {
+			entry.manifest.id == id && entry.manifest.capabilities.contains(&Capability::ApiProxy)
+		});
+		match picked {
+			Some(path) => self.submit(
+				Job::AddFileHandle {
+					id,
+					account: account.clone(),
+					connection,
+					pick,
+					path,
+				},
+				None,
+				state.generation,
+				ctx,
+				messaging,
+			),
+			None => Self::pick_answer(
+				state,
+				messaging,
+				id,
+				pick.action,
+				("cancelled", "true".into()),
+			),
+		}
+	}
+	/// Runs the plugin's pick action with what became of its pick.
+	fn pick_answer(
+		state: &State,
+		messaging: &mut ui::MessagingUi,
+		id: String,
+		action: String,
+		value: (&str, String),
+	) {
+		messaging
+			.extensions
+			.requests
+			.push(ExtensionRequest::Invoke {
+				id,
+				invocation: Invocation {
+					action,
+					values: [(value.0.to_owned(), value.1)].into(),
+					..Default::default()
+				},
+				context: ExtensionContext::panel(state),
+			});
+	}
+	/// Shows a running plugin's caption lines while the user is in a call.
+	fn show_captions(
+		&self,
+		state: &State,
+		messaging: &mut ui::MessagingUi,
+		id: &str,
+		captions: Option<Vec<extensions::Caption>>,
+	) {
+		let Some(captions) = captions else {
+			return;
+		};
+		let Some(entry) = self.installed.iter().find(|entry| {
+			entry.manifest.id == id && entry.error.is_none() && !self.disabled.contains(id)
+		}) else {
+			return;
+		};
+		if state.voice.active.is_some() {
+			messaging
+				.call_captions
+				.set(id, &entry.manifest.name, captions, Instant::now());
+		}
+	}
+	/// Takes in a desktop alert for the enabled `notification` plugins.
+	pub fn offer_notification(&mut self, state: &State, alert: crate::notification_runtime::Alert) {
+		let crate::notification_runtime::Alert::Message {
+			channel,
+			message,
+			author,
+			direct,
+			title,
+			body,
+			avatar_key,
+			image_path,
+		} = alert;
+		self.notify.offer(
+			extension_host::notify::Alert {
+				source: extensions::NotificationSource::Gateway,
+				message,
+				channel,
+				guild: state.channel(channel).and_then(|channel| channel.guild),
+				author: Some(author),
+				direct,
+				title,
+				body,
+				extra: (avatar_key, image_path),
+			},
+			Instant::now(),
+		);
+	}
+	/// The next alert to show: shaped by its plugins, or as it stands once they were too slow.
+	pub fn take_notification(
+		&mut self,
+		ctx: &egui::Context,
+	) -> Option<extension_host::notify::Ready<(String, Option<String>)>> {
+		if let Some(wait) = self.notify.expire(Instant::now()) {
+			ctx.request_repaint_after(wait);
+		}
+		self.notify.take_ready()
+	}
+	/// Drops alerts still waiting for plugins after a read, mute or connection change.
+	pub fn dismiss_notifications(&mut self) {
+		self.notify.dismiss(false);
+	}
+	fn topic_action(entry: &InstalledExtension) -> Option<&str> {
+		entry
+			.manifest
+			.actions
+			.iter()
+			.find(|action| action.surface == Surface::Topic)
+			.map(|action| action.id.as_str())
+	}
+	/// Hands the broker the approved subscriptions whose plugins both run, and starts one
+	/// topic delivery when a subscriber has messages waiting.
+	fn topics(
+		&mut self,
+		account: &Option<String>,
+		generation: u64,
+		ctx: &egui::Context,
+		messaging: &mut ui::MessagingUi,
+	) {
+		let running = |id: &str| {
+			self.installed.iter().any(|entry| {
+				entry.manifest.id == id && entry.error.is_none() && !self.disabled.contains(id)
+			})
+		};
+		let live: BTreeSet<_> = if account.is_some() && self.start_screen_loaded {
+			self.subscriptions
+				.iter()
+				.filter(|subscription| {
+					running(&subscription.subscriber) && running(&subscription.provider)
+				})
+				.cloned()
+				.collect()
+		} else {
+			BTreeSet::new()
+		};
+		let broker = self.host.as_ref().unwrap().broker();
+		if live != self.live_subscriptions {
+			broker.set_subscriptions(live.clone());
+			self.live_subscriptions = live;
+		}
+		let Some(account) = account else {
+			return;
+		};
+		if self.host.as_ref().unwrap().busy()
+			|| !self.message_events.is_empty()
+			|| self
+				.pending
+				.values()
+				.any(|pending| pending.delivery.is_some())
+		{
+			return;
+		}
+		let now = Instant::now();
+		self.topic_retry.retain(|_, at| *at > now);
+		let Some((id, action)) = broker.pending().into_iter().find_map(|id| {
+			if self.topic_retry.contains_key(&id) {
+				return None;
+			}
+			let entry = self
+				.installed
+				.iter()
+				.find(|entry| entry.manifest.id == id)?;
+			Some((id.clone(), Self::topic_action(entry)?.to_owned()))
+		}) else {
+			if let Some(next) = self.topic_retry.values().min() {
+				ctx.request_repaint_after(next.saturating_duration_since(now));
+			}
+			return;
+		};
+		let job = Job::Invoke {
+			id: id.clone(),
+			account: account.clone(),
+			invocation: Invocation {
+				action,
+				..Default::default()
+			},
+		};
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
+			Ok(token) => {
+				self.pending.insert(
+					token,
+					Pending {
+						catalog: false,
+						theme_save: false,
+						generation,
+						cleanup: false,
+						reconcile: false,
+						preview: None,
+						invocation: None,
+						tick: None,
+						delivery: Some(id),
+					},
+				);
+			}
+			Err(error) => messaging.extensions.report_error(error),
+		}
 	}
 	fn schedule_ticks(
 		&mut self,
@@ -1560,7 +2784,7 @@ impl Bridge {
 						..Default::default()
 					},
 				};
-				match self.host.as_mut().unwrap().submit(job, ctx) {
+				match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
 					Ok(token) => {
 						self.pending.insert(
 							token,
@@ -1573,6 +2797,7 @@ impl Bridge {
 								preview: None,
 								invocation: None,
 								tick: Some(id),
+								delivery: None,
 							},
 						);
 					}
@@ -1645,7 +2870,7 @@ impl Bridge {
 		let catalog = matches!(job, Job::RefreshCatalog);
 		let reconcile =
 			cleanup || theme_save || matches!(job, Job::Enable { .. } | Job::SelectTheme { .. });
-		match self.host.as_mut().unwrap().submit(job, ctx) {
+		match self.host.as_mut().unwrap().submit(job, &repaint(ctx)) {
 			Ok(token) => {
 				self.pending.insert(
 					token,
@@ -1658,6 +2883,7 @@ impl Bridge {
 						generation,
 						invocation,
 						tick: None,
+						delivery: None,
 					},
 				);
 			}
@@ -1693,6 +2919,20 @@ impl Bridge {
 	}
 
 	fn entries(&self, messaging: &mut ui::MessagingUi) {
+		messaging.extensions.catalog_origins = self
+			.catalog
+			.iter()
+			.filter_map(|(id, entry)| {
+				let source = entry.catalog_source.as_deref()?;
+				let name = messaging
+					.extensions
+					.catalog_sources
+					.iter()
+					.find(|status| status.source.id == source)
+					.map_or(source, |status| status.source.name.as_str());
+				Some((id.clone(), name.to_owned()))
+			})
+			.collect();
 		messaging.extensions.active_theme = self
 			.installed
 			.iter()
@@ -1810,6 +3050,15 @@ impl Bridge {
 		invocation: (Invocation, ExtensionContext),
 	) {
 		let (invocation, context) = invocation;
+		self.show_captions(state, messaging, id, output.captions.take());
+		self.set_media_state(id, output.media_state.take());
+		if let Some(pick) = output.pick.take() {
+			if self.file_pick.is_some() || self.pick_request.is_some() {
+				messaging.extensions.status = "Finish the open folder or file picker first.".into();
+			} else {
+				self.pick_request = Some((id.to_owned(), pick));
+			}
+		}
 		if context.is_current(state)
 			&& let Some(appearance) = &output.appearance
 		{
@@ -1845,11 +3094,15 @@ impl Bridge {
 			installed.interface_tweaks.clone_from(tweaks);
 		}
 		// Every result restates the plugin's interface: a tree replaces the one shown, and
-		// its absence restores the normal layout.
-		if let Some(installed) = self
-			.installed
-			.iter_mut()
-			.find(|entry| entry.manifest.id == id)
+		// its absence restores the normal layout. Hooks cannot return one, so keep it.
+		let hook = invocation.send_target.is_some()
+			|| invocation.annotate.is_some()
+			|| invocation.page_request.is_some();
+		if !hook
+			&& let Some(installed) = self
+				.installed
+				.iter_mut()
+				.find(|entry| entry.manifest.id == id)
 		{
 			installed.interface_ui.clone_from(&output.interface_ui);
 		}
@@ -1972,6 +3225,7 @@ mod tests {
 				preview: None,
 				invocation: None,
 				tick: Some("rainbow".into()),
+				delivery: None,
 			},
 		);
 		assert!(bridge.tick_pending(7, "rainbow"));
@@ -2230,6 +3484,10 @@ mod tests {
 			license: "MIT".into(),
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
+			network: Vec::new(),
+			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![
 				Capability::InterfaceUi,
 				Capability::AppEvents,
@@ -2341,6 +3599,10 @@ mod tests {
 			license: "MIT".into(),
 			source: "https://example.org/source".into(),
 			kind: extensions::ExtensionKind::Plugin,
+			network: Vec::new(),
+			secrets: Vec::new(),
+			broadcasts: Vec::new(),
+			subscribes: Vec::new(),
 			capabilities: vec![Capability::InterfaceUi, Capability::StartScreen],
 			actions: vec![
 				extensions::Action {
@@ -2542,7 +3804,7 @@ mod tests {
 				freshness: model::Freshness::Fresh,
 			}),
 		};
-		let changes = crate::extension_data_events::Changes::capture(&state, &envelope);
+		let changes = extension_host::data_events::Changes::capture(&state, &envelope);
 		bridge.data_changed(changes);
 		bridge.app_events(&state, &messaging);
 		assert_eq!(bridge.message_events.len(), 1);
@@ -2732,6 +3994,7 @@ mod tests {
 			source_commit: "c".repeat(40),
 			download_bytes: 100,
 			release_url: "https://example.org/release.json".into(),
+			catalog_source: None,
 		};
 		let starter = Starter {
 			source: InstallSource::Bundled {

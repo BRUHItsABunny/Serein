@@ -271,6 +271,34 @@ pub fn safe_filename(filename: &str) -> String {
 	}
 }
 
+/// What a plugin asks the user to pick.
+pub enum Pick {
+	Folder,
+	File,
+	/// A file to write, with a suggested name.
+	Save(String),
+}
+
+/// A folder or file the user picks for a plugin; `title` says which plugin and why.
+pub fn plugin_pick(
+	parent: Arc<winit::window::Window>,
+	pick: Pick,
+	title: String,
+) -> impl std::future::Future<Output = Option<PathBuf>> + Send + 'static {
+	let dialog = rfd::AsyncFileDialog::new()
+		.set_parent(parent.as_ref())
+		.set_title(title);
+	async move {
+		let picked = match pick {
+			Pick::Folder => dialog.pick_folder().await,
+			Pick::File => dialog.pick_file().await,
+			Pick::Save(name) => dialog.set_file_name(name).save_file().await,
+		};
+		drop(parent);
+		Some(picked?.path().to_owned())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[test]

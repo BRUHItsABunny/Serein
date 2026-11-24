@@ -2155,6 +2155,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
+name = "extension-host"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "client-core",
+ "egui",
+ "extensions",
+ "futures-util",
+ "getrandom 0.4.3",
+ "image",
+ "model",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "test-support",
+ "tokio",
+ "url",
+ "wat",
+ "wreq",
+ "zeroize",
+]
+
+[[package]]
 name = "extensions"
 version = "0.1.0"
 dependencies = [
@@ -6403,6 +6427,7 @@ dependencies = [
  "discord-voice",
  "eframe",
  "egui-winit",
+ "extension-host",
  "extensions",
  "find-msvc-tools",
  "fontique 0.11.1",
@@ -7680,6 +7705,7 @@ dependencies = [
  "client-core",
  "diagnostics",
  "egui",
+ "extension-host",
  "extensions",
  "fluent-templates",
  "image",

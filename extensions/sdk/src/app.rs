@@ -978,6 +978,27 @@ pub enum HostEffect {
 	SetNotificationSettings {
 		settings: NotificationSettingsPatch,
 	},
+	/// Switches the proposing plugin's own message hooks in one conversation (Preview):
+	/// its notes under messages, and its send hook, which replaces another plugin's there.
+	/// `send: None` switches the send hook off; both off ends the plugin's hooks there.
+	/// Needs `message_annotations` for notes and `send_hook` for the send hook.
+	SetChannelHooks {
+		channel_id: String,
+		#[serde(default)]
+		notes: bool,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		send: Option<SendHookMode>,
+	},
+}
+
+/// How a send hook switched on by [`HostEffect::SetChannelHooks`] sends the rewrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendHookMode {
+	/// The rewrite waits in the composer for the user to send it.
+	Preview,
+	/// The rewrite is sent at once.
+	Auto,
 }
 
 use crate::{Invocation, MessageEvent, Output};

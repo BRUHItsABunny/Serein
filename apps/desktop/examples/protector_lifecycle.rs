@@ -1,11 +1,9 @@
-#[allow(dead_code)]
-#[path = "../src/extensions.rs"]
-mod host;
 use client_core::{Envelope, Event};
-use eframe::egui;
+use extension_host::store as host;
 
 fn job(host: &mut host::ExtensionHost, job: host::Job) -> host::Event {
-	host.submit(job, &egui::Context::default()).unwrap();
+	let wake: host::Wake = std::sync::Arc::new(|| {});
+	host.submit(job, &wake).unwrap();
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
 	loop {
 		if let Some((_, outcome)) = host.poll() {
@@ -128,7 +126,8 @@ fn main() {
 			host::Job::Disable {
 				id: "message-delete-protector".into(),
 				kind: extensions::ExtensionKind::Plugin,
-				account
+				account,
+				delete_data: true,
 			}
 		),
 		host::Event::Disabled(_)

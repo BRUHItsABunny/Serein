@@ -271,7 +271,7 @@ messages, 100 entries each and 64 participant IDs respectively. The voice roster
 up to 128 tracked participants with names and flags across voice channels the account
 can view, on its own 16-KiB byte budget within the snapshot. A simultaneous
 `message_details` grant lowers the timeline row limit to 20, retaining its 20-KiB
-byte budget and the shared 10-million Wasm fuel limit; valid wire size alone does not
+byte budget and the shared Wasm fuel limit (10 million plus 150 per input byte); valid wire size alone does not
 guarantee execution fits the fuel budget. Collector budgets
 include item overhead and escaped text: 10 KiB channels (plus 48 KiB and up to 250
 channels for the focus server, trimmed from the end to keep the snapshot within
@@ -645,8 +645,9 @@ account-isolated; declarative themes are device preferences. Up to eight install
 themes remain available in Colour preset; switching only changes the bounded
 64-byte active theme identifier and retains the packages. Installation,
 validation, invocation storage and removal run on a bounded background worker.
-Disabling removes Serein's package and extension data, and failed cleanup is
-reported and retried. Logout removes the account's plugin data. Imported
+Disabling removes Serein's package and, when the user chooses, the plugin's data;
+failed cleanup is reported and retried. Logout removes the account's plugin packages
+and grants; plugin data is kept (see "Plugin data lifecycle" below). Imported
 original files and source repositories are never deleted. No credentials belong
 in plugin storage; it is not encrypted. Only bounded metadata may remain after
 successful disable. Shop descriptions and optional preview URLs/hashes belong to
@@ -702,8 +703,8 @@ written directly to Discord through the existing authenticated transport, never 
 settings file. Relationship state keeps at most 4000 fixed ID/bool entries with a 128 KiB
 estimated allocation ceiling; only one fixed-size action may be pending. DM mute state reuses
 the existing bounded notification overrides. Logout clears both with other account RAM state.
-Closing a DM preserves its local draft. Accepted navigation removal uses the existing account
-history invalidation path, which can clear other cached history but preserves drafts. The
+Closing a DM preserves its local draft. Accepted navigation removal deletes only the removed
+conversations' cached history (see "Scoped history deletion" below) and preserves drafts. The
 standalone offline fixture changes synthetic RAM only and issues no service or storage writes.
 
 Current reply metadata schema is 10. It adds one constrained reply_deleted boolean to each
@@ -859,7 +860,7 @@ Microphone gain and speaker volume are saved bounded integer percentages (0..=20
 initially 100. System mixer settings are unchanged. Two callback atomics hold active levels;
 no audio is retained. Preview levels remain session-only.
 
-Loaded thread navigation shares the 4,000-entry account navigation and 4 MiB normalized navigation budgets. Incoming thread syncs additionally cap combined parent/thread entries at 4,000 and normalized snapshot metadata at 2 MiB; wire JSON remains capped at 4 MiB. Removed-member arrays are capped at 4,000 and are discarded after checking the owner. Navigation/member lists are session-only; selected thread messages/drafts reuse existing account history/draft storage. Actual accepted thread removals enqueue the existing account-wide history clear, preserving drafts; ignored, empty-scope and rename-only events do not clear disk history. This coarse invalidation trades refetch cost for simpler deletion, without new tables or workers.
+Loaded thread navigation shares the 4,000-entry account navigation and 4 MiB normalized navigation budgets. Incoming thread syncs additionally cap combined parent/thread entries at 4,000 and normalized snapshot metadata at 2 MiB; wire JSON remains capped at 4 MiB. Removed-member arrays are capped at 4,000 and are discarded after checking the owner. Navigation/member lists are session-only; selected thread messages/drafts reuse existing account history/draft storage. Actual accepted thread removals delete only those threads' cached history, preserving drafts; ignored, empty-scope and rename-only events do not clear disk history.
 
 Draft undo snapshots stay in memory for the active composer. They use egui's
 bounded undo stack and are discarded when the conversation or session changes.
@@ -1074,9 +1075,8 @@ account, selected server and query changes invalidate results; navigation/sessio
 reset releases the cache. No catalog strings or image pixels are duplicated.
 
 
-Channel obfuscation and accepted READY removals invalidate inaccessible history using the existing
-account-wide ClearHistory operation; readable-to-unsupported channel changes count as removal.
-This deliberately trades a broader history refetch for no new per-channel deletion API. Cache
+Channel obfuscation and accepted READY removals delete the inaccessible conversations' cached
+history only; readable-to-unsupported channel changes count as removal. Cache
 hydration requires the current request, a pending empty loading view, a loaded text channel and
 matching message channel IDs. Late disk/HTTP responses cannot refill a revoked view. Drafts remain
 available for recovery. This does not erase explicit downloaded files or promise deletion of
@@ -1094,8 +1094,8 @@ RSS. Decisions expire at timeout boundaries, are recomputed after clock rollback
 cleared on metadata updates. Logout/READY replace the session mirror.
 
 Current VIEW and READ_MESSAGE_HISTORY are required for HTTP/cache admission and history
-persistence. Read-access loss, including thread parent/type changes, queues the existing
-account-wide ClearHistory operation. Sending-only permission changes do not erase cached
+persistence. Read-access loss, including thread parent/type changes, deletes only the affected
+conversations' cached history. Sending-only permission changes do not erase cached
 history. VIEW-only live messages stay in the bounded RAM timeline without being persisted.
 Existing recovery drafts and explicitly downloaded files keep their documented lifecycle.
 No schema change or external runtime dependency is added; UI tests reuse the existing
@@ -1935,8 +1935,8 @@ Only a plugin granted `api_proxy` (and optionally `storage`) uses the global
 `extensions/proxy-plugins` directory. These plugins have no account snapshot,
 message, file or networking grants and may run before authentication. Account
 plugins retain their existing account isolation; account logout does not erase a
-connection plugin. Explicit disable removes its package/data using the existing
-bounded cleanup path and restores the remaining selected route or Direct.
+connection plugin. Explicit disable removes its package, and its data when the user
+chooses, using the existing bounded cleanup path and restores the remaining selected route or Direct.
 
 One validated mode and at most 2,048 UTF-8 bytes of credential-free endpoint
 configuration are coalesced in a watch channel. The API task caches the current
@@ -2136,3 +2136,153 @@ reused; a full active tracker returns a local capacity failure. Session teardown
 drops the tracker. The existing semaphore allows at most four admitted REST
 requests; caller queues retain their own bounds. There is no new disk storage
 or logging.
+
+## Plugin databases (preview, November 21, 2026)
+
+A plugin granted `database` gets one SQLite file, `data.sqlite`, in its existing
+per-account (or, for connection plugins, global) extension directory. SQLite caps
+the file at its quota through the page count (64 MiB unless the user picks 256 MiB,
+1 GiB, 4 GiB or 16 GiB), and Serein uses the default rollback journal
+beside it during a write. Every invocation opens the file on first use with a 2 MiB
+page cache and closes it when the invocation ends. Its writes form one transaction
+that is committed only after the output is accepted. Temporary tables are refused,
+and sort spill files are SQLite's own short-lived temporary files. Requests and
+replies are each at most 256 KiB, so one pending reply is held in RAM at a time.
+The file lives in the plugin's data directory; see "Plugin data lifecycle". The file is not encrypted and must not hold
+credentials. A failed open, a full file or an exhausted SQLite budget is reported to
+the plugin, and the invocation's changes are discarded.
+
+## Message journal (preview, November 21, 2026)
+
+While an enabled plugin in the current account holds `message_journal`, Serein records
+live gateway message creates, edits and deletes for every readable conversation, plus
+session, gap and channel hints, to `journal.sqlite` in the account's extension
+directory (WAL mode). Records are built on the UI thread without I/O and passed to one
+writer thread through a 1,024-record queue. A full queue or a failed write becomes an
+`overflow` gap instead of blocking. Entries hold message text, author IDs and names, and
+attachment names and URLs. Edits and deletes carry the earlier version only when it
+was loaded in memory. Each entry is at most 64 KiB, and the journal at most 100,000
+unread entries / 64 MiB, pruning the oldest into a gap.
+Entries every consuming plugin has read are deleted at the next write; a channel table
+keeps the latest journaled message ID for at most 10,000 channels to report `missed`
+entries. Nothing is recorded without a consumer. Disabling a plugin drops its cursor.
+The file lives with the account's plugin data, so logout keeps it. Not encrypted.
+
+## Plugin secrets (preview, November 21, 2026)
+
+Secret values a user enters for a plugin are stored only in the OS credential store,
+under the Serein service with a `plugin-secret.<account key or connection>/<plugin>/<secret>`
+name; the account key is the existing hash, not the account ID. The plugin's
+`settings.json` records only which secret IDs are set, so deleting the data can remove
+them. Values are at most 4,096 characters, are never written to plugin data, journals,
+logs or diagnostics, and are read on the extension worker only to fill a request. No OS
+store means no plugin secrets; there is no plaintext fallback. The demo keeps them in
+process memory.
+
+## Plugin broadcasts (preview, November 21, 2026)
+
+Approved provider/subscriber/topic connections are saved per account in
+`extensions/plugin-data/<account key>/subscriptions.json` (at most 64 entries, 64 KiB).
+Broadcast payloads exist only in RAM: one queue per subscriber of at most 64 messages /
+256 KiB plus at most 16 gap markers, each payload at most 16 KiB. Nothing is written to
+disk, journaled or replayed; scope changes, logout and revoked connections discard queued
+messages, and disabling either plugin removes its saved connections.
+
+## Plugin message hooks (preview, November 21, 2026)
+
+The channels where the user switched on a plugin's send hook or annotations are saved per
+account in `extensions/plugin-data/<account key>/hooks.json`: channel IDs, plugin IDs and
+the chosen mode and fallback, at most 512 channels and 256 KiB. Disabling a plugin removes
+it from the file. Drafts and messages handed to hooks are not stored by the host. Notes
+plugins return live only in RAM, at most 2,000 messages and 2 MiB of notes with the
+oldest dropped first, and are cleared on logout or an account switch; which messages each
+plugin was given is remembered in RAM for at most 4,096 messages.
+
+## Plugin attachment archive (preview, November 22, 2026)
+
+Attachments a `media_archive` plugin fetches are saved in its private folder
+(`extensions/plugin-data/<account key>/<id>/files/`), count against its data limit and
+follow its data's lifecycle: kept on disable or logout unless the user deletes the data.
+At most 100 MiB per file; a download in progress lives as `<path>.part` and is removed on
+failure. The queue (256 fetches per plugin, 1,024 in all) and the last 256 outcomes per
+plugin live in RAM only and are dropped when the plugin is disabled or its account logs
+out.
+
+## Scoped history deletion (November 22, 2026)
+
+Losing one conversation no longer clears the account's whole history cache. When channels
+are removed or become unreadable, when one channel or server becomes unavailable (with its
+threads), when the user is removed from a group DM, or when the open conversation's history
+or reactions are refused, only those channels' cached messages, channel rows and history
+starts are deleted, in one transaction of at most 512 channels. Drafts stay. A failed
+deletion disables the history cache until restart, like other deletions. A session-wide
+reset (resync or a permission model reset) still clears the account's cached history.
+
+## Catalog sources (preview, November 22, 2026)
+
+Added catalog sources are saved device-wide in `extensions/sources.json` (at most 8, read
+up to 64 KiB): ID, name, catalog address, token origins, the refresh choice and whether a
+token is saved. Tokens live only in the OS credential store, under the source's ID, and
+are forgotten when the source is removed or its address changes. Each source's last valid
+catalog is cached in `extensions/sources/<id>.json` within the 1 MiB catalog bound and
+removed with the source.
+
+## Plugin media taps (preview, November 22, 2026)
+
+Nothing is written to disk by the host. While a `media_packets` or `media_audio` worker
+runs, the voice transport copies decrypted remote packets into one RAM queue of at most
+4,096 packets or 16 MiB, drained every 20 ms; packets that do not fit are counted, not
+kept. Turning the tap off discards the queue. Audio conversion keeps one Opus decoder per
+stream, for at most twice the participant limit.
+
+## Plugin media workers (preview, November 22, 2026)
+
+Nothing is written to disk by the host. Each running media worker holds its plugin
+instance (at most 64 MiB of Wasm memory) and a queue of at most 32 batches or 16 MiB, the
+oldest dropped first, plus the call's participant IDs. All of it ends with the call, the
+plugin or the account.
+
+## Plugin files (preview, November 21, 2026)
+
+A `files` plugin's private folder is `extensions/plugin-data/<account key>/<id>/files/`,
+bounded by the plugin's data limit (64 MiB by default, up to 16 GiB) and measured with a
+scan of at most 100,000 entries. It is kept on disable or logout like other plugin data
+and removed when the user deletes the data. Picked folders and files are recorded in
+the plugin's `settings.json` (at most 16, with their full paths, kinds, write flag and
+purpose; the file is read up to 64 KiB). Removing a pick deletes only the record; the
+user's files stay. Files the plugin writes into picked folders are the user's and are
+not bounded or removed by Serein.
+
+## Plugin call captions and message history (preview, November 21, 2026)
+
+Nothing is written to disk. Earlier versions and kept deleted rows plugins return share
+the RAM budget of notes (2,000 messages, 2 MiB). Caption lines live in RAM, at most four
+lines from two plugins, and are dropped 10 seconds after the plugin's last update, when
+the call ends, the plugin stops or the account changes.
+
+## Plugin pages (preview, November 21, 2026)
+
+Nothing is written to disk. An open page and its fetched rows live in RAM, at most 2,000
+rows and 8 MiB with the rows farthest from view dropped first, and are discarded when the
+page closes, its list version changes, the plugin stops or the account changes.
+
+## Plugin notification hook (preview, November 21, 2026)
+
+Nothing is written to disk. Alerts waiting for `notification` plugins stay in RAM, at most
+16 and only for 1.5 s before they are shown; a late answer can replace one for 10 s more.
+Deduplication remembers the IDs and sources of the last 512 alerted messages in RAM,
+cleared on logout or an account switch.
+
+## Plugin data lifecycle (preview, November 21, 2026)
+
+Plugin data moves out of package directories into `extensions/plugin-data/<account key>/<id>/`
+(`connection/<id>/` for connection plugins): `data.json`, `data.sqlite` with its rollback
+journal, and a `settings.json` of at most 1 KiB holding the chosen database quota. Older
+layouts are moved on first load or invocation; an existing new copy is never overwritten.
+The account's `journal.sqlite` lives in the same account directory. Updating, logging out
+and reinstalling keep this data; logout still removes the account's packages and grants.
+Disabling asks the user to keep or delete the data. Settings > Extensions lists data
+directories of plugins that are not installed (at most 256 per scope, sizes summed over at
+most 64 files each) with a delete action. Kept data per plugin is bounded by the existing
+1 MiB storage and the chosen database quota (at most 16 GiB). The number of kept plugins
+and logged-out accounts is not capped; the user deletes them from that list. Not encrypted.

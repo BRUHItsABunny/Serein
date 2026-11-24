@@ -1,0 +1,179 @@
+//! Message hooks (preview): rewrite drafts before they are sent and add notes under messages.
+//! Both run only in channels where the user switched the plugin on.
+use crate::{Invocation, Output};
+use serde::{Deserialize, Serialize};
+
+/// Most messages in one [`AnnotateBatch`], and most notes one result may return.
+pub const MAX_ANNOTATE_MESSAGES: usize = 25;
+/// Largest note under one message, in UTF-8 bytes.
+pub const MAX_ANNOTATION_BYTES: usize = 4 * 1024;
+
+/// Input of a [`crate::Surface::Send`] action. The draft is in `invocation.composer`; return
+/// the text to send in `Output::replacement`, or `None` to send the draft unchanged. Whether
+/// the user reviews the rewrite first is their choice per channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendInvocation {
+	#[serde(flatten)]
+	pub invocation: Invocation,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub send_target: Option<SendTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendTarget {
+	pub channel_id: String,
+	/// Absent in direct and group messages.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub guild_id: Option<String>,
+}
+
+/// Input of a [`crate::Surface::Annotate`] action.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotateInvocation {
+	#[serde(flatten)]
+	pub invocation: Invocation,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotate: Option<AnnotateBatch>,
+}
+
+/// Up to [`MAX_ANNOTATE_MESSAGES`] messages of one channel, oldest first: new and edited
+/// messages, and the latest ones when the user opens the channel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotateBatch {
+	pub channel_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub guild_id: Option<String>,
+	pub messages: Vec<AnnotateMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotateMessage {
+	pub message_id: String,
+	pub author_id: String,
+	pub content: String,
+	/// The message was edited since it was last given to this plugin.
+	#[serde(default)]
+	pub edited: bool,
+}
+
+/// A note shown under a message; empty `text` removes this plugin's note.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Annotation {
+	pub message_id: String,
+	pub text: String,
+}
+
+/// Earlier versions of a message, oldest first, shown behind its "edited" label; an empty
+/// list removes your history for it. At most 8 versions of 4 KiB each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageHistory {
+	pub message_id: String,
+	pub revisions: Vec<crate::PageRevision>,
+}
+
+/// Deleted messages you kept, shown as deleted rows under the message they followed; an
+/// empty list removes your rows there. At most 25 rows per result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedMessages {
+	pub after_message_id: String,
+	pub messages: Vec<DeletedMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedMessage {
+	/// Must not be one of the messages you were given.
+	pub message_id: String,
+	pub author: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub time_ms: Option<i64>,
+	pub text: String,
+	/// When it was deleted, shown with the row.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deleted_ms: Option<i64>,
+	/// Its earlier versions, oldest first, at most 8, shown above its last text.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub revisions: Vec<crate::PageRevision>,
+}
+
+/// Output of an `annotate` action, or of a `message` action annotating the chosen message.
+/// Each note, history, alternate and deleted-row anchor must name a message the action was
+/// given.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotationOutput {
+	#[serde(flatten)]
+	pub output: Output,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub annotations: Vec<Annotation>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub histories: Vec<MessageHistory>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub deleted_messages: Vec<DeletedMessages>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub alternates: Vec<Alternate>,
+}
+
+/// Text shown in place of a message, such as its translation, with a toggle back to the
+/// message itself. Empty `text` removes yours. At most 4 KiB of text, line breaks allowed,
+/// and a label of at most 64 bytes, such as "Translation".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alternate {
+	pub message_id: String,
+	pub label: String,
+	pub text: String,
+}
+
+/// Output of a `send` action: the rewrite in `output.replacement`, and optionally a second
+/// message sent right after the first is confirmed, in the same channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendOutput {
+	#[serde(flatten)]
+	pub output: Output,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub follow_up: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn hook_inputs_decode_and_annotations_flatten_into_the_output() {
+		let send: SendInvocation = serde_json::from_str(
+			r#"{"action":"send","composer":"hallo","send_target":{"channel_id":"20"}}"#,
+		)
+		.unwrap();
+		assert_eq!(send.invocation.composer.as_deref(), Some("hallo"));
+		assert_eq!(send.send_target.unwrap().channel_id, "20");
+		let batch: AnnotateInvocation = serde_json::from_str(
+			r#"{"action":"notes","annotate":{"channel_id":"20","messages":[
+				{"message_id":"1","author_id":"2","content":"hola"}]}}"#,
+		)
+		.unwrap();
+		assert!(!batch.annotate.unwrap().messages[0].edited);
+		let output = serde_json::to_value(AnnotationOutput {
+			annotations: vec![Annotation {
+				message_id: "1".into(),
+				text: "hello".into(),
+			}],
+			..Default::default()
+		})
+		.unwrap();
+		assert_eq!(output["annotations"][0]["text"], "hello");
+		assert!(
+			output.get("panel").is_some(),
+			"Output fields stay flattened"
+		);
+		let send = serde_json::to_value(SendOutput {
+			output: Output {
+				replacement: Some("hi".into()),
+				..Default::default()
+			},
+			follow_up: Some("hola".into()),
+		})
+		.unwrap();
+		assert_eq!(
+			(send["replacement"].as_str(), send["follow_up"].as_str()),
+			(Some("hi"), Some("hola"))
+		);
+	}
+}

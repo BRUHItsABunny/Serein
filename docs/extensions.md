@@ -42,6 +42,30 @@ Plugin grants and data belong to the signed-in account, except the narrow
 plugin results, drains bounded in-flight work and clears that account's extension data. Theme selection is a device
 preference. There is no periodic background polling or automatic package update.
 
+## Catalog sources (preview)
+
+Settings > Extensions > **Catalog sources** adds up to 8 catalogs beside the built-in one,
+such as a private plugin repository. A source has a name, a catalog address (public
+HTTPS, the same format as `extensions/catalog.json`), an optional token, optional extra
+origins the token may go to, and whether it refreshes with the built-in catalog; one that
+does not refreshes only from its **Refresh** button.
+
+- **Tokens** are saved in the system credential store, never in `sources.json`. A token is
+  sent as `Authorization: Bearer` only to the catalog's own origin and the listed origins,
+  checked on every redirect hop, so a redirect elsewhere, such as GitHub's signed release
+  storage, goes without it. Changing a source's address or token origins forgets its
+  token unless a new one is entered. Preview images are always fetched without a token.
+- **Packages** keep the catalog's pinned SHA-256 and size, and downloads keep the public
+  address and redirect rules of the built-in catalog.
+- **Entries** from a source show "from <source>" on their card. An ID the built-in catalog
+  already lists is skipped, and a catalog cannot claim a source for its entries. Installed
+  packages update from the catalog they came from, like built-in ones.
+- **GitHub**: requests to `api.github.com` ask for raw file contents (`/contents/`) and
+  release assets (`/releases/assets/`). A repository can publish with
+  [`extensions/templates/publish-plugin.yml`](../extensions/templates/publish-plugin.yml),
+  then be added with `https://api.github.com/repos/OWNER/REPO/contents/catalog.json` and,
+  if private, a fine-grained token with read access to its contents.
+
 ## Creator workflow
 
 1. Keep source and license in a public Git repository. Use the standalone Rust
@@ -127,7 +151,7 @@ Unknown API versions and invalid packages are rejected before installation.
 
 Each capability is independent and requires user consent. An update requests
 renewed consent; adding a read grant does not grant commands. The SDK currently
-supports 58 capabilities, with at most 64 distinct declarations per manifest.
+supports 73 capabilities, with at most 96 distinct declarations per manifest.
 `external_navigation` and `style.icon_size` are Preview APIs from PR #937, not yet released.
 
 > **Preview SDK — PR #411, not yet released.** `channel_control`,
@@ -172,10 +196,26 @@ supports 58 capabilities, with at most 64 distinct declarations per manifest.
 | `clipboard_write` | Propose replacing clipboard text | At most 4,096 bytes; requires Apply; no clipboard read |
 | `voice_control` | Propose mute/deafen, leaving or watching/stopping a participant stream | Each command requires Apply and the same current call |
 | `app_events` | Observe ready/navigation/context/connection/voice/settings changes | Other grants control accompanying data; no background commands |
-| `context_menus` | Add actions to user, channel, server and role context menus | The invocation names the clicked item by ID (a role adds its name and color); results follow the action's other grants |
+| `context_menus` | Add actions to user, channel, server and role context menus, and (Preview) a `call` action to the call controls' More menu | The invocation names the clicked item by ID (a role adds its name and color; a call names its channel); results follow the action's other grants |
 | `interface_tweaks` | Switch on host-defined interface tweaks such as still typing dots, plain profiles, always-expanded roles, hidden request counts, one alert per direct conversation until read, hidden messages from blocked users, hidden profile notes, a larger stream preview or double-click to reply or edit | Activation and panel results only; a tweak stays on while any enabled plugin requests it and switches off when that plugin is disabled, fails or the account logs out |
 | `interface_ui` | Replace the client's main panes with a bounded declarative row tree (indent, generic icon, tint, badge, emphasis, selected) whose rows may also carry a native voice join; row clicks invoke the plugin's declared `interface_click` panel action (the one reserved action id allowed to contain `_`) with the row id and a double-click flag, which Enter on a focused row or dock item also sets as the primary open action (Space is a single click), and `window` shows one native window beside the tree: the active call's stage or an accessible channel's conversation view; `dock` adds small server tiles at the left of the tree pane's bottom control row (the loaded server's icon via `guild_id`, or the label's initials when unknown, with hover labels, a selected ring and row-like click routing), and `add_server` appends the client's own native add-a-server button after them; `controls` picks the native buttons at the right of that row, left to right, from `disconnect` (only during a call), `mute`, `deafen` and `settings`, and the host always appends `settings` when missing so the plugin can still be turned off; a `native` join row shows the loaded voice channel's real name and, with `voice_connect`, its double click or Enter joins through the client's own join path (current mute and deafen, call-switch confirmation) with no Apply step, since the double-clicked host-labelled row is the confirmation (an unknown, non-voice or hidden channel leaves the row inert with the plugin's text); `size` asks for a window size while the layout shows | Activation, panel and event results restate the tree; `None` restores the normal layout; at most 512 rows, 256-byte labels, 32-byte badges, unique 64-byte row ids (unique across rows and dock items), indent at most 8, at most 64 dock items with 1-256-byte labels and snowflake `guild_id`s, no repeated controls, snowflake native channel ids, `size` 200-1600 by 200-1200 logical pixels (centered and clamped to the monitor, the previous placement restored afterwards, never saved); the host renders the window, dock icons, the add-server button, the controls and native join labels itself, so no message content reaches Wasm; other row-click effects still wait for Apply |
 | `start_screen` | Replace the start screen's logo and copy with the plugin's own pre-rendered images and plain text | Preview; activation and panel results only; one bounded device-level file, shown on the connecting screen before any account loads and without running Wasm; the host draws nothing of its own design: up to four 2-bit palette cell images, each still or looping at up to 30 frames per second, stack top to bottom, then an optional title and subtitle in the normal font, scaled down only to fit (see the [image format](extension-sdk-actions.md#start-screen-preview)); an optional `window` size of 240-1,600 × 240-1,200 logical pixels is clamped to the monitor and centered while the screen shows, never saved as the window size, and the previous size, position and maximized state return afterwards; when several plugins set one, the lowest plugin id wins; disabling, removing or failing the plugin, revoking its grant, ending its account session or returning `start_screen: null` restores the default; the progress bar and **Use a different account** always stay |
+| `clock` | Import `serein.clock_now_ms` to read the current Unix time in milliseconds | Preview; [host import](#host-imports-preview); no account data |
+| `random` | Import `serein.random_fill` for operating-system secure random bytes | Preview; [host import](#host-imports-preview); at most 4 KiB per call |
+| `database` | Import `serein.db_execute` for a private SQLite database | Preview; [plugin database](#plugin-database-preview); per-account/plugin; 64 MiB by default, up to 16 GiB by user choice |
+| `network` | Make HTTPS requests to the exact origins in the manifest's `network` list | Preview; [network](#network-preview); the consent dialog lists the origins and warns that readable data may be sent there |
+| `message_journal` | Receive every message create, edit and delete the account sees, with earlier text where the host holds it, through one `journal` action | Preview; [message journal](#message-journal-preview); all conversations, including DMs; at-least-once |
+| `send_hook` | Rewrite the user's draft in one `send` action before it is sent | Preview; [message hooks](#message-hooks-preview); only in channels where the user switches it on, with preview or automatic sending and a chosen fallback |
+| `message_annotations` | Add notes under messages from one `annotate` action, and under the message a `message` action was chosen on | Preview; [message hooks](#message-hooks-preview); `annotate` batches come only from channels where the user switches it on, or from every channel when they choose *In every conversation*; notes are shown, never sent |
+| `notifications` | See each desktop notification, with its message preview, in one `notification` action and reword or hide it | Preview; [notification hook](#notification-hook-preview); the original shows when the plugin fails or is too slow |
+| `pages` | Show a page in the main area from activation and panel actions, with panel elements above a long list the host fetches a screenful at a time | Preview; [plugin pages](#plugin-pages-preview); rows are drawn by the host, never sent to Discord |
+| `call_captions` | Show up to four caption lines above the call controls during a call | Preview; [call captions](#call-captions-preview); from any action except hooks and page row fetches, including `topic` deliveries |
+| `files` | Read and write files in a private folder, and in folders and files the user picks for it, with `serein.file_request` and `serein.file_write` | Preview; [files](#files-preview); the private folder counts against the data limit; picks are listed in the plugin's details and can be removed |
+| `media_worker` | Keep one instance loaded during calls that runs one `media` action per batch of call events and, with media taps, call media; other actions may tell it a `media_state` | Preview; [media worker](#media-worker-preview); only during a call; may return only `captions`, `keyframes` and `media_chunks` |
+| `media_packets` | Receive the decrypted Opus, H.264, H.265 and AV1 packets of everyone else in the call in `media` batches, and ask senders for keyframes | Preview; [media taps](#media-taps-preview); requires `media_worker`; the user's own media needs `media_own` |
+| `media_own` | Also receive the user's own microphone, camera, screen share and screen share audio, as sent | Preview; [media taps](#media-taps-preview); requires `media_packets` |
+| `media_audio` | Receive each other speaker's audio as 16 kHz mono 16-bit samples in `media` batches | Preview; [media taps](#media-taps-preview); requires `media_worker` |
+| `media_archive` | Save original message attachments from Discord's CDN into the private folder with `serein.attachment_fetch` | Preview; [attachment archive](#attachment-archive-preview); requires `files`; counts against the data limit |
 | `message_send` | Propose sending text, replies, loaded stickers, a loaded-message forward, or opening the native attachment picker | Apply; selected accessible targets; picker discloses no file path/bytes to Wasm; preserves existing composition |
 | `message_manage` | Propose editing, deleting or pinning a loaded message | Apply; native ownership/moderation checks |
 | `reactions_control` | Propose adding/removing your reaction | Apply; known message and current reaction state |
@@ -262,8 +302,8 @@ content (8 KiB), forum data (6 KiB) and conversation activity (2 KiB) also share
 that ceiling; no new total snapshot allocation is authorized. The timeline
 skips messages larger than 4 KiB and reports partial data. Granting
 `message_details` also caps both timeline text and metadata rows at 12 when requested together, while preserving
-the 20-KiB timeline byte budget and shared 10-million-fuel limit. Valid wire-sized
-inputs can still exceed execution fuel. Bounded list responses
+the 20-KiB timeline byte budget and shared fuel limit (10 million plus 150 per input
+byte). Valid wire-sized inputs can still exceed execution fuel. Bounded list responses
 expose `truncated`; voice participant IDs are capped without a completeness flag.
 No snapshot includes tokens, deleted/ephemeral text, attachment bytes/URLs, raw
 voice/video/screen media or the unbounded client state.
@@ -375,7 +415,15 @@ for package compatibility; successful activation with the granted capability ena
 retention, including existing protector packages with no-op activation. Input is
 restricted to the granted context and bounded form values.
 Results can propose a composer replacement or return native headings, text, rows,
-separators, buttons, text inputs, checkboxes, dropdowns and integer sliders. Standalone
+separators, buttons, text inputs, checkboxes, dropdowns, integer sliders and pickers.
+A picker (Preview) is `{"type": "picker", "id", "label", "kinds", "value"}` with `kinds`
+from `server`, `channel` (server channels and threads), `dm`, `group` and `user`: a search
+box over the servers, conversations and people Serein has loaded (sidebar, DM and group
+recipients, the open conversation's authors and member list). Only the choice reaches
+the plugin: its form value is `<kind>:<id>`, such as `user:42`, or empty, and
+`<id>-name` holds the name Serein showed for that choice (at most 128 bytes, when that key
+is a valid ID).
+`value` must be empty or such a choice of an offered kind. Standalone
 panel actions are available from Settings > Extensions. Composer actions appear in the composer Tools menu. Composer proposals require Apply, retain
 the ordinary Send action and are discarded when their originating context is
 stale. Account/session changes invalidate outstanding results.
@@ -465,7 +513,7 @@ identify a useful next check, not a complete crash trace:
 
 | Host error category | Author action |
 | --- | --- |
-| `Fuel` | Reduce handler loops, JSON work or requested data; the limit is 10 million fuel. |
+| `Fuel` | Reduce handler loops, JSON work or requested data; the limit is 10 million fuel plus 150 per byte of input. |
 | `Memory` | Reduce memory/table allocation; linear memory remains capped at 16 MiB. This category also covers engine allocation failure, not only hitting that exact cap. |
 | `Stack` | Reduce recursion and stack allocations. |
 | `Trap` | Check for panic, invalid memory access or arithmetic traps. No panic text is exposed. |
@@ -483,7 +531,8 @@ proves live Discord compatibility. No lifecycle tests are implied by these diagn
 ## Resource and privacy limits
 
 Wasm executes on an on-demand background worker with fuel, stack and memory
-limits and no WASI or host imports. Each invocation gets a new runtime; it is
+limits, no WASI, and only the capability-gated [host imports](#host-imports-preview).
+Each invocation gets a new runtime; it is
 dropped when the call completes. Plugin execution never happens in a render or
 audio callback. The application bounds package sizes, installed plugin count,
 invocation input/output, panel complexity, queues and plugin storage.
@@ -493,12 +542,15 @@ invocation input/output, panel complexity, queues and plugin storage.
 | Compiled Wasm | 4 MiB | Keep the module small; the host validates imports and compilation limits too. |
 | JSON package | 16 MiB | Includes the manifest and encoded payload. |
 | Linear memory | 16 MiB | Includes decoding, handler allocations and output buffers. |
-| Execution fuel | 10,000,000 | Shared by parsing and execution; a valid-sized input can still exhaust it. |
+| Execution fuel | 10,000,000 plus 150 per byte of encoded input (about 49,000,000 for a full 256 KiB input) | Shared by parsing and execution. Decoding JSON costs roughly 70–200 fuel per byte, so a large snapshot brings fuel for itself; decode only the fields you use. A valid-sized input can still exhaust it. |
 | Wasm call depth / interpreter stack | 128 calls / 256 KiB | Avoid deep recursion. |
 | Serialized input and output | 256 KiB each | Count UTF-8 and JSON escaping, including nested storage JSON. |
-| Manifest actions / capabilities | 16 / 64 distinct | Only the 58 supported capability names are currently accepted. |
+| Manifest actions / capabilities | 16 / 96 distinct | Only the 73 supported capability names are currently accepted. |
+| Network | 16 declared origins; 32 requests and 30 s per invocation; 15 s, 192 KiB sent and 160 KiB received per request | See [network](#network-preview). |
+| Host calls | 4,096 per invocation; 1,000 fuel each plus 4 per byte copied (1 per 64 bytes for a media worker's `media_read` and `file_write`) | Exceeding either ends the call with the fuel error. |
 | Panel | 64 elements / 8 row levels | Includes nested children; text and input values are at most 4 KiB each. |
 | Plugin storage on disk | 1 MiB | Its practical size must also fit the smaller invocation/output budget. |
+| Plugin database | 64 MiB file by default (user-selectable 64 MiB-16 GiB); 256 KiB per request and reply; about 100 million SQLite instructions per invocation | See [plugin database](#plugin-database-preview). |
 | App snapshot | 64 KiB | Individual lists have smaller budgets; see the [data reference](extension-sdk-reference.md#app-data). |
 | Host proposals | 1 / 8 KiB serialized | A foreground action proposes one operation for Apply. |
 | Reactive queue / rate | 32 pending calls / 64 KiB / 10 starts per second | Shared message/app events are best effort; excess work is dropped. |
@@ -507,12 +559,13 @@ Invalid output or exhausted Wasm budgets produce an execution error and can
 disable the failing plugin. Snapshot collectors may instead return explicitly
 partial lists, and reactive overload may drop events; handle both in your code.
 
-Disabled plugins have no retained instance, worker, package or plugin data once
-cleanup succeeds. Shared host code and bounded catalog metadata still cost some
+Disabled plugins have no retained instance, worker or package once cleanup succeeds;
+their data is kept or deleted as the user chose (see [plugin data](#plugin-data-preview)).
+ Shared host code and bounded catalog metadata still cost some
 application space. Freed allocations may remain in the process allocator; an
 unchanged RSS reading alone does not mean an instance remains active.
 
-Plugin storage is ordinary local data, not encrypted by Serein. Do not use it
+Plugin storage and plugin databases are ordinary local data, not encrypted by Serein. Do not use it
 for credentials. No extension diagnostics or private invocation data are
 uploaded. Sandboxing and review reduce exposure but cannot prove absence of
 bugs in the runtime or host; keep Serein updated.
@@ -523,6 +576,544 @@ a separate bounded temporary `serein-extension-demo` profile; it can import loca
 fixtures and browse the embedded starter catalog/previews but cannot download a
 catalog, preview or package. `Ctrl+Shift+F12` resets a
 community theme if its colors make controls difficult to read.
+
+## Host imports (preview)
+
+A plugin module may import functions from the Wasm module `serein`; nothing else
+can be imported. Each function needs its capability declared in the manifest and
+granted by the user:
+
+| Import | Signature | Capability | Result |
+| --- | --- | --- | --- |
+| `clock_now_ms` | `() -> i64` | `clock` | Unix time in milliseconds, or `-1` when unavailable |
+| `random_fill` | `(ptr: i32, len: i32) -> i32` | `random` | Writes `len` (0-4,096) secure random bytes at `ptr`; `0` success, `-1` invalid length, `-2` unavailable |
+| `db_execute` | `(ptr: i32, len: i32) -> i32` | `database` | Runs one JSON request of at most 256 KiB; the pending reply's length, `-3` with a pending error message of at most 1 KiB, `-1` invalid length, `-2` unavailable |
+| `journal_read` | `(max: i32) -> i32` | `message_journal` | Reads 1-256 entries after the plugin's journal position; the pending reply's length, `-3` with a pending error, `-1` invalid count, `-2` unavailable |
+| `https_request` | `(ptr: i32, len: i32) -> i32` | `network` | Performs one JSON request to a declared origin; the pending response's length, `-3` with a pending error, `-1` invalid length, `-2` unavailable |
+| `broadcast` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | Sends `{"topic", "payload"}` (payload at most 16 KiB); the number of approved subscribers reached, or `-1` invalid / `-2` limit |
+| `has_subscribers` | `(ptr: i32, len: i32) -> i32` | manifest `broadcasts` | `1` when the topic has an approved subscriber, else `0` |
+| `topic_read` | `(max: i32) -> i32` | manifest `subscribes` | Reads 1-64 delivered messages in a `topic` action; the pending reply's length |
+| `file_request` | `(ptr, len) -> i32` | `files` | Runs one JSON file request of at most 4 KiB; the pending reply's length (raw bytes for `read`, JSON otherwise) |
+| `file_write` | `(ptr, len, data, data_len) -> i32` | `files` | Writes up to 1 MiB of raw bytes as a JSON header says; `0`, or `-3` with a message pending |
+| `media_read` | `(ptr, offset, len) -> i32` | `media_worker` | Copies bytes of the current media batch's data; the copied length, or `-1` outside the data |
+| `attachment_fetch` | `(ptr, len) -> i32` | `media_archive` | Queues `{"url", "size", "path"}`; `0` once queued, or `-3` with a message pending |
+| `result_read` | `(ptr: i32, cap: i32) -> i32` | none | Copies the pending reply when it fits in `cap` bytes and clears it; its length, or `-1` when nothing is pending or `cap` is too small |
+
+Installation rejects a module that imports an unknown name, uses a different
+signature or module name, or imports a function whose capability the manifest
+does not declare. An invocation fails with the capability error before any Wasm
+runs when an imported function's capability is not granted. Host functions copy
+bytes into the module's own memory and never expose host pointers; a write past
+linear memory traps. Calls count toward the invocation's fuel and its host-call
+budget (see [limits](#resource-and-privacy-limits)). Rust authors use
+`serein_extension_sdk::host`; only functions a plugin calls become imports.
+`HostInfo.host_imports` lists the names a host provides.
+
+Calls with a variable-size reply return its length and keep it pending; a later
+`result_read` copies it, and the next such call discards any unread reply. The
+reply is charged as copied bytes when it is produced.
+
+## Plugin database (preview)
+
+A plugin granted `database` has one SQLite file, `data.sqlite`, in its
+[data directory](#plugin-data-preview). Like `storage`, it is per account and per
+plugin and outlives updates, disabling, logout and reinstalling unless the user deletes
+it. Rust authors call `serein_extension_sdk::host::db::execute(sql, params)`.
+
+Each `db_execute` request is JSON, `{"sql": "...", "params": [...]}`, with one
+statement and `?` parameters. Values are `null`, booleans (stored as integers),
+numbers, strings or `{"blob": "<base64>"}`. A reply is
+`{"columns": [...], "rows": [[...]], "changes": n, "last_insert_rowid": n}`,
+with the same value encoding; `changes` and `last_insert_rowid` are `0` for
+read-only statements.
+
+All requests in one invocation share a transaction. Serein commits it only after
+the invocation finishes and its output is accepted, so an error, trap, exhausted
+fuel, cancelled job or rejected output leaves the database unchanged. Plugins
+cannot run `BEGIN`, `COMMIT` or `ROLLBACK`, but `SAVEPOINT`, `RELEASE` and
+`ROLLBACK TO` work inside it.
+
+| Rule | Limit |
+| --- | --- |
+| File size | 64 MiB unless the user picks 256 MiB, 1 GiB, 4 GiB or 16 GiB in the plugin's details; a write past it fails and discards the invocation's database work. Lowering the limit below the current size keeps existing data but refuses growth. |
+| Request / reply | 256 KiB each; a larger result fails instead of truncating |
+| SQLite work | About 100 million virtual-machine instructions per invocation. Exhausting it fails that statement and every later one, and the invocation's database work is discarded. |
+| Statement | 100,000 bytes of SQL, 256 parameters, 256 columns, expression depth 100, values up to 1 MiB |
+| Refused | `ATTACH`, `DETACH`, `VACUUM`, transaction statements, temporary tables, views and triggers, virtual tables, `load_extension`, writes to `sqlite_schema` |
+| Pragmas | Only `user_version`, `table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check`, `quick_check` and `integrity_check` |
+
+Foreign keys are enforced. Serein's bundled SQLite has no full-text search or
+R-tree modules. SQL errors are returned to the plugin as text; they never contain
+host paths.
+
+## Message journal (preview)
+
+A plugin granted `message_journal` declares one action with `surface: "journal"`.
+Serein then records every message create, edit and delete the account receives from
+the gateway, in every conversation it can read including DMs, to a journal shared by
+the account's journal plugins. The host invokes the `journal` action whenever entries
+are waiting; the action reads them with `serein.journal_read`
+(`serein_extension_sdk::host::journal::read`) and may return only `storage`.
+
+Delivery is at least once. Each plugin has a position in the journal that moves only
+when the invocation succeeds and its output is accepted, immediately after the
+plugin's database commits. A failed, cancelled or rejected invocation sees the same
+entries again, so entries should be stored idempotently (by `seq` or message ID).
+
+| Entry `kind` | Fields | Meaning |
+| --- | --- | --- |
+| `create` | `channel_id`, `guild_id`, `conversation`, `message` | A new message |
+| `update` | `channel_id`, `guild_id`, `conversation`, `message_id`, changed `content` / `edited_at_ms` / `attachments`, `previous` | An edit. Embed refreshes and reactions are not journaled. |
+| `delete` | `channel_id`, `guild_id`, `conversation`, `message_id`, `bulk`, `previous` | A deletion, one entry per ID of a bulk delete |
+| `gap` | `reason`: `overflow` with `dropped`, or `pruned` with `from_seq` / `to_seq` | Entries were lost: the host fell behind, or the journal's bounds removed entries before this plugin read them |
+| `session_started` | none | A new gateway session began; anything while disconnected or closed is not journaled |
+| `missed` | `channel_id`, `after_message_id`, `latest_message_id` | At a new session, a channel's latest message is newer than the last one journaled |
+| `channel_changed` | `channel_id` | A channel was created or its details changed |
+| `access_lost` | `guild_id` (`null` for DMs), `channel_ids` (at most 1,000 per entry) | These channels were readable before an event and are not after it: a kick or leave, a deleted channel, a permission change, or a server becoming unavailable (an outage looks the same) |
+| `access_changed` | none | Which conversations the account can read may have changed |
+
+Every entry also has `seq` (increasing, never reused) and `at_ms` (when the host
+recorded it). Newer hosts may add kinds; ignore unknown ones.
+
+A `message` holds `id`, `author` (`id`, `name`, `nick`, `bot`, `webhook`), `content`,
+`created_at_ms`, `edited_at_ms`, `type`, `flags`, `reply_to`, `forwarded`, embed and
+sticker counts, and `attachments` (`id`, `filename`, `content_type`, `size`, `url`,
+`proxy_url`). An entry over 64 KiB drops attachment details and sets `truncated`.
+
+`conversation` is what Serein knew about the channel when it recorded the entry, or
+`null` when the channel was not loaded: `type` (the Discord channel type, such as `1`
+for a DM and `3` for a group chat), `name`, `parent_id` (a thread's channel or a
+channel's category), and `guild_name` in servers or up to 10 `recipients` (`id`,
+`name`) without one. An archive can scope entries by server, channel, group chat or DM
+and keep their names after access is lost.
+
+`previous` is the version Serein held in memory: the open conversation's loaded
+messages. For other conversations it is `null`; a plugin that stores each `create`
+already has the earlier text. History pages, search results and messages sent before
+the plugin was enabled are not journaled.
+
+Bounds: the journal keeps at most 100,000 unread entries or 64 MiB, pruning the oldest
+into a `pruned` gap; up to 1,024 records wait for the writer before an `overflow` gap.
+Entries every consumer has read are deleted. Nothing is recorded while no enabled
+plugin consumes the journal, and a plugin enabled later starts with new entries.
+Disabling a plugin removes its position. The journal lives with the account's plugin
+data, so logging out keeps it; with no consumer installed nothing new is recorded.
+
+## Network (preview)
+
+A plugin granted `network` lists the HTTPS origins it may reach in its manifest:
+
+```json
+"capabilities": ["network"],
+"network": ["https://api.example.org", "https://upload.example.org:8443"]
+```
+
+Origins are exact: `https`, a DNS name with at least one dot, an optional port and
+nothing else. No wildcards, paths, credentials, IP literals or `localhost` names; at
+most 16, no duplicates, and the capability and the list must come together. The consent
+dialog lists the origins and warns that anything the plugin can read may be sent there.
+
+Each `serein.https_request` (`serein_extension_sdk::host::https::send`) is one request,
+`{"method", "url", "headers": [[name, value]], "body" | "body_base64", "timeout_ms"}`,
+and one complete response, `{"status", "url", "redirected", "headers", "body" |
+"body_base64"}`. Text bodies arrive as `body`, others base64-encoded.
+
+- Methods: GET, HEAD, POST, PUT, PATCH, DELETE. GET and HEAD carry no body.
+- The host sets `Host`, `Content-Length`, framing and connection headers; `Proxy-*` is
+  refused. `User-Agent` defaults to `Serein plugin`, and `Accept-Encoding` to `identity`.
+  Bodies are never decompressed.
+- Each hop's name is resolved by the host; any non-public address (private, loopback,
+  link-local, carrier-grade NAT, documentation or multicast ranges) refuses the request,
+  and the connection is pinned to the checked addresses.
+- Redirects to declared origins are followed (up to five, each re-checked; 301-303 become
+  GET). A redirect elsewhere is returned as the 3xx response, unfollowed.
+- No cookies, system proxy, Discord session, token or Serein fingerprint is used.
+- Limits: 32 requests and 30 seconds of network time per invocation; per request
+  10 seconds by default and 15 at most, 192 KiB sent, 160 KiB received (a larger
+  response fails rather than truncating), 32 request and 64 response headers.
+- The invocation waits on the extension worker while a request runs; cancelling the
+  job, such as on navigation or logout, ends it at once.
+
+## Plugin secrets (preview)
+
+A plugin with `network` may declare secrets the user enters, such as API keys:
+
+```json
+"secrets": [
+  { "id": "api_key", "label": "DeepL API key", "origins": ["https://api-free.deepl.com"] }
+]
+```
+
+IDs are 1-32 lowercase letters, digits and `_`; labels at most 64 characters; at most 8
+secrets; every origin must also be in `network`. The consent dialog names them, and
+the plugin's details show each one with its origins, whether it is set, and a masked
+field to enter, replace or remove it. Values (1-4,096 characters without control
+characters) are saved only in the OS credential store; the demo keeps them in memory.
+Without an OS credential store, secrets are unavailable rather than written to a file.
+
+The plugin never reads a value. It writes `{{secret.<id>}}` in a request's URL, header
+values or text body, and the host fills it in (URL-encoded in the URL) when:
+
+- the secret is declared, set, and the request's origin is one of its origins;
+- otherwise the request fails before any network access, naming the secret but never
+  its value.
+
+A redirect is not followed to an origin any of the request's secrets may not reach, and
+every occurrence of a value (raw or URL-encoded) in the response's URL, headers and text
+body is replaced by `[secret]`. Values pass through host memory and the HTTP client
+only for the request; Serein zeroizes its own copies where practical.
+
+Secrets follow the plugin's data: keeping data on disable or logout keeps them; deleting
+the plugin's data also removes them from the credential store.
+
+## Broadcasts between plugins (preview)
+
+A provider lists versioned topics, such as `serein.captions/1`, in `broadcasts`; a
+subscriber lists them in `subscribes` and declares exactly one action with
+`surface: "topic"`, which may return only `storage`. Shared payload formats are defined in
+[extension topics](extension-topics.md).
+
+```json
+"broadcasts": ["serein.captions/1"]
+```
+
+- **Approval.** Nothing flows until the user turns on that provider, subscriber and topic
+  in Settings > Extensions > Connections, which lists every pairing the enabled plugins
+  allow and warns when the subscriber can send data to network origins. Approvals are
+  saved per account (at most 64) and end when either plugin is disabled.
+- **Delivery.** `serein.broadcast` copies the payload to each approved subscriber's
+  queue; with none it is dropped before copying (`has_subscribers` lets a provider skip
+  the work). The host then invokes the subscriber's `topic` action, which reads with
+  `serein.topic_read`. Messages leave the queue only when that invocation is accepted,
+  so a failed delivery is retried with the next one (after a 10-second pause).
+- **Bounds.** Payloads are at most 16 KiB; 32 broadcasts per invocation; each subscriber
+  queue holds 64 messages / 256 KiB. A full queue records a `gap` item with the provider,
+  topic and number dropped instead of losing messages silently.
+- **No history.** Queues live in memory only; nothing is replayed to subscribers that
+  connect later, and logout, an account switch or a revoked connection discards them.
+  A plugin that needs history stores what it receives in its own database.
+
+## Message hooks (preview)
+
+Two actions let a plugin take part in conversations the user picks. Both are switched on
+per channel from the composer's **Extensions** menu, under **In this channel**; nothing
+runs anywhere else, and disabling the plugin switches them off everywhere. The settings
+are saved per account (at most 512 channels).
+
+**Send hook.** With `send_hook`, one action with `surface: "send"` receives the draft in
+`composer` and its destination in `send_target` (`channel_id`, `guild_id`) when the user
+sends. It returns the text to send in `replacement`, or nothing to send the draft
+unchanged; it may also save `storage`, nothing else. The user chooses per channel:
+
+- **Show me the rewrite first** (default): the rewrite replaces the draft, a line above
+  the composer names the plugin, and the next Enter sends it, edited or not. **Use my
+  original** puts the original back and sends it unhooked.
+- **Send the rewrite automatically**: the rewrite is sent at once.
+- **If it fails**: keep the message unsent (default) or send it unchanged. A failure,
+  an empty or oversized rewrite, or a plugin that stops running counts as failing; the
+  plugin keeps running for other messages.
+
+**Follow-up.** A send hook may also return `follow_up`: a second message (at most 16 KiB,
+not blank) that Serein sends in the same channel only after Discord confirms the first,
+so the two arrive in order. A follow-up without a rewrite still waits for review in the
+**Show me the rewrite first** mode, and the line above the composer shows it. If the first
+message fails, the follow-up is dropped with a notice. A translator sends the original and
+then its translation this way.
+
+A draft edited while the hook runs is neither replaced nor sent. One plugin per channel
+holds the send hook; attachments are sent with the rewritten text, and attachment-only
+messages skip the hook. Only one draft waits for a hook at a time.
+
+**Annotations.** With `message_annotations`, one action with `surface: "annotate"`
+receives `annotate`: `channel_id`, `guild_id` and up to 25 `messages` (`message_id`,
+`author_id`, `content`, `edited`), oldest first, at most 128 KiB of text. The host sends
+the open channel's latest loaded messages when it opens, then new and edited ones, each
+message once per text. The action returns `annotations`: `{"message_id", "text"}` for
+messages in its batch, at most 4 KiB each; empty text removes the plugin's note. A
+`message` action of a plugin with this grant may annotate the message it was chosen on
+the same way. Notes appear in small muted text under the message with the plugin's name,
+are kept in memory only (2,000 messages, 2 MiB) and are never sent to Discord. Up to
+four plugins may annotate one channel. Under each plugin's switch in the composer's
+Extensions menu, **In every conversation** runs its notes in every channel the user opens,
+alongside that channel's own switches and within the same four.
+
+```json
+{"annotations": [{"message_id": "1300000000000000000", "text": "Hi everyone"}]}
+```
+
+**History and deleted rows.** The same results may return `histories` and
+`deleted_messages`, under the same rules: each names a message the action was given, once.
+
+- `histories: [{"message_id", "revisions": [{"time_ms", "text"}]}]` gives up to 8 earlier
+  versions of a message, oldest first. Each is shown under the message with its time,
+  marked "earlier version · kept by" the plugin. An empty list removes the plugin's
+  history for it.
+- `deleted_messages: [{"after_message_id", "messages": [{"message_id", "author",
+  "time_ms", "text", "deleted_ms", "revisions"}]}]` shows deleted messages the plugin kept
+  as struck-through rows under the message they followed, marked "deleted · kept by" the
+  plugin, with the deletion time when `deleted_ms` is given. The optional `revisions` (up
+  to 8, oldest first, like a history) are shown above the last text; without them the row
+  shows the history the plugin gave while the message was loaded. At most 25 rows per
+  result; a deleted row cannot be one of the given messages. The client draws each row by
+  its own id, after the message shown before it, with a day divider when its day differs;
+  `after_message_id` only tells it which of your rows to replace. When batches place one
+  deleted message under different messages, the closest earlier one keeps it. An empty
+  list removes the plugin's rows there.
+
+Texts follow page rows: at most 4 KiB, line breaks allowed. Like notes, they live in RAM
+within the same 2,000-message, 2 MiB budget and never reach Discord.
+
+**Alternates.** `alternates: [{"message_id", "label", "text"}]` shows `text` in place of a
+given message, such as its translation, under the same rules, with a label of at most 64
+bytes. A line under it reads "*label* by *plugin*" with **Show as sent**, which switches
+that message back to its own text (and **Show *label*** again); the choice is kept in
+memory for up to 512 messages. When several plugins give one, the first by plugin ID is
+shown. Empty text removes the plugin's alternate. Only the screen changes: the message,
+copying, replies and search keep the text Discord has.
+
+## Call captions (preview)
+
+With `call_captions`, any action except `send`, `annotate`, `notification` and page row
+fetches may return `captions`: up to 4 lines of at most 512 bytes, without control
+characters or line breaks, each with an optional `speaker_id` and `final`. They replace
+the plugin's previous lines; an empty list clears them. The host shows them in a bar
+above the call controls, with the speaker's name from the call roster (or the plugin's
+name), and unfinished lines dimmer. Lines fade 10 seconds after the plugin's last update,
+are shown only during a call, and at most two plugins' lines show at once. A `topic`
+subscriber, such as one receiving `serein.captions/1`, can return them from each delivery.
+
+```json
+{"captions": [{"speaker_id": "1200000000000000000", "text": "Can everyone hear me?", "final": true}]}
+```
+
+## Notification hook (preview)
+
+With `notifications`, one action with `surface: "notification"` sees each desktop alert
+before the operating system shows it. It runs only after Serein's own checks (mutes, Do
+Not Disturb, the focused channel and your notification settings) picked the alert, so it
+cannot add alerts. The action receives `notification`:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `gateway` (the live connection) or `push` (a mobile push message; desktop sends only `gateway`) |
+| `message_id`, `channel_id`, `guild_id`, `author_id` | The message; `guild_id` is absent in direct and group messages |
+| `direct` | From a direct or group conversation |
+| `title`, `body` | What the alert would show: sender name and preview, at most 256 and 512 bytes |
+| `upgrade` | The alert was already shown, and a reworded one replaces it |
+
+It returns `notification`: `{"hide": true}` to skip the alert, or `title` and/or `body` to
+reword it, within the same limits and without control characters or line breaks. Leaving
+it out shows the alert unchanged. It may also save `storage`, nothing else. Hiding affects
+only the alert; message sounds and unread badges stay as they are.
+
+- **Order.** Several enabled plugins run one after another in the order they are listed;
+  each sees the previous one's wording. A plugin that hides the alert ends the chain.
+- **Fails open.** A plugin that fails is skipped. An alert still waiting after 1.5 s is
+  shown as it stands; a plugin answering within 10 s after that replaces it with the
+  reworded one, unless a newer alert was shown since or the alert was read. At most 16
+  alerts wait at a time; more are shown without plugins.
+- **One alert per message.** The host remembers the last 512 alerted messages. A message
+  reported by both sources alerts once; when a `push` alert is followed by its `gateway`
+  copy, the gateway copy replaces it.
+
+```json
+{"notification": {"body": "Hello, how are you?"}}
+```
+
+## Plugin pages (preview)
+
+With `pages`, an activation or panel action may return `page` to show a page in the main
+area: a `title` (at most 128 bytes), panel `elements` and an optional `list`. A later
+result with `page` replaces it, `"page": null` closes it, and leaving it out keeps it.
+The page also closes when the user closes it, opens another conversation, or the plugin
+stops. Buttons run the panel action they name with the page's input values, as in a
+result window.
+
+The `list` names its content `version` (1–64 ASCII bytes), its `total` rows (at most
+1,000,000), a declared panel action `rows_action`, optionally a declared `click_action`
+(run with the row's id in `values["row"]`), up to 100 inline `rows` and an `empty_text`.
+The host draws only the rows on screen and asks for missing ones, 50 at a time and one
+request at a time, by running `rows_action` with `page_request {version, start, count}`.
+That action answers with `page_rows {version, start, rows}`: the same version and start
+and at most `count` rows. A fetch may also return `page` and `storage`, and nothing that
+would open a window. The host keeps at most 2,000 fetched rows (8 MiB) in RAM, dropping
+those farthest from view, and forgets them when the version changes.
+
+A row has an `id` (at most 64 bytes), an optional `author` and `time_ms`, `text` (at most
+4 KiB; line breaks allowed, other control characters not), an optional `state` of
+`edited` or `deleted`, and up to 8 earlier `revisions` (`time_ms`, `text`), oldest first.
+Rows show one line with the full text on hover; deleted rows are struck through, and a row
+with revisions has an **(edited) · history** button that opens its versions.
+
+```json
+{"page_rows": {"version": "v3", "start": 50, "rows": [
+  {"id": "1300000000000000000", "author": "Ada", "time_ms": 1763700000000,
+   "text": "See you at 6", "state": "edited",
+   "revisions": [{"time_ms": 1763699000000, "text": "See you at 5"}]}]}}
+```
+
+## Files (preview)
+
+With `files`, a plugin reads and writes files through two imports. Every call names a
+`root` and a relative `path` (`/`-separated, at most 1 KiB):
+
+- `"private"` is the plugin's own folder, `files/` in its data directory. It counts
+  against the plugin's data limit (the size chosen in its details, 64 MiB by default),
+  is kept and removed with the rest of its data, and needs no pick.
+- Any other root is the id of a folder or file the user picked for the plugin. An
+  activation or panel action asks with `pick`: `kind` (`folder`, `file` or `save_file`),
+  `write`, a `purpose` (at most 128 bytes, shown in the picker title) and, for
+  `save_file`, a suggested `name`. The host shows the system picker and then runs the
+  declared panel `action` with the new root in `values["root"]`, or with
+  `values["cancelled"] = "true"`. A `save_file` pick may always be written; other picks
+  only with `write`. A plugin keeps at most 16 picks, saved with its data settings, and
+  the user removes them from **Folders and files you gave it** in its details.
+
+`file_request` takes JSON tagged by `op`: `handles` (the picks, with each one's own name
+but never its full path), `list` (`offset`, `limit` up to 512, sorted by name, links left
+out), `stat`, `read` (`offset`, `length` up to 256 KiB, raw bytes back),
+`create_folder`, `delete` (a file or an empty folder) and `rename` (`to`, within the same
+root, never over an existing entry). `file_write` takes a header `{root, path, offset?,
+truncate?}` and up to 1 MiB of raw data; without `offset` it appends. A picked file has
+no paths inside it.
+
+The host refuses absolute paths, `..`, `.`, empty parts, backslashes, `:` and other
+characters Windows reserves, reserved device names, and any symbolic link under the
+root. Changes apply at once, even if the invocation later fails. One invocation may write
+and read at most 512 MiB each.
+
+```json
+{"pick": {"kind": "save_file", "purpose": "Export the archive", "name": "archive.json", "action": "exported"}}
+```
+
+## Media worker (preview)
+
+With `media_worker`, a plugin declares one action with `surface: "media"`. While the user
+is in a call, the host keeps one instance of the plugin loaded on its own thread, so its
+memory carries state from one call of `serein_invoke` to the next, and runs the action
+once per batch. The instance may grow to 64 MiB of memory, and each batch gets fresh
+host-call budgets and fresh fuel: 50,000,000 plus 16 per byte of the batch's data, so a
+full 4 MiB batch gets about 117,000,000. Its `media_read` and `file_write` copies cost 1
+fuel per 64 bytes, as Wasm's own `memory.copy` does, instead of 4 per byte.
+
+The action receives `media`: `seq`, `dropped` (batches the host discarded because the
+plugin fell behind), `data_bytes` and up to 256 `items` in time order:
+
+- `{"type": "event", "time_us", "event"}` with `event.kind` of `started` (`channel_id`,
+  `guild_id`; first), `joined` and `left` (`user_id`), or `ended` (last). `time_us` counts
+  from the worker's start.
+- `{"type": "chunk", "stream", "codec", "time_us", "offset", "length"}` points into the
+  batch's binary data (at most 4 MiB), copied with `serein.media_read`. Media taps fill
+  these; until then batches carry only events.
+- `{"type": "state", "time_us", "state"}`: what the plugin's other actions last set with
+  `media_state` (below), in each worker's first batch and again whenever it changes.
+
+The action may return only `captions` (with `call_captions`), shown above the call
+controls, `keyframes` and `media_chunks` (see [media taps](#media-taps-preview)). It may
+also call the clock, randomness, its files, its network origins and `broadcast`; the
+database, journal and topic deliveries are not available, and it cannot save `storage`.
+
+The worker has no database, so the plugin's other actions tell it what it needs to know
+by returning `media_state`: any JSON value of at most 16 KiB, such as its settings or the
+call the user asked to record. Any action except `media`, `send`, `annotate`,
+`notification` and page row fetches may return it. Each one replaces the last; the host
+keeps it in memory until the plugin is disabled, the account changes or Serein closes, so
+an `activation` action should set it again. A running worker gets it in its next batch.
+
+```json
+{"media_state": {"record": ["1200000000000000001"], "people": ["1200000000000000002"]}}
+```
+
+The host queues at most 32 batches or 16 MiB per worker (about 0.6 seconds), or 256 batches
+or 64 MiB (about 5 seconds) for a plugin granted `files`, so a disk that stalls for a moment
+does not cut holes into what it writes. Past that it drops the oldest batches with media;
+batches of only call events and state are kept. An error ends the worker; a new one starts
+10 seconds later in the same call. The worker ends with the call, or when the plugin is
+disabled or the account changes.
+
+```json
+{"action": "media", "media": {"seq": 2, "items": [
+  {"type": "event", "time_us": 1520000, "event": {"kind": "joined", "user_id": "1200000000000000000"}}]}}
+```
+
+## Media taps (preview)
+
+With `media_packets` or `media_audio` (each requires `media_worker`), the media worker's
+batches also carry the call's media. The voice transport copies each packet right after
+DAVE decryption, on its network task, into one queue of at most 4,096 packets or 16 MiB;
+the copy happens only while such a worker runs. A separate thread drains the queue every
+20 ms and builds each worker's batches.
+
+- Streams are `voice:<user>`, `camera:<user>`, `screen:<user>` and `screen_audio:<user>`.
+- `media_packets` chunks are one Opus frame (`opus`) or one complete access unit (`h264`,
+  `h265`, `av1`), with the sender's `rtp_timestamp` (48 kHz audio, 90 kHz video), audio
+  `sequence` and video `keyframe`. `time_us` is when the host received the packet on one
+  clock shared by all streams of the worker, so streams can be aligned with it, using
+  each stream's `rtp_timestamp` for spacing within it. Video is copied only once the client accepted the picture, so a stream
+  starts on a keyframe.
+- `media_audio` chunks (`pcm_s16le`) are one Opus frame decoded to 16 kHz mono
+  little-endian samples, one decoder per stream, off the UI thread.
+- `{"type": "gap", "stream", "time_us", "lost"}` reports packets the tap could not keep.
+  A larger-than-4 MiB picture also becomes a gap.
+- A `media` result with `media_packets` may return `keyframes`: up to 16 `camera:<user>`
+  or `screen:<user>` streams. The host asks those senders through the same rate-limited
+  path it uses to recover lost pictures.
+- A `media` result may return `"media_chunks": false` while the worker only waits for
+  events, such as someone joining; the host then stops copying media for it (and stops the
+  tap when no worker wants media). `"media_chunks": true` resumes; ask for keyframes then
+  so video starts promptly.
+- With `media_own` (requires `media_packets`), the user's own microphone, camera, screen
+  share and screen share audio arrive too, as encoded and before encryption, in streams
+  named by the user's own ID. Microphone silence is sent as Discord's Opus silence frame.
+
+Not included: audio while the user is deafened (it is not decrypted then), and video
+Discord does not send, such as streams the user is not watching.
+
+## Attachment archive (preview)
+
+With `media_archive` (and `files`), a plugin saves original attachments, for example the
+ones its message journal reports, before their signed links expire or the message is
+deleted. `serein.attachment_fetch` takes `{"url", "size", "path"}` and returns at once;
+the host downloads the file afterwards, one at a time across plugins, into `path` in the
+plugin's private folder.
+
+- **Links**: only signed original attachment links on `cdn.discordapp.com` (a
+  `media.discordapp.net` link is rewritten to its original), with the same admission as
+  the client's own downloads: HTTPS on port 443, no credentials or fragment, the
+  `attachments/<channel>/[<message>/]<attachment>/<file>` path, and only the `ex`, `is`,
+  `hm` and `backend` parameters. No redirects are followed and no credentials are sent.
+- **Size**: `size` is the attachment's size, 1 byte to 100 MiB. The download must match it
+  exactly; anything else fails. Each file must fit the plugin's data limit before it
+  starts.
+- **Writing**: the file is written as `<path>.part` and renamed once complete; an existing
+  file is never replaced. `path` follows the private folder's path rules.
+- **Queue**: at most 256 waiting fetches per plugin (1,024 in all) and one per path.
+  `{"op": "fetches"}` through `serein.file_request` returns the last 256 outcomes as
+  `{"path", "state": "queued" | "done" | "failed", "error"?}`. Disabling the plugin or
+  logging out of its account drops its waiting fetches, stops the running one and forgets
+  its outcomes.
+
+Expired links are not refreshed; a fetch of one fails with "its link may have expired".
+
+## Plugin data (preview)
+
+Plugin data lives apart from packages in `extensions/plugin-data/<account>/<plugin id>/`
+(`connection/` for connection plugins): `data.json` (`storage`), `data.sqlite`
+(`database`), `files/` (`files`) and `settings.json` (the chosen data size and the
+folders and files the user picked). The account's message
+journal, approved connections (`subscriptions.json`) and message hooks (`hooks.json`)
+sit beside them. Data from older versions inside package directories moves
+there on first use.
+
+- **Updating** a plugin keeps its data.
+- **Disabling** a plugin that has data asks whether to keep or delete it.
+- **Logging out** removes the account's plugin packages and grants but keeps their data.
+- **Reinstalling** the same plugin ID in the same account picks up its kept data.
+- Settings > Extensions lists **kept plugin data** of plugins that are not installed, with
+  its size and a delete action; a plugin's details show its data size and, for `database`
+  plugins, the database size limit.
+
+Kept data is ordinary local data, not encrypted by Serein, and is never uploaded.
 
 ## API proxy plugin (preview)
 

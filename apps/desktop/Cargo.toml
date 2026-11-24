@@ -10,11 +10,12 @@ development-data = ["local-store/development-data", "platform/development-data"]
 # No-op: token sign-in used to require this flag; it is now always built in.
 # Kept only so `--features developer-session` in older scripts keeps building.
 developer-session = []
-demo = ["dep:test-support", "ui/demo"]
+demo = ["dep:test-support", "ui/demo", "extension-host/demo"]
 
 [dependencies]
 diagnostics.workspace = true
 extensions.workspace = true
+extension-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 discord-voice.workspace = true

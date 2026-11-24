@@ -40,6 +40,11 @@ pub struct TimelineView {
 	/// A private command response the reader dismissed this frame.
 	pub(super) dismiss_ephemeral: Option<Id>,
 	pub(super) extension_actions: std::sync::Arc<Vec<crate::extensions_ui::MenuAction>>,
+	/// Notes plugins added under messages.
+	pub(super) notes: extension_host::hooks::Annotations,
+	/// Messages with a plugin's alternate, such as a translation, switched back to their
+	/// own text; RAM only.
+	pub(super) show_original: std::collections::HashSet<Id>,
 	pub(super) extension_request: Option<(
 		crate::extensions_ui::MenuAction,
 		String,
@@ -512,6 +517,123 @@ pub(crate) fn fill_header_line(ui: &mut egui::Ui, compact: bool, text_line: egui
 		ui.expand_to_include_y(text_line.bottom() + slack);
 	}
 }
+/// The "edited" label; when plugins supplied earlier versions it opens them.
+/// The format cache part holding a plugin's alternate text; message components use parts
+/// below `u16::MAX`.
+const ALTERNATE_PART: u16 = u16::MAX;
+/// Messages switched back from their alternate that are remembered at once.
+const MAX_SHOWN_ORIGINALS: usize = 512;
+
+/// The "edited" label, then each earlier version a plugin kept, drawn under the message
+/// oldest first.
+fn plugin_history(
+	ui: &mut egui::Ui,
+	edited: bool,
+	notes: &[extension_host::hooks::Note],
+	colors: &crate::design::Palette,
+) {
+	if edited {
+		ui.label(
+			RichText::new(crate::i18n::translate("timeline-show-with-scroll-edited"))
+				.small()
+				.color(colors.muted),
+		);
+	}
+	for note in notes {
+		earlier_versions(ui, &note.name, &note.history, colors);
+	}
+}
+
+/// Each earlier version `plugin` kept of a message, oldest first.
+fn earlier_versions(
+	ui: &mut egui::Ui,
+	plugin: &str,
+	history: &[extension_host::hooks::Revision],
+	colors: &crate::design::Palette,
+) {
+	for revision in history {
+		egui::Frame::new()
+			.inner_margin(egui::Margin::symmetric(8, 4))
+			.corner_radius(4)
+			.stroke(egui::Stroke::new(1.0, colors.muted.gamma_multiply(0.35)))
+			.show(ui, |ui| {
+				ui.horizontal_wrapped(|ui| {
+					ui.spacing_mut().item_spacing.x = 6.0;
+					if let Some(time) = revision.time_ms.and_then(plugin_time) {
+						ui.label(
+							RichText::new(crate::local_time::full(time))
+								.small()
+								.color(colors.muted),
+						);
+					}
+					ui.label(
+						RichText::new(crate::i18n::translate_args(
+							"timeline-plugin-earlier",
+							&[("plugin", plugin)],
+						))
+						.small()
+						.color(colors.muted),
+					);
+				});
+				ui.add(egui::Label::new(RichText::new(&revision.text).color(colors.muted)).wrap());
+			});
+	}
+}
+
+/// A deleted message a plugin kept, drawn plainly where it was, after its earlier versions:
+/// those the row carries, or else those plugins showed of it while it was loaded.
+fn archived_row(
+	ui: &mut egui::Ui,
+	plugin: &str,
+	row: &extension_host::hooks::Archived,
+	notes: &[extension_host::hooks::Note],
+	colors: &crate::design::Palette,
+) {
+	egui::Frame::new()
+		.inner_margin(egui::Margin::symmetric(8, 4))
+		.corner_radius(4)
+		.stroke(egui::Stroke::new(1.0, colors.danger.gamma_multiply(0.35)))
+		.show(ui, |ui| {
+			ui.horizontal_wrapped(|ui| {
+				ui.spacing_mut().item_spacing.x = 6.0;
+				ui.label(RichText::new(&row.author).small().strong());
+				if let Some(time) = row.time_ms.and_then(plugin_time) {
+					ui.label(
+						RichText::new(crate::local_time::header(time))
+							.small()
+							.color(colors.muted),
+					);
+				}
+				let deleted = match row.deleted_ms.and_then(plugin_time) {
+					Some(time) => crate::i18n::translate_args(
+						"timeline-plugin-deleted-at",
+						&[("time", &crate::local_time::full(time)), ("plugin", plugin)],
+					),
+					None => crate::i18n::translate_args(
+						"timeline-plugin-deleted",
+						&[("plugin", plugin)],
+					),
+				};
+				ui.label(RichText::new(deleted).small().color(colors.danger));
+			});
+			if row.history.is_empty() {
+				for note in notes {
+					earlier_versions(ui, &note.name, &note.history, colors);
+				}
+			} else {
+				earlier_versions(ui, plugin, &row.history, colors);
+			}
+			ui.add(
+				egui::Label::new(RichText::new(&row.text).color(colors.muted).strikethrough())
+					.wrap(),
+			);
+		});
+}
+
+fn plugin_time(ms: i64) -> Option<time::OffsetDateTime> {
+	time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+}
+
 // Discord snowflakes carry milliseconds since 2015-01-01. All u64 IDs fit time's range.
 fn timestamp(id: Id) -> time::OffsetDateTime {
 	crate::local_time::local(
@@ -1484,14 +1606,28 @@ fn row_key(
 	crate::mentions::presentation_fingerprint(state, message).hash(&mut key);
 	key.finish()
 }
+/// `next` is the row after this one: deleted rows plugins kept between them are drawn in
+/// this row, and those before it decide its day divider.
 fn row_height_key(
 	message: &Message,
 	previous: Option<&Message>,
+	next: Option<Id>,
 	boundary: Option<Id>,
 	state: &State,
 	deleted: bool,
+	notes: &extension_host::hooks::Annotations,
 ) -> u64 {
-	row_key(message, previous, boundary, state) ^ u64::from(deleted)
+	row_key(message, previous, boundary, state)
+		^ u64::from(deleted)
+		^ notes.fingerprint(message.id)
+		^ notes
+			.deleted_fingerprint(message.channel, message.id, next)
+			.rotate_left(1)
+		^ previous.map_or(0, |previous| {
+			notes
+				.deleted_fingerprint(message.channel, previous.id, Some(message.id))
+				.rotate_left(2)
+		})
 }
 fn divider(
 	ui: &mut egui::Ui,
@@ -2614,6 +2750,9 @@ impl TimelineView {
 				},
 				opening: self.opening.take(),
 				browser_opening: self.browser_opening.take(),
+				// Plugins are not asked again for messages they already annotated, so their
+				// notes, histories and deleted rows stay for when the conversation reopens.
+				notes: std::mem::take(&mut self.notes),
 				truncated_translation: self.truncated_translation.take(),
 				pending_viewer: self.pending_viewer.take(),
 				jump: following,
@@ -2825,7 +2964,19 @@ impl TimelineView {
 				.map(|m| {
 					let prior = previous;
 					let deleted = state.timeline.is_deleted(m.id);
-					let key = row_height_key(m, prior, self.unread_boundary, state, deleted);
+					let next = row_ids
+						.binary_search(&m.id)
+						.ok()
+						.and_then(|index| row_ids.get(index + 1).copied());
+					let key = row_height_key(
+						m,
+						prior,
+						next,
+						self.unread_boundary,
+						state,
+						deleted,
+						&self.notes,
+					);
 					row_keys.insert(m.id, key);
 					previous = Some(m);
 					let lines = m
@@ -3324,9 +3475,11 @@ impl TimelineView {
 						row_height_key(
 							starter,
 							None,
+							Some(id),
 							self.unread_boundary,
 							state,
 							state.timeline.is_deleted(id),
+							&self.notes,
 						),
 						response.rect.height(),
 					));
@@ -3346,6 +3499,7 @@ impl TimelineView {
 				let previous = index
 					.checked_sub(1)
 					.and_then(|i| display_message(state, self.rows[i].0));
+				let next = self.rows.get(index + 1).map(|row| row.0);
 				let deleted = state.timeline.is_deleted(id);
 				// ponytail: reuse only settled ordinary text; dynamic media, references,
 				// spoilers and reactions need explicit layout invalidation before caching.
@@ -3368,8 +3522,15 @@ impl TimelineView {
 					&& state.interactions.pending.is_none()
 					&& let Some(&(key, height)) = self.heights.get(&id)
 					&& key
-						== row_height_key(message, previous, self.unread_boundary, state, deleted)
-				{
+						== row_height_key(
+							message,
+							previous,
+							next,
+							self.unread_boundary,
+							state,
+							deleted,
+							&self.notes,
+						) {
 					ui.add_space(height);
 					// Keep one result per row: visible height updates below zip by index.
 					measurements.push((id, key, height));
@@ -3382,8 +3543,15 @@ impl TimelineView {
 
 				let compact =
 					self.compact_messages || grouped(previous, message, self.unread_boundary);
-				let new_day = previous
-					.is_none_or(|previous| timestamp(previous.id).date() != timestamp(id).date());
+				// A deleted row kept between them is drawn on its own day.
+				let new_day = previous.is_none_or(|previous| {
+					let shown = self
+						.notes
+						.deleted_between(message.channel, previous.id, Some(id))
+						.last()
+						.map_or(previous.id, |(_, row)| row.message);
+					timestamp(shown).date() != timestamp(id).date()
+				});
 				// Snowflakes rank rows as shown, so a selection outlives its rows' layout.
 				let order = |index| egui::text_selection::SelectionOrder { item: id.0, index };
 				let response = ui.scope_builder(egui::UiBuilder::new().scope_id(row_id), |ui| {
@@ -4064,8 +4232,22 @@ impl TimelineView {
 											} else {
 												None
 											};
-											let formatted =
-												self.formatted.get(id, &message.content);
+											// A plugin's alternate, such as a translation, shows in
+											// place of the text until the reader switches back.
+											let alternate =
+												self.notes.alternate(message.id).and_then(|note| {
+													Some((
+														note.name.clone(),
+														note.alternate.clone()?,
+													))
+												});
+											let original_shown = self.show_original.contains(&id);
+											let formatted = match &alternate {
+												Some((_, alternate)) if !original_shown => self
+													.formatted
+													.get_part(id, ALTERNATE_PART, &alternate.text),
+												_ => self.formatted.get(id, &message.content),
+											};
 											let reveal = self
 												.revealed
 												.get(&id)
@@ -4142,7 +4324,67 @@ impl TimelineView {
 													.response
 													.rect;
 											}
-											if formatted.limited {
+											let limited = formatted.limited;
+											if let Some((name, alternate)) = &alternate {
+												let toggle = ui
+													.horizontal_wrapped(|ui| {
+														ui.spacing_mut().item_spacing.x = 6.0;
+														if !original_shown {
+															ui.label(
+																RichText::new(
+																	crate::i18n::translate_args(
+																		"timeline-alternate-from",
+																		&[
+																			(
+																				"label",
+																				&alternate.label,
+																			),
+																			("plugin", name),
+																		],
+																	),
+																)
+																.small()
+																.color(colors.muted),
+															);
+														}
+														let label = if original_shown {
+															crate::i18n::translate_args(
+																"timeline-alternate-show",
+																&[("label", &alternate.label)],
+															)
+														} else {
+															crate::i18n::translate(
+																"timeline-alternate-show-sent",
+															)
+														};
+														ui.add(
+															egui::Button::new(
+																RichText::new(label)
+																	.small()
+																	.color(colors.link),
+															)
+															.frame(false)
+															.small(),
+														)
+													})
+													.inner;
+												surface.keep(&toggle);
+												if toggle.clicked() {
+													if original_shown {
+														self.show_original.remove(&id);
+													} else {
+														if self.show_original.len()
+															>= MAX_SHOWN_ORIGINALS
+														{
+															self.show_original.clear();
+														}
+														self.show_original.insert(id);
+													}
+													self.heights.remove(&id);
+													ui.ctx().request_repaint();
+												}
+											}
+											if limited {
 												ui.label(
 													RichText::new(crate::i18n::translate(
 														"timeline-show-with-scroll-display-limited-copy-message-for-the-full-text",
@@ -4260,13 +4502,58 @@ impl TimelineView {
 												self.heights.remove(&id);
 												ui.ctx().request_repaint();
 											}
-											if message.edited {
-												ui.label(
-													RichText::new(crate::i18n::translate(
-														"timeline-show-with-scroll-edited",
-													))
-													.small()
-													.color(colors.muted),
+											let notes = self.notes.get(message.id);
+											let history =
+												notes.iter().any(|note| !note.history.is_empty());
+											if message.edited || history {
+												plugin_history(ui, message.edited, notes, &colors);
+											}
+											for note in
+												notes.iter().filter(|note| !note.text.is_empty())
+											{
+												ui.horizontal_wrapped(|ui| {
+													ui.spacing_mut().item_spacing.x = 6.0;
+													ui.label(
+														RichText::new(&note.name)
+															.small()
+															.strong()
+															.color(colors.muted),
+													);
+													ui.label(
+														RichText::new(&note.text)
+															.small()
+															.color(colors.muted),
+													);
+												});
+											}
+											let mut day = timestamp(id).date();
+											for (note, row) in self.notes.deleted_between(
+												message.channel,
+												id,
+												next,
+											) {
+												let date = timestamp(row.message);
+												if date.date() != day {
+													day = date.date();
+													divider(
+														ui,
+														format!(
+															"{} {}, {}",
+															date.month(),
+															date.day(),
+															date.year()
+														),
+														false,
+														self.compact_messages,
+														None,
+													);
+												}
+												archived_row(
+													ui,
+													&note.name,
+													row,
+													self.notes.get(row.message),
+													&colors,
 												);
 											}
 											if !message.components.is_empty() {
@@ -5189,7 +5476,15 @@ impl TimelineView {
 				});
 				measurements.push((
 					id,
-					row_height_key(message, previous, self.unread_boundary, state, deleted),
+					row_height_key(
+						message,
+						previous,
+						next,
+						self.unread_boundary,
+						state,
+						deleted,
+						&self.notes,
+					),
 					response.response.rect.height(),
 				));
 			}
@@ -6534,12 +6829,15 @@ mod tests {
 		let mut channel = state.channels[0].clone();
 		channel.id = Id(21);
 		state.channels.push(channel);
+		view.notes.set("archive", "Archive", Id(10), "kept");
 		state.selected = Some(Id(21));
 		banner_frame(&ctx, &mut view, &mut state, vec![], false);
 		assert!(
 			view.video.posters.contains_key(&Id(10)),
 			"posters survive channel switches"
 		);
+		// Plugins are not asked again for what they annotated, so their notes stay too.
+		assert_eq!(view.notes.get(Id(10)).len(), 1);
 		assert!(view.video.poster_seen.contains(&Id(10)));
 		assert!(
 			view.video.active.is_none(),

@@ -19,15 +19,10 @@ mod credentials;
 mod dm_demo;
 mod downloads;
 mod emoji_upload;
-mod extension_app;
 mod extension_bridge;
-mod extension_data_events;
-mod extension_events;
-mod extension_forum_data;
-mod extension_member_details;
-mod extension_message_content;
+#[cfg(test)]
+mod extension_snapshot_tests;
 mod extension_start_screen;
-mod extensions;
 mod font_import;
 mod game_activity;
 mod game_mentions;
@@ -35,6 +30,7 @@ mod gpu;
 mod gpu_video;
 mod group_icon;
 mod interaction_uploads;
+mod media_tap;
 mod native_login;
 mod notification_runtime;
 mod notification_sounds;
@@ -726,7 +722,8 @@ fn demo_check_updates() {
 /// One offline debug path through the shipped Wasm, reducer, and egui rows.
 #[cfg(feature = "demo")]
 fn demo_check_extensions() {
-	let _ = extensions::demo_check_examples().expect("starter packages activate with consent");
+	let _ = extension_host::store::demo_check_examples()
+		.expect("starter packages activate with consent");
 	let mut state = test_support::demo_state();
 	state.set_preserve_deleted_messages(true);
 	let channel = state.selected.expect("demo conversation");
@@ -5541,6 +5538,32 @@ impl Desktop {
 				|| matches!(&event.event, Event::Reactions(client_core::reactions::Event::Read {channel,result:Err(Failure::Forbidden),..}) if self.state.selected==Some(*channel))
 				|| matches!(&event.event, Event::HistoryFailed { channel, request, failure: Failure::Forbidden }
                 if self.state.selected == Some(*channel) && self.state.request == self.state.history_request(*request) && self.state.history_pending);
+			// Losing one conversation forgets only its cached history (and its threads'); a
+			// session-wide reset still clears the account's.
+			let reset_history = matches!(event.event, Event::Resync | Event::PermissionsChanged);
+			let lost_channels: Vec<model::Id> = if !invalidate || reset_history {
+				Vec::new()
+			} else {
+				match &event.event {
+					Event::Unavailable(channel) => std::iter::once(*channel)
+						.chain(
+							self.state
+								.channels
+								.iter()
+								.filter(|c| {
+									matches!(c.kind, 10..=12) && c.parent_id == Some(*channel)
+								})
+								.map(|c| c.id),
+						)
+						.collect(),
+					Event::RecipientRemoved { channel, .. }
+					| Event::HistoryFailed { channel, .. }
+					| Event::Reactions(client_core::reactions::Event::Read { channel, .. }) => {
+						vec![*channel]
+					}
+					_ => Vec::new(),
+				}
+			};
 			let history_changed = changes_active_history(&self.state, &event.event);
 			if history_changed {
 				match &event.event {
@@ -5595,10 +5618,36 @@ impl Desktop {
 						})
 				)) {
 				self.notifications.dismiss();
+				self.extensions.dismiss_notifications();
 			}
-			let data_changes = extension_data_events::Changes::capture(&self.state, &event);
+			let data_changes = extension_host::data_events::Changes::capture(&self.state, &event);
+			let journal_records = self.extensions.journal_capture(&self.state, &event);
+			self.extensions.journal_changes_notes(&self.state, &event);
+			let session_started = event.generation == self.state.generation
+				&& matches!(event.event, Event::Ready { .. } | Event::Resync);
+			// Readable channels this event may take away, with their server, for the journal.
+			let journal_access: Vec<(model::Id, Option<model::Id>)> =
+				if self.extensions.journal_active() && event.generation == self.state.generation {
+					let deleted = match &event.event {
+						Event::Unavailable(id) => Some(*id),
+						_ => None,
+					};
+					self.state
+						.channels
+						.iter()
+						.filter(|channel| {
+							(removed_channels.contains(&channel.id)
+								|| deleted.is_some_and(|id| {
+									channel.id == id || channel.parent_id == Some(id)
+								})) && self.state.can_read_history(channel.id)
+						})
+						.map(|channel| (channel.id, channel.guild))
+						.collect()
+				} else {
+					Vec::new()
+				};
 			let extension_events = if self.extensions.has_message_events(&self.state) {
-				extension_events::capture(&self.state, &event.event)
+				extension_host::message_events::capture(&self.state, &event.event)
 			} else {
 				Vec::new()
 			};
@@ -5618,6 +5667,12 @@ impl Desktop {
 					.push(ui::design::Level::Info, ui::i18n::translate(message));
 			}
 			self.extensions.data_changed(data_changes);
+			let lost: Vec<_> = journal_access
+				.into_iter()
+				.filter(|(channel, _)| !self.state.can_read_history(*channel))
+				.collect();
+			self.extensions
+				.journal_record(&self.state, journal_records, session_started, &lost);
 			self.extensions.cancel_stale_message_events(&self.state);
 			for candidate in extension_events {
 				if let Some(event) = candidate.admit(&self.state) {
@@ -5651,10 +5706,18 @@ impl Desktop {
 			{
 				self.command(command);
 			}
-			// ponytail: accepted navigation removals clear account-wide history;
-			// add scoped disk deletion if channel churn makes refetch cost significant.
-			if invalidate || !removed_channels.is_empty() {
+			// A session-wide invalidation clears the account's cached history; losing some
+			// conversations removes only theirs, so the rest needs no refetch.
+			if invalidate && (reset_history || lost_channels.is_empty()) {
 				self.queue_cache(cache::Operation::ClearHistory);
+			} else {
+				let mut lost = lost_channels;
+				lost.extend(removed_channels.iter().copied());
+				lost.sort_unstable();
+				lost.dedup();
+				for channels in lost.chunks(512) {
+					self.queue_cache(cache::Operation::ClearChannels(channels.to_vec()));
+				}
 			}
 			persist_timeline |= history_changed;
 			if let Some(channel) = confirmed_channel {
@@ -6476,6 +6539,7 @@ impl eframe::App for Desktop {
 		};
 		if self.state.auth != AuthState::Authenticated && !self.state.demo {
 			self.notifications.clear();
+			self.extensions.dismiss_notifications();
 		}
 		if let Some(channel) = self.notifications.take_activation()
 			&& self.state.auth == AuthState::Authenticated
@@ -6492,22 +6556,18 @@ impl eframe::App for Desktop {
 			ctx,
 			self.fixture_only,
 		) {
-			match alert {
-				notification_runtime::Alert::Message {
-					channel,
-					title,
-					body,
-					avatar_key,
-					image_path,
-				} => {
-					if self
-						.notifications
-						.notify_channel(channel, title, body, image_path)
-						&& let Some(worker) = &self.avatars
-					{
-						worker.request(avatar_key);
-					}
-				}
+			// Enabled `notification` plugins may reword or hide it first.
+			self.extensions.offer_notification(&self.state, alert);
+		}
+		while let Some(ready) = self.extensions.take_notification(ctx) {
+			let alert = ready.alert;
+			let (avatar_key, image_path) = alert.extra;
+			if self
+				.notifications
+				.notify_channel(alert.channel, alert.title, alert.body, image_path)
+				&& let Some(worker) = &self.avatars
+			{
+				worker.request(avatar_key);
 			}
 		}
 		let talking = self.messaging.voice_push_to_talk && self.state.voice.active.is_some();

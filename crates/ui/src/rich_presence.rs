@@ -67,7 +67,7 @@ pub(crate) fn editor(
 		})
 		.collect();
 	if sections.is_empty() {
-		form(ui, elements, values, action);
+		form(ui, state, elements, values, action);
 		preview_card(ui, preview, avatars, state, activity_status);
 		return;
 	}
@@ -76,7 +76,7 @@ pub(crate) fn editor(
 		match element {
 			Element::Text { text } => design::hint(ui, text),
 			Element::Heading { .. } => {}
-			_ => form(ui, std::slice::from_ref(element), values, action),
+			_ => form(ui, state, std::slice::from_ref(element), values, action),
 		}
 	}
 	ui.add_space(12.0);
@@ -116,7 +116,7 @@ pub(crate) fn editor(
 				egui::vec2(width - 299.0, 0.0),
 				egui::Layout::top_down(egui::Align::Min),
 				|ui| {
-					design::group(ui, title, |ui| form(ui, fields, values, action));
+					design::group(ui, title, |ui| form(ui, state, fields, values, action));
 				},
 			);
 			ui.allocate_ui_with_layout(
@@ -128,7 +128,7 @@ pub(crate) fn editor(
 			);
 		});
 	} else {
-		design::group(ui, title, |ui| form(ui, fields, values, action));
+		design::group(ui, title, |ui| form(ui, state, fields, values, action));
 		ui.add_space(20.0);
 		preview_card(ui, preview, avatars, state, activity_status);
 	}
@@ -136,6 +136,7 @@ pub(crate) fn editor(
 
 fn form(
 	ui: &mut egui::Ui,
+	state: &client_core::State,
 	elements: &[Element],
 	values: &mut BTreeMap<String, String>,
 	action: &mut Option<String>,
@@ -193,7 +194,7 @@ fn form(
 					*action = Some(id.clone());
 				}
 			}
-			_ => render_elements(ui, std::slice::from_ref(element), values, action),
+			_ => render_elements(ui, state, std::slice::from_ref(element), values, action),
 		}
 	}
 }
@@ -308,7 +309,9 @@ pub(crate) fn summary(ui: &mut egui::Ui, presence: &CustomRichPresence) {
 fn seed_fields(elements: &[Element], values: &mut BTreeMap<String, String>) {
 	for element in elements {
 		match element {
-			Element::TextInput { id, value, .. } | Element::Select { id, value, .. } => {
+			Element::TextInput { id, value, .. }
+			| Element::Select { id, value, .. }
+			| Element::Picker { id, value, .. } => {
 				values.entry(id.clone()).or_insert_with(|| value.clone());
 			}
 			Element::Checkbox { id, checked, .. } => {

@@ -14,11 +14,17 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		Surface::MessageEvent => capabilities.push(Capability::MessageEvents),
 		Surface::AppEvent => capabilities.push(Capability::AppEvents),
 		Surface::Tick => capabilities.push(Capability::Appearance),
-		Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
+		Surface::Journal => capabilities.push(Capability::MessageJournal),
+		Surface::Topic => {}
+		Surface::Send => capabilities.push(Capability::SendHook),
+		Surface::Annotate => capabilities.push(Capability::MessageAnnotations),
+		Surface::Notification => capabilities.push(Capability::Notifications),
+		Surface::Media => capabilities.push(Capability::MediaWorker),
+		Surface::User | Surface::Channel | Surface::Server | Surface::Role | Surface::Call => {
 			capabilities.push(Capability::ContextMenus)
 		}
 	}
-	let manifest = Manifest {
+	let mut manifest = Manifest {
 		api_version: extensions::API_VERSION,
 		id: "sdk-check".into(),
 		name: "SDK compatibility check".into(),
@@ -27,6 +33,10 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
+		secrets: Vec::new(),
+		broadcasts: Vec::new(),
+		subscribes: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: action.into(),
@@ -34,6 +44,9 @@ fn manifest(action: &str, surface: Surface) -> Manifest {
 			surface,
 		}],
 	};
+	if surface == Surface::Topic {
+		manifest.subscribes = vec!["serein.test/1".into()];
+	}
 	manifest.validate().unwrap();
 	manifest
 }
@@ -64,6 +77,7 @@ fn host_invocations_and_legacy_handlers_keep_the_v1_contract() {
 		("channel", Surface::Channel),
 		("server", Surface::Server),
 		("role", Surface::Role),
+		("call", Surface::Call),
 	] {
 		let manifest = manifest(action, surface);
 		let input = Invocation {
@@ -90,6 +104,10 @@ fn host_invocations_and_legacy_handlers_keep_the_v1_contract() {
 				}),
 				Surface::Server => Some(extensions::MenuTarget::Server {
 					guild_id: "5".into(),
+				}),
+				Surface::Call => Some(extensions::MenuTarget::Call {
+					channel_id: "2".into(),
+					guild_id: Some("5".into()),
 				}),
 				Surface::Role => Some(extensions::MenuTarget::Role {
 					guild_id: "5".into(),

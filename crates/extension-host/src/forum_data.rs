@@ -1,11 +1,11 @@
 //! Loaded thread metadata only; no discovery, requests, or tags absent from core state.
-use crate::extension_app::{name, push};
+use crate::snapshot::{name, push};
 use client_core::State;
 use extensions::{ForumDataSnapshot, ForumPostSnapshot, MAX_FORUM_DATA_BYTES, MAX_FORUM_POSTS};
 use model::Freshness;
 
 pub fn snapshot(state: &State) -> Option<ForumDataSnapshot> {
-	if !crate::extension_app::available(state)
+	if !crate::snapshot::available(state)
 		|| !state.gateway_connected
 		|| state.freshness != Freshness::Fresh
 	{

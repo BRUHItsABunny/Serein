@@ -143,9 +143,10 @@ as `con` and `nul` are reserved. Themes declare no actions or capabilities.
 | `message_event` | Accepted live message change | `message_events`; receives one typed event. |
 | `app_event` | Supported app change | `app_events`; receives the reason and separately granted snapshots. |
 | `tick` | Host schedule while enabled and signed in | `appearance`; receives `tick_ms` through `TickInvocation`. |
+| `journal` | Message journal entries are waiting (preview) | `message_journal`; reads them with `host::journal::read` and may return only `storage`. |
 
 At most one action of **each** automatic surface is allowed: `activation`,
-`message_event`, `app_event` and `tick`. A capability alone does not register a handler;
+`message_event`, `app_event`, `tick` and `journal`. A capability alone does not register a handler;
 declare its action too.
 
 ### Scheduled appearance ticks
@@ -503,7 +504,7 @@ Rust authors use `export!`. Other languages must export:
 
 | Export | Contract |
 | --- | --- |
-| `memory` | 32-bit linear Wasm memory. No WASI or function imports. |
+| `memory` | 32-bit linear Wasm memory. No WASI; function imports only from `serein`, each gated by a capability where it reads or changes data ([host imports](../../docs/extensions.md#host-imports-preview)). |
 | `serein_alloc(i32 length) -> i32 pointer` | Allocate room for the host's UTF-8 JSON input. |
 | `serein_invoke(i32 pointer, i32 length) -> i64 output` | Return UTF-8 JSON: output pointer in the high 32 bits, byte length in the low 32 bits. |
 

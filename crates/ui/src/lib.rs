@@ -155,7 +155,7 @@ pub use voice::{StageFocus, VOICE_DEVICES_LOADED, VOICE_DEVICES_LOOKING, VoiceRo
 mod voice_latency;
 pub use voice_latency::VoiceLatency;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct VoiceGain {
 	pub input_percent: u16,
 	pub output_percent: u16,
@@ -613,6 +613,8 @@ pub struct MessagingUi {
 	pub notification_options: model::notification_preferences::Device,
 	pub notification_preview: Option<model::notification_preferences::Sound>,
 	pub notification_sound_status: &'static str,
+	/// Caption lines plugins show above the call controls.
+	pub call_captions: extension_host::captions::Captions,
 	pub notification_test_available: bool,
 	pub notification_test_requested: bool,
 	pub notification_status: &'static str,
@@ -2690,6 +2692,12 @@ impl MessagingUi {
 				}
 				self.apply_voice_join(state, commands);
 				self.take_archive_request(state, commands);
+				// A send hook's second message goes once its first is confirmed.
+				let (follow_ups, notices) = self.extensions.send_follow_ups(state);
+				commands.extend(follow_ups);
+				for notice in notices {
+					self.toasts.push(design::Level::Warning, notice);
+				}
 			});
 		if self.banner_rows > 0
 			&& let Some(art) = art
@@ -3555,6 +3563,10 @@ impl MessagingUi {
 		if self.upload_busy || self.image_share_requested.is_some() || !state.can_send(channel) {
 			return;
 		}
+		// A send hook switched on here gets the draft first; its result sends it later.
+		if self.extensions.intercept_send(state, channel) {
+			return;
+		}
 		let draft = state.drafts.get(&channel).map_or("", String::as_str);
 		if self.selected_files().is_empty()
 			&& let Some(assets) = model::ImageShare::markdown_only(draft)
@@ -3566,6 +3578,7 @@ impl MessagingUi {
 			}
 			self.image_share_requested =
 				Some((state.generation, channel, assets, draft.to_owned()));
+			self.extensions.sent(state, channel, None);
 			return;
 		}
 		let original_draft = if self.convert_emoticons {
@@ -3601,9 +3614,13 @@ impl MessagingUi {
 			// Consume this selection once, before desktop dispatch.
 			self.stage_pending_upload(ctx, &command);
 			self.timeline.follow_latest(state);
+			self.extensions.sent(state, channel, Some(&command));
 			commands.push(command);
-		} else if let Some(original) = original_draft {
-			state.drafts.insert(channel, original);
+		} else {
+			self.extensions.sent(state, channel, None);
+			if let Some(original) = original_draft {
+				state.drafts.insert(channel, original);
+			}
 		}
 	}
 	/// Submits message drafts or edits after applying the device conversion preference.
@@ -3865,6 +3882,22 @@ impl MessagingUi {
 			self.emoji_picker.reset();
 		}
 		let mut cancel_edit = false;
+		if !editing_here {
+			if let Some(outcome) = self.extensions.take_send_outcome(state, channel) {
+				use crate::extensions_ui::SendOutcome;
+				match outcome {
+					SendOutcome::Replace { text, send } => {
+						state.drafts.insert(channel, text);
+						if send {
+							self.submit_composer(state, ctx, commands);
+						}
+					}
+					SendOutcome::Send => self.submit_composer(state, ctx, commands),
+					SendOutcome::Keep(reason) => self.toasts.push(design::Level::Warning, reason),
+				}
+			}
+			self.extensions.send_hook_bar(ui, state, channel);
+		}
 		if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
 			let available = state.can_attach(channel) && !self.attach_busy && !editing_here;
 			egui::Frame::new()
@@ -6037,6 +6070,10 @@ impl MessagingUi {
 					);
 				}
 				self.startup_warnings_toasted = (state.generation, warnings);
+				if self.extensions.page_open(state) {
+					self.extensions.show_page(ui, state);
+					return;
+				}
 				if state.selected.is_none() && self.guild.is_none() {
 					self.call_bar(ui, state, &mut commands, None);
 					self.timeline.download.show_status(ui);
@@ -6276,6 +6313,7 @@ impl MessagingUi {
 					.then_some(self.reading_preferences.double_click_emoji());
 				self.timeline.instant_scrolling = !self.reading_preferences.smooth_scrolling;
 				self.timeline.extension_actions = self.extensions.message_actions();
+				self.extensions.drain_notes(&mut self.timeline.notes);
 				self.timeline.quick_reactions = Some(self.reaction_picker.quick_reactions(state));
 				let mut seen = std::collections::BTreeSet::new();
 				let author_lookup: Vec<_> = state
@@ -7696,6 +7734,299 @@ mod composer_tests {
 			assert_eq!(view.editing.as_ref().unwrap().2, kept);
 			assert!(view.edit_sent.is_none());
 		}
+	}
+
+	/// A plugin's confirmed proposal switches only its own hooks in one conversation: its
+	/// send hook replaces another plugin's and keeps a fallback the user chose, and a hook
+	/// the plugin does not have is refused.
+	#[test]
+	fn confirmed_hook_proposals_switch_only_the_plugins_own_hooks() {
+		use crate::extensions_ui::ExtensionRequest;
+		use extension_host::hooks::{ChannelHooks, Fallback, SendHook, SendMode};
+		let channel = Id(10);
+		let mut view = MessagingUi::default();
+		let plugin = |id: &str, surfaces: &[extensions::Surface]| {
+			let mut entry = crate::extensions_ui::tests::entry();
+			entry.enabled = true;
+			entry.manifest.id = id.into();
+			entry.manifest.actions = surfaces
+				.iter()
+				.map(|surface| extensions::Action {
+					id: format!("{surface:?}").to_lowercase(),
+					label: "Hook".into(),
+					surface: *surface,
+				})
+				.collect();
+			entry
+		};
+		use extensions::Surface::{Annotate, Send};
+		view.extensions.set_entries(vec![
+			plugin("translator", &[Annotate, Send]),
+			plugin("archive", &[Annotate]),
+			plugin("other", &[Send]),
+		]);
+		view.extensions.channel_hooks = vec![ChannelHooks {
+			channel,
+			send: Some(SendHook {
+				plugin: "other".into(),
+				mode: SendMode::Preview,
+				fallback: Fallback::SendOriginal,
+			}),
+			annotate: vec!["archive".into()],
+		}];
+		let saved = |view: &mut MessagingUi| match std::mem::take(&mut view.extensions.requests)
+			.as_slice()
+		{
+			[ExtensionRequest::SetChannelHooks { hooks }] => hooks.clone(),
+			other => panic!("one save, got {}", other.len()),
+		};
+		view.extensions
+			.set_plugin_hooks("translator", channel, true, Some(SendMode::Auto))
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(hooks.annotate, ["archive", "translator"]);
+		let send = hooks.send.clone().unwrap();
+		assert_eq!(
+			(send.plugin.as_str(), send.mode, send.fallback),
+			("translator", SendMode::Auto, Fallback::KeepDraft),
+			"another plugin's fallback is not inherited"
+		);
+		// Its own fallback stays when the mode changes.
+		view.extensions.channel_hooks = vec![ChannelHooks {
+			send: Some(SendHook {
+				fallback: Fallback::SendOriginal,
+				..send
+			}),
+			..hooks
+		}];
+		view.extensions
+			.set_plugin_hooks("translator", channel, false, Some(SendMode::Preview))
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(hooks.annotate, ["archive"]);
+		assert_eq!(
+			hooks.send.as_ref().unwrap().fallback,
+			Fallback::SendOriginal
+		);
+		// Switching off leaves the other plugins alone.
+		view.extensions.channel_hooks = vec![hooks];
+		view.extensions
+			.set_plugin_hooks("translator", channel, false, None)
+			.unwrap();
+		let hooks = saved(&mut view);
+		assert_eq!(
+			(hooks.annotate.as_slice(), hooks.send),
+			(&["archive".to_owned()][..], None)
+		);
+		assert!(
+			view.extensions
+				.set_plugin_hooks("archive", channel, true, Some(SendMode::Auto))
+				.is_err()
+		);
+		assert!(view.extensions.requests.is_empty());
+	}
+
+	#[test]
+	fn send_hooks_hold_the_draft_until_the_plugin_answers_and_fall_back_as_chosen() {
+		use crate::extensions_ui::ExtensionRequest;
+		use extension_host::hooks::{ChannelHooks, Fallback, SendHook, SendMode};
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let channel = Id(10);
+		let mut view = MessagingUi::default();
+		let mut entry = crate::extensions_ui::tests::entry();
+		entry.enabled = true;
+		entry.manifest.id = "translator".into();
+		entry.manifest.capabilities = vec![extensions::Capability::SendHook];
+		entry.manifest.actions = vec![extensions::Action {
+			id: "send".into(),
+			label: "Translate".into(),
+			surface: extensions::Surface::Send,
+		}];
+		view.extensions.set_entries(vec![entry]);
+		let hook = |view: &mut MessagingUi, state: &mut State, mode, fallback, draft: &str| {
+			view.extensions.channel_hooks = vec![ChannelHooks {
+				channel,
+				send: Some(SendHook {
+					plugin: "translator".into(),
+					mode,
+					fallback,
+				}),
+				annotate: Vec::new(),
+			}];
+			state.drafts.insert(channel, draft.into());
+			let mut commands = Vec::new();
+			view.submit_composer(state, &ctx, &mut commands);
+			assert!(
+				commands.is_empty(),
+				"nothing is sent before the hook answers"
+			);
+			let mut requests = std::mem::take(&mut view.extensions.requests);
+			let Some(ExtensionRequest::Invoke {
+				id,
+				invocation,
+				context,
+			}) = requests.pop()
+			else {
+				panic!("the draft goes to the hook")
+			};
+			assert_eq!(invocation.composer.as_deref(), Some(draft));
+			assert_eq!(invocation.send_target.as_ref().unwrap().channel_id, "10");
+			(id, invocation, context)
+		};
+		let frame = |view: &mut MessagingUi, state: &mut State| {
+			let mut commands = Vec::new();
+			ctx.run_ui(Default::default(), |ui| {
+				view.composer(ui, state, channel, &ctx, &mut commands);
+			})
+			.drop_without_applying_deltas();
+			commands
+		};
+		let sent = |commands: &[Command]| match commands {
+			[Command::Send { content, .. }] => Some(content.clone()),
+			_ => None,
+		};
+		// Preview: the rewrite replaces the draft, and Enter then sends it without asking again.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Preview,
+			Fallback::KeepDraft,
+			"hallo",
+		);
+		let rewrite = extensions::Output {
+			replacement: Some("hello".into()),
+			..Default::default()
+		};
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite.clone(), &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "hello");
+		let mut commands = Vec::new();
+		view.submit_composer(&mut state, &ctx, &mut commands);
+		assert_eq!(sent(&commands).as_deref(), Some("hello"));
+		assert!(view.extensions.requests.is_empty());
+		state.pending.clear();
+		// Automatic: the rewrite is sent at once.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"zwei",
+		);
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite.clone(), &state);
+		assert_eq!(
+			sent(&frame(&mut view, &mut state)).as_deref(),
+			Some("hello")
+		);
+		state.pending.clear();
+		// A draft edited while the hook ran is neither replaced nor sent.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"drei",
+		);
+		state.drafts.insert(channel, "drei!".into());
+		view.extensions
+			.present_output(id.clone(), invocation, context, rewrite, &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "drei!");
+		// Failures follow the channel's fallback.
+		let (id, invocation, _) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"vier",
+		);
+		view.extensions.send_failed(&id, &invocation);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "vier");
+		let (id, invocation, _) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::SendOriginal,
+			"fünf",
+		);
+		view.extensions.send_failed(&id, &invocation);
+		assert_eq!(sent(&frame(&mut view, &mut state)).as_deref(), Some("fünf"));
+		state.pending.clear();
+
+		// A follow-up alone still waits for review, then goes only after Discord confirms
+		// the first message, in the same channel.
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Preview,
+			Fallback::KeepDraft,
+			"sechs",
+		);
+		let follow = extensions::Output {
+			follow_up: Some("six".into()),
+			..Default::default()
+		};
+		view.extensions
+			.present_output(id.clone(), invocation, context, follow.clone(), &state);
+		assert!(frame(&mut view, &mut state).is_empty());
+		assert_eq!(state.drafts[&channel], "sechs");
+		let mut commands = Vec::new();
+		view.submit_composer(&mut state, &ctx, &mut commands);
+		let Some(Command::Send { nonce, .. }) = commands.into_iter().next() else {
+			panic!("the reviewed draft is sent first")
+		};
+		assert!(view.extensions.send_follow_ups(&mut state).0.is_empty());
+		let mut first = test_support::message(7001, channel);
+		first.author = state.user.clone().unwrap();
+		first.nonce = Some(nonce.clone());
+		// The gateway echo usually arrives before the send's own reply and ends the pending
+		// row; the follow-up still goes, and only once.
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::Message(first.clone()),
+		});
+		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
+		assert!(notices.is_empty(), "{notices:?}");
+		assert_eq!(sent(&follow_ups).as_deref(), Some("six"));
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::SendResult {
+				nonce,
+				result: Ok(first),
+			},
+		});
+		assert!(
+			view.extensions.send_follow_ups(&mut state).0.is_empty(),
+			"sent once"
+		);
+		// When the first message fails, the follow-up is dropped with a notice.
+		state.pending.clear();
+		let (id, invocation, context) = hook(
+			&mut view,
+			&mut state,
+			SendMode::Auto,
+			Fallback::KeepDraft,
+			"sieben",
+		);
+		view.extensions
+			.present_output(id, invocation, context, follow, &state);
+		let Some(Command::Send { nonce, .. }) = frame(&mut view, &mut state).into_iter().next()
+		else {
+			panic!("sent at once")
+		};
+		state.apply(client_core::Envelope {
+			generation: state.generation,
+			event: client_core::Event::SendResult {
+				nonce,
+				result: Err(client_core::auth::Failure::ProtocolAt("rejected")),
+			},
+		});
+		let (follow_ups, notices) = view.extensions.send_follow_ups(&mut state);
+		assert!(follow_ups.is_empty() && notices.len() == 1);
 	}
 
 	fn edit_state() -> State {

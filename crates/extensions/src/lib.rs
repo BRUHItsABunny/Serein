@@ -4,7 +4,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod runtime;
-pub use runtime::invoke;
+pub use runtime::{
+	INPUT_BYTE_FUEL, MEDIA_BYTE_FUEL, MEDIA_FUEL, MEDIA_MEMORY_BYTES, MediaInstance, invoke,
+	invoke_with,
+};
+pub mod imports;
+pub mod message_hooks;
+pub use message_hooks::{
+	Alternate, AnnotateBatch, AnnotateMessage, Annotation, DeletedMessage, DeletedMessages,
+	MessageHistory, SendTarget,
+};
+pub mod captions;
+pub use captions::Caption;
+pub mod files;
+pub use files::{AttachmentFetch, FileHandleInfo, FilePick, FileRequest, FileWrite, PickKind};
+pub mod media;
+pub use media::{CallEvent, MediaBatch, MediaItem};
+pub mod notification_hook;
+pub mod pages;
+pub use notification_hook::{NotificationDecision, NotificationInput, NotificationSource};
+pub use pages::{Page, PageList, PageRequest, PageRevision, PageRow, PageRowState, PageRows};
+pub mod network;
+pub mod topics;
+pub use imports::{HostImports, NoHostImports, Reply};
 mod rich_presence;
 pub use rich_presence::*;
 mod discovery;
@@ -39,7 +61,7 @@ pub const MAX_EVENT_CONTENT_BYTES: usize = 16 * 1024;
 pub const MAX_STORAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_PLUGINS: usize = 8;
 pub const MAX_PANEL_ELEMENTS: usize = 64;
-pub const MAX_CAPABILITIES: usize = 64;
+pub const MAX_CAPABILITIES: usize = 96;
 /// Minimum delay between completed host-scheduled appearance ticks.
 pub const TICK_MIN_INTERVAL_MS: u64 = 250;
 
@@ -157,6 +179,50 @@ pub enum Capability {
 	InterfaceUi,
 	/// Customize the start (connecting) screen shown before any account loads.
 	StartScreen,
+	/// Import `serein.clock_now_ms` to read the current time.
+	Clock,
+	/// Import `serein.random_fill` for secure random bytes.
+	Random,
+	/// Import `serein.db_execute` for a private SQLite database on this device.
+	Database,
+	/// Receive every message create, edit and delete the account sees, with earlier text
+	/// where the host has it, through `serein.journal_read` on a `journal` action.
+	MessageJournal,
+	/// Make HTTPS requests with `serein.https_request` to the origins in the manifest's
+	/// `network` list.
+	Network,
+	/// Rewrite the user's draft in a `send` action before it is sent, in channels where the
+	/// user switched the hook on.
+	SendHook,
+	/// Add notes under messages from an `annotate` action, in channels where the user
+	/// switched it on, and under the message a `message` action was chosen on.
+	MessageAnnotations,
+	/// See each desktop alert, with its message preview, before it is shown and reword or
+	/// hide it from a `notification` action.
+	Notifications,
+	/// Show a page in the main area from activation and panel actions, with a long list the
+	/// host fetches from a panel action as the user scrolls.
+	Pages,
+	/// Show a few caption lines above the call controls during a call.
+	CallCaptions,
+	/// Read and write files in a private folder, and in folders and files the user picks,
+	/// through `serein.file_request` and `serein.file_write`.
+	Files,
+	/// Keep one instance loaded during calls that receives call events, and with media taps
+	/// call media, in batches through a `media` action.
+	MediaWorker,
+	/// Receive the decrypted audio and video packets of everyone in the call in `media`
+	/// batches, and ask senders for keyframes. Requires `media_worker`.
+	MediaPackets,
+	/// Receive each speaker's audio as 16 kHz mono samples in `media` batches. Requires
+	/// `media_worker`.
+	MediaAudio,
+	/// Save original message attachments from Discord's CDN into the private folder with
+	/// `serein.attachment_fetch`. Requires `files`.
+	MediaArchive,
+	/// Also receive the user's own microphone, camera, screen share and screen share audio,
+	/// as sent, in `media` batches. Requires `media_packets`.
+	MediaOwn,
 }
 
 /// Host-defined interface behavior that a plugin may switch on for the whole client from
@@ -222,12 +288,36 @@ pub enum Surface {
 	Server,
 	/// An entry in a role's context menu; the invocation names the role and its server.
 	Role,
+	/// Host-scheduled delivery of the message journal; the plugin pulls entries with
+	/// `serein.journal_read`. Requires `message_journal`.
+	Journal,
+	/// Host-scheduled delivery of broadcasts from approved providers; the plugin pulls them
+	/// with `serein.topic_read`. Requires a `subscribes` list.
+	Topic,
+	/// Runs when the user sends a message in a channel where they switched this hook on; the
+	/// draft arrives in `composer` and `replacement` rewrites it. Requires `send_hook`.
+	Send,
+	/// Host-scheduled batches of messages in channels where the user switched annotations on;
+	/// the result's `annotations` are shown under them. Requires `message_annotations`.
+	Annotate,
+	/// Runs before each desktop alert with it in `notification`; the result's `notification`
+	/// rewords or hides it. Requires `notifications`.
+	Notification,
+	/// Runs in an instance kept loaded during a call, once per batch in `media`. Requires
+	/// `media_worker`.
+	Media,
+	/// An entry in the call controls' More menu; the invocation names the call's channel.
+	/// Requires `context_menus`.
+	Call,
 }
 
 impl Surface {
 	/// Context-menu surfaces whose invocation carries a [`MenuTarget`].
 	pub fn is_context_menu(self) -> bool {
-		matches!(self, Self::User | Self::Channel | Self::Server | Self::Role)
+		matches!(
+			self,
+			Self::User | Self::Channel | Self::Server | Self::Role | Self::Call
+		)
 	}
 }
 
@@ -254,6 +344,21 @@ pub struct Manifest {
 	pub capabilities: Vec<Capability>,
 	#[serde(default)]
 	pub actions: Vec<Action>,
+	/// HTTPS origins `serein.https_request` may reach; requires the `network` capability.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub network: Vec<String>,
+	/// Values the user enters for this plugin, such as API keys. The host fills them into
+	/// requests to their origins; the plugin never reads them.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub secrets: Vec<network::SecretSpec>,
+	/// Versioned topics this plugin may broadcast to approved subscribers, such as
+	/// `serein.captions/1`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub broadcasts: Vec<String>,
+	/// Topics this plugin receives through its `topic` action once the user approves a
+	/// provider for each.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub subscribes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +519,9 @@ pub struct CatalogEntry {
 	pub sha256: String,
 	pub download_bytes: u64,
 	pub source_commit: String,
+	/// The added catalog source the host found this entry in; never read from a catalog.
+	#[serde(skip)]
+	pub catalog_source: Option<String>,
 }
 
 /// A creator-supplied shop image, pinned independently from executable packages.
@@ -479,6 +587,21 @@ pub struct Invocation {
 	/// Panel button activations leave it false.
 	#[serde(default, skip_serializing_if = "interface_ui::is_false")]
 	pub double_clicked: bool,
+	/// Where the draft of a `send` action is going.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub send_target: Option<Box<SendTarget>>,
+	/// Messages for an `annotate` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotate: Option<Box<AnnotateBatch>>,
+	/// The alert for a `notification` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notification: Option<Box<NotificationInput>>,
+	/// The rows a page's list needs, on its `rows_action`. Requires `pages`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub page_request: Option<Box<PageRequest>>,
+	/// A batch for a `media` action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media: Option<Box<MediaBatch>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,6 +678,12 @@ pub enum MenuTarget {
 	Server {
 		guild_id: String,
 	},
+	/// The call the user is in, from the call controls.
+	Call {
+		channel_id: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		guild_id: Option<String>,
+	},
 	/// Besides IDs, a role carries the name and color shown on the chip that was clicked.
 	Role {
 		guild_id: String,
@@ -579,6 +708,7 @@ impl MenuTarget {
 			Self::Channel { .. } => Surface::Channel,
 			Self::Server { .. } => Surface::Server,
 			Self::Role { .. } => Surface::Role,
+			Self::Call { .. } => Surface::Call,
 		}
 	}
 	/// Every ID the target carries, required ones first.
@@ -590,6 +720,10 @@ impl MenuTarget {
 				channel_id,
 			} => (Some(user_id), guild_id.as_ref(), channel_id.as_ref()),
 			Self::Channel {
+				channel_id,
+				guild_id,
+			}
+			| Self::Call {
 				channel_id,
 				guild_id,
 			} => (Some(channel_id), guild_id.as_ref(), None),
@@ -756,6 +890,63 @@ pub struct Output {
 		deserialize_with = "start_screen::present"
 	)]
 	pub start_screen: Option<Option<StartScreen>>,
+	/// Notes under messages from an `annotate` action, or under the chosen message of a
+	/// `message` action; empty text removes this plugin's note. Requires `message_annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub annotations: Vec<Annotation>,
+	/// How a `notification` action wants the alert shown. Requires `notifications`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notification: Option<NotificationDecision>,
+	/// Opens or replaces this plugin's page; an explicit `null` closes it and an omitted field
+	/// keeps it. Requires `pages`; activation and panel actions only.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		deserialize_with = "pages::present"
+	)]
+	pub page: Option<Option<Page>>,
+	/// Rows answering the invocation's `page_request`. Requires `pages`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub page_rows: Option<PageRows>,
+	/// Earlier versions of messages, shown behind their "edited" label; same rules as
+	/// `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub histories: Vec<MessageHistory>,
+	/// Deleted messages the plugin kept, shown as deleted rows under the message they
+	/// followed; same rules as `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub deleted_messages: Vec<DeletedMessages>,
+	/// Text shown in place of messages, such as their translation, with a toggle back to the
+	/// message itself; same rules as `annotations`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub alternates: Vec<Alternate>,
+	/// A second message a `send` action sends right after the first one is confirmed, in the
+	/// same channel. Requires `send_hook`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub follow_up: Option<String>,
+	/// This plugin's caption lines in the call; an empty list clears them. Requires
+	/// `call_captions`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub captions: Option<Vec<Caption>>,
+	/// Asks the user to pick a folder or file for this plugin. Requires `files`; activation
+	/// and panel actions only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pick: Option<FilePick>,
+	/// Camera and screen share streams, such as `camera:<user>`, whose senders are asked for
+	/// a keyframe. Requires `media_packets`; `media` actions only.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub keyframes: Vec<String>,
+	/// Replaces what this plugin's media worker is told: any JSON value of at most
+	/// [`media::MAX_MEDIA_STATE_BYTES`], such as its settings or "record this call". The
+	/// running worker gets it in its next batch and each later worker in its first, as a
+	/// `state` item. Requires `media_worker`; not from `media`, `send`, `annotate` or
+	/// `notification` actions.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_state: Option<serde_json::Value>,
+	/// `false` stops sending this worker media chunks while it only waits for events;
+	/// `true` resumes them. Requires `media_packets` or `media_audio`; `media` actions only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub media_chunks: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -801,6 +992,57 @@ pub enum Element {
 		max: i32,
 		value: i32,
 	},
+	/// A search box over the servers, conversations and people Serein has loaded. Names stay
+	/// in Serein; the plugin receives only the choice, as `<kind>:<id>` such as `user:42`, or
+	/// an empty value when nothing is chosen, and the chosen name in `<id>-name`.
+	Picker {
+		id: String,
+		label: String,
+		kinds: Vec<PickerKind>,
+		#[serde(default)]
+		value: String,
+	},
+}
+
+/// What a [`Element::Picker`] offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerKind {
+	Server,
+	/// A server channel or thread.
+	Channel,
+	Dm,
+	Group,
+	User,
+}
+
+impl PickerKind {
+	pub const ALL: [Self; 5] = [
+		Self::Server,
+		Self::Channel,
+		Self::Dm,
+		Self::Group,
+		Self::User,
+	];
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Server => "server",
+			Self::Channel => "channel",
+			Self::Dm => "dm",
+			Self::Group => "group",
+			Self::User => "user",
+		}
+	}
+
+	/// Reads a picker value; `None` for anything but `<kind>:<snowflake>`.
+	pub fn parse(value: &str) -> Option<(Self, u64)> {
+		let (kind, text) = value.split_once(':')?;
+		let kind = Self::ALL.into_iter().find(|k| k.as_str() == kind)?;
+		let id = text.parse::<u64>().ok().filter(|id| *id != 0)?;
+		// One spelling per choice: no sign or leading zeros.
+		(id.to_string() == text).then_some((kind, id))
+	}
 }
 
 pub fn valid_id(value: &str) -> bool {
@@ -889,6 +1131,38 @@ impl Manifest {
 		if self.capabilities.iter().any(|c| !capabilities.insert(*c)) {
 			return Err(Error::Invalid);
 		}
+		if self.network.len() > network::MAX_ORIGINS {
+			return Err(Error::Limit);
+		}
+		let mut origins = BTreeSet::new();
+		if self.network.iter().any(|origin| {
+			network::Origin::parse(origin).is_none_or(|origin| !origins.insert(origin))
+		}) {
+			return Err(Error::Invalid);
+		}
+		// Hosts only mean something with the capability, and the capability needs hosts.
+		if capabilities.contains(&Capability::Network) == self.network.is_empty() {
+			return Err(Error::Capability);
+		}
+		network::validate_secrets(&self.secrets, &origins)?;
+		topics::validate(self)?;
+		message_hooks::validate(self)?;
+		if capabilities.contains(&Capability::MediaArchive)
+			&& !capabilities.contains(&Capability::Files)
+		{
+			return Err(Error::Capability);
+		}
+		if (capabilities.contains(&Capability::MediaPackets)
+			|| capabilities.contains(&Capability::MediaAudio))
+			&& !capabilities.contains(&Capability::MediaWorker)
+		{
+			return Err(Error::Capability);
+		}
+		if capabilities.contains(&Capability::MediaOwn)
+			&& !capabilities.contains(&Capability::MediaPackets)
+		{
+			return Err(Error::Capability);
+		}
 		if capabilities.contains(&Capability::DataEvents)
 			&& !capabilities.contains(&Capability::AppEvents)
 		{
@@ -917,6 +1191,12 @@ impl Manifest {
 			Surface::MessageEvent,
 			Surface::AppEvent,
 			Surface::Tick,
+			Surface::Journal,
+			Surface::Topic,
+			Surface::Send,
+			Surface::Annotate,
+			Surface::Notification,
+			Surface::Media,
 		] {
 			if self
 				.actions
@@ -942,13 +1222,21 @@ impl Manifest {
 				Surface::Message => Some(Capability::SelectedMessage),
 				Surface::Composer => Some(Capability::Composer),
 				Surface::Panel => None,
-				Surface::User | Surface::Channel | Surface::Server | Surface::Role => {
-					Some(Capability::ContextMenus)
-				}
+				Surface::User
+				| Surface::Channel
+				| Surface::Server
+				| Surface::Role
+				| Surface::Call => Some(Capability::ContextMenus),
 				Surface::Activation => None,
 				Surface::MessageEvent => Some(Capability::MessageEvents),
 				Surface::AppEvent => Some(Capability::AppEvents),
 				Surface::Tick => Some(Capability::Appearance),
+				Surface::Journal => Some(Capability::MessageJournal),
+				Surface::Topic => None,
+				Surface::Send => Some(Capability::SendHook),
+				Surface::Annotate => Some(Capability::MessageAnnotations),
+				Surface::Notification => Some(Capability::Notifications),
+				Surface::Media => Some(Capability::MediaWorker),
 			};
 			if required.is_some_and(|c| !capabilities.contains(&c)) {
 				return Err(Error::Capability);
@@ -1135,7 +1423,7 @@ impl Package {
 				if self.wasm.len() > MAX_MODULE_BYTES {
 					return Err(Error::Limit);
 				}
-				runtime::validate_module(&self.wasm)
+				runtime::validate_module(&self.wasm, &self.manifest)
 			}
 			_ => Err(Error::Invalid),
 		}
@@ -1269,9 +1557,56 @@ impl Invocation {
 		} else if self.message_event.is_some() {
 			return Err(Error::Capability);
 		}
+		// A `send` action's draft arrives with its target, under the hook's own grant.
+		match (&self.send_target, action.surface == Surface::Send) {
+			(Some(target), true)
+				if self.composer.is_some()
+					&& manifest.capabilities.contains(&Capability::SendHook) =>
+			{
+				target.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		match (&self.annotate, action.surface == Surface::Annotate) {
+			(Some(batch), true)
+				if manifest
+					.capabilities
+					.contains(&Capability::MessageAnnotations) =>
+			{
+				batch.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		match (&self.notification, action.surface == Surface::Notification) {
+			(Some(alert), true) if manifest.capabilities.contains(&Capability::Notifications) => {
+				alert.validate()?
+			}
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		match (&self.media, action.surface == Surface::Media) {
+			(Some(batch), true) => batch.validate()?,
+			(None, false) => {}
+			_ => return Err(Error::Capability),
+		}
+		if let Some(request) = &self.page_request {
+			if action.surface != Surface::Panel
+				|| !manifest.capabilities.contains(&Capability::Pages)
+			{
+				return Err(Error::Capability);
+			}
+			request.validate()?;
+		}
+		let composer_grant = if action.surface == Surface::Send {
+			Capability::SendHook
+		} else {
+			Capability::Composer
+		};
 		for (data, capability) in [
 			(&self.selected_message, Capability::SelectedMessage),
-			(&self.composer, Capability::Composer),
+			(&self.composer, composer_grant),
 			(&self.storage, Capability::Storage),
 		] {
 			if let Some(data) = data {
@@ -1297,21 +1632,30 @@ impl Invocation {
 			reference.validate()?;
 		}
 		if self.selected_message.is_some() && action.surface != Surface::Message
-			|| self.composer.is_some() && action.surface != Surface::Composer
+			|| self.composer.is_some()
+				&& !matches!(action.surface, Surface::Composer | Surface::Send)
 			|| self.tick_ms.is_some() && action.surface != Surface::Tick
 			|| self.tick_ms.is_none() && action.surface == Surface::Tick
 		{
 			return Err(Error::Capability);
 		}
-		if action.surface == Surface::Tick
-			&& (!self.values.is_empty()
-				|| self.message_event.is_some()
-				|| self.app.is_some()
-				|| self.app_event.is_some()
-				|| self.action_result.is_some()
-				|| self.queries.is_some()
-				|| self.messaging_settings.is_some()
-				|| self.guild_folders.is_some())
+		if matches!(
+			action.surface,
+			Surface::Tick
+				| Surface::Journal
+				| Surface::Topic
+				| Surface::Send
+				| Surface::Annotate
+				| Surface::Notification
+				| Surface::Media
+		) && (!self.values.is_empty()
+			|| self.message_event.is_some()
+			|| self.app.is_some()
+			|| self.app_event.is_some()
+			|| self.action_result.is_some()
+			|| self.queries.is_some()
+			|| self.messaging_settings.is_some()
+			|| self.guild_folders.is_some())
 		{
 			return Err(Error::Capability);
 		}
@@ -1372,6 +1716,165 @@ impl Output {
 			if let Some(screen) = start {
 				screen.validate().map_err(|_| Error::Invalid)?;
 			}
+		}
+		if !self.annotations.is_empty()
+			|| !self.histories.is_empty()
+			|| !self.deleted_messages.is_empty()
+			|| !self.alternates.is_empty()
+		{
+			let allowed: Vec<&str> = match (surface, &input.annotate, &input.selected_message_ref) {
+				(Surface::Annotate, Some(batch), _) => batch
+					.messages
+					.iter()
+					.map(|message| message.message_id.as_str())
+					.collect(),
+				(Surface::Message, _, Some(reference)) => vec![reference.message_id.as_str()],
+				_ => return Err(Error::Capability),
+			};
+			if !manifest
+				.capabilities
+				.contains(&Capability::MessageAnnotations)
+			{
+				return Err(Error::Capability);
+			}
+			message_hooks::validate_annotations(&self.annotations, &allowed)?;
+			message_hooks::validate_history(&self.histories, &self.deleted_messages, &allowed)?;
+			message_hooks::validate_alternates(&self.alternates, &allowed)?;
+		}
+		if let Some(text) = &self.follow_up {
+			if surface != Surface::Send || !manifest.capabilities.contains(&Capability::SendHook) {
+				return Err(Error::Capability);
+			}
+			message_hooks::validate_follow_up(text)?;
+		}
+		match (&self.notification, surface == Surface::Notification) {
+			(Some(decision), true) => decision.validate()?,
+			(None, _) => {}
+			_ => return Err(Error::Capability),
+		}
+		if let Some(Some(page)) = &self.page {
+			if !manifest.capabilities.contains(&Capability::Pages)
+				|| !matches!(surface, Surface::Activation | Surface::Panel)
+			{
+				return Err(Error::Capability);
+			}
+			page.validate(|id| {
+				manifest
+					.actions
+					.iter()
+					.any(|action| action.id == id && action.surface == Surface::Panel)
+			})?;
+			let mut count = 0;
+			validate_elements(
+				&page.elements,
+				0,
+				&mut count,
+				&mut BTreeSet::new(),
+				manifest,
+			)?;
+		} else if self.page.is_some()
+			&& (!manifest.capabilities.contains(&Capability::Pages)
+				|| !matches!(surface, Surface::Activation | Surface::Panel))
+		{
+			return Err(Error::Capability);
+		}
+		if let Some(pick) = &self.pick {
+			if !manifest.capabilities.contains(&Capability::Files)
+				|| !matches!(surface, Surface::Activation | Surface::Panel)
+				|| input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			pick.validate(|id| {
+				manifest
+					.actions
+					.iter()
+					.any(|action| action.id == id && action.surface == Surface::Panel)
+			})?;
+		}
+		if !self.keyframes.is_empty() {
+			if surface != Surface::Media
+				|| !manifest.capabilities.contains(&Capability::MediaPackets)
+			{
+				return Err(Error::Capability);
+			}
+			media::validate_keyframes(&self.keyframes)?;
+		}
+		if let Some(state) = &self.media_state {
+			if !manifest.capabilities.contains(&Capability::MediaWorker)
+				|| matches!(
+					surface,
+					Surface::Media | Surface::Send | Surface::Annotate | Surface::Notification
+				) || input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			media::validate_state(state)?;
+		}
+		if self.media_chunks.is_some()
+			&& (surface != Surface::Media
+				|| !manifest.capabilities.contains(&Capability::MediaPackets)
+					&& !manifest.capabilities.contains(&Capability::MediaAudio))
+		{
+			return Err(Error::Capability);
+		}
+		if let Some(captions) = &self.captions {
+			if !manifest.capabilities.contains(&Capability::CallCaptions)
+				|| matches!(
+					surface,
+					Surface::Send | Surface::Annotate | Surface::Notification
+				) || input.page_request.is_some()
+			{
+				return Err(Error::Capability);
+			}
+			captions::validate(captions)?;
+		}
+		match (&self.page_rows, &input.page_request) {
+			(Some(rows), Some(request)) => rows.validate(request)?,
+			(Some(_), None) => return Err(Error::Capability),
+			(None, _) => {}
+		}
+		// A row fetch runs while the user scrolls: it answers with rows and nothing to review.
+		if input.page_request.is_some()
+			&& (self.rich_presence.is_some()
+				|| self.api_proxy.is_some()
+				|| self.image_sharing
+				|| self.preserve_deleted_messages
+				|| self.appearance.is_some()
+				|| self.replacement.is_some()
+				|| !self.panel.is_empty()
+				|| !self.effects.is_empty()
+				|| self.interface_tweaks.is_some()
+				|| self.interface_ui.is_some()
+				|| self.start_screen.is_some()
+				|| !self.annotations.is_empty())
+		{
+			return Err(Error::Capability);
+		}
+		// Background deliveries and hooks may only save storage, and a send hook its rewrite;
+		// database writes go through imports.
+		if matches!(
+			surface,
+			Surface::Journal
+				| Surface::Topic
+				| Surface::Send
+				| Surface::Annotate
+				| Surface::Notification
+				| Surface::Media
+		) && (self.storage.is_some() && surface == Surface::Media
+			|| self.rich_presence.is_some()
+			|| self.api_proxy.is_some()
+			|| self.image_sharing
+			|| self.preserve_deleted_messages
+			|| self.appearance.is_some()
+			|| self.replacement.is_some() && surface != Surface::Send
+			|| !self.panel.is_empty()
+			|| !self.effects.is_empty()
+			|| self.interface_tweaks.is_some()
+			|| self.interface_ui.is_some()
+			|| self.start_screen.is_some())
+		{
+			return Err(Error::Capability);
 		}
 		if surface == Surface::Tick
 			&& (self.rich_presence.is_some()
@@ -1439,8 +1942,13 @@ impl Output {
 		{
 			return Err(Error::Capability);
 		}
+		let replaces = if surface == Surface::Send {
+			Capability::SendHook
+		} else {
+			Capability::Composer
+		};
 		if self.replacement.is_some()
-			&& (input.composer.is_none() || !manifest.capabilities.contains(&Capability::Composer))
+			&& (input.composer.is_none() || !manifest.capabilities.contains(&replaces))
 		{
 			return Err(Error::Capability);
 		}
@@ -1547,6 +2055,22 @@ fn validate_elements(
 				value,
 			} => {
 				if min >= max || !(*min..=*max).contains(value) {
+					return Err(Error::Invalid);
+				}
+				(id, label)
+			}
+			Element::Picker {
+				id,
+				label,
+				kinds,
+				value,
+			} => {
+				let unique: BTreeSet<_> = kinds.iter().collect();
+				if kinds.is_empty()
+					|| unique.len() != kinds.len()
+					|| !(value.is_empty()
+						|| PickerKind::parse(value).is_some_and(|(kind, _)| kinds.contains(&kind)))
+				{
 					return Err(Error::Invalid);
 				}
 				(id, label)

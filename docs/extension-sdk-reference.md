@@ -23,6 +23,11 @@ instance. Local variables do not survive the call. Use the separately granted
 | `TickInvocation` | Preview `tick` actions, or a mixed tick/panel handler | `input.invocation.action` |
 | `MenuInvocation` | `AppInvocation` plus the user, channel or server a context-menu action was chosen on | `input.invocation.invocation.action` |
 | `MessageActionInvocation` | `AppInvocation` plus the IDs of the message a `message` action was chosen on | `input.invocation.invocation.action` |
+| `SendInvocation` | Preview `send` hooks: the draft in `composer` plus its `send_target` | `input.invocation.action` |
+| `AnnotateInvocation` | Preview `annotate` actions: a batch of messages to add notes under | `input.invocation.action` |
+| `NotificationInvocation` | Preview `notification` actions: a desktop alert to reword or hide | `input.invocation.action` |
+| `PageInvocation` | Preview panel actions that may answer a page list's row request | `input.page_request.as_ref()` |
+| `MediaInvocation` | Preview `media` actions in an instance kept loaded during a call | `input.media.as_ref().map(\|b\| &b.items)` |
 
 The wrappers keep the original `Invocation` fields unchanged. Their `invocation`
 field is a Rust convenience: JSON stays flat. There is no JSON object named
@@ -96,8 +101,13 @@ common optional fields above may instead be serialized as `null`.
 | `guild_folders` | `Option<GuildFoldersSnapshot>` / object or absent | Loaded versioned server-folder layout; requires `guild_folders`. | `input.guild_folders.as_ref()` |
 | `action_result` | `Option<ActionResult>` / object or absent | Apply admission result for `tracked_app_action`; requires `action_feedback`. | `input.action_result.as_ref()` |
 | `selected_message_ref` | `Option<SelectedMessageRef>` / object or absent | `channel_id`, `message_id`, `author_id` and, in servers, `guild_id` of the message a `message` action was chosen on. Sent with `selected_message` under the same grant; absent on older hosts and on panel callbacks. Available through `MessageActionInvocation`. Use it to propose actions on that exact message, such as `send_reply`, `set_message_pinned` or `delete_message`. | `input.selected_message_ref.as_ref().map(\|m\| &m.message_id)` |
-| `menu_target` | `Option<MenuTarget>` / object tagged by `kind` or absent | For `user`, `channel`, `server` and `role` actions only, and always present for them: `{"kind":"user","user_id","guild_id"?,"channel_id"?}`, `{"kind":"channel","channel_id","guild_id"?}`, `{"kind":"server","guild_id"}` or `{"kind":"role","guild_id","role_id","user_id"?,"name","color"}`. Role actions appear when a role in a member's profile is right-clicked; `user_id` is that member, and `name` and `color` (`0xRRGGBB`, `0` for none) are what its chip shows. Requires `context_menus`. Other targets carry IDs only; read details through your other grants. Available through `MenuInvocation`. | `match &input.menu_target { Some(MenuTarget::User { user_id, .. }) => …, _ => … }` |
+| `menu_target` | `Option<MenuTarget>` / object tagged by `kind` or absent | For `user`, `channel`, `server`, `role` and `call` actions only, and always present for them: `{"kind":"user","user_id","guild_id"?,"channel_id"?}`, `{"kind":"channel","channel_id","guild_id"?}`, `{"kind":"server","guild_id"}`, `{"kind":"role","guild_id","role_id","user_id"?,"name","color"}` or (Preview) `{"kind":"call","channel_id","guild_id"?}`. Call actions appear in the call controls' More menu and name the call's channel; pair one with `media_state` to tell a media worker what to do in that call. Role actions appear when a role in a member's profile is right-clicked; `user_id` is that member, and `name` and `color` (`0xRRGGBB`, `0` for none) are what its chip shows. Requires `context_menus`. Other targets carry IDs only; read details through your other grants. Available through `MenuInvocation`. | `match &input.menu_target { Some(MenuTarget::User { user_id, .. }) => …, _ => … }` |
 | `tick_ms` | `Option<u64>` / integer or absent | Elapsed milliseconds since this plugin was enabled for the session. Present only on preview `tick` calls through `TickInvocation`. | `input.tick_ms` |
+| `send_target` | `Option<SendTarget>` / object or absent | Preview. `channel_id` and, in servers, `guild_id` the draft in `composer` is being sent to. Present only on `send` actions, with `send_hook`, through `SendInvocation`. Return the text to send in `Output::replacement`, or `None` to send the draft unchanged. | `input.send_target.as_ref().map(\|t\| &t.channel_id)` |
+| `annotate` | `Option<AnnotateBatch>` / object or absent | Preview. `channel_id`, `guild_id` and up to 25 `messages` (`message_id`, `author_id`, `content`, `edited`), oldest first, from a channel where the user switched annotations on. Present only on `annotate` actions, with `message_annotations`, through `AnnotateInvocation`. Answer with `AnnotationOutput::annotations`, each naming a message of the batch; empty text removes your note. `histories` and `deleted_messages` add earlier versions and kept deleted rows the same way. | `input.annotate.iter().flat_map(\|b\| &b.messages)` |
+| `notification` | `Option<Notification>` / object or absent | Preview. The desktop alert about to be shown: `source` (`gateway` or `push`), `message_id`, `channel_id`, `guild_id`, `author_id`, `direct`, `title`, `body` and `upgrade`. Present only on `notification` actions, with `notifications`, through `NotificationInvocation`. Answer with `NotificationOutput::notification` (`hide`, or a new `title`/`body`); the original shows if you fail or take longer than 1.5 s. | `input.notification.as_ref().map(\|n\| &n.body)` |
+| `media` | `Option<MediaBatch>` / object or absent | Preview. `seq`, `dropped`, `data_bytes` and up to 256 `items`: call `event`s (`started`, `joined`, `left`, `ended`), binary `chunk`s at `offset`/`length` of the batch's data, copied with `host::media::read`, and the `state` the plugin's other actions set with `MediaStateOutput::media_state`. Present only on `media` actions, with `media_worker`. Unknown items decode as `Other`. | `input.media.iter().flat_map(\|b\| &b.items)` |
+| `page_request` | `Option<PageRequest>` / object or absent | Preview. `version`, `start` and `count` (1–100) of the rows a page list needs. Present only on the list's `rows_action`, a panel action, with `pages`, through `PageInvocation`. Answer with `PageOutput::page_rows` for the same version and start, at most `count` rows. | `input.page_request.as_ref().map(\|r\| r.start)` |
 
 A tick is completion-paced with a 250 ms minimum delay and runs only when the shared
 extension worker is idle. It receives the flattened base invocation plus `tick_ms`;
@@ -116,9 +126,10 @@ can be inspected without decoding a newer capability/event enum.
 | --- | --- | --- | --- |
 | `api_version` | `u32` / integer | Current buffer/JSON ABI version, `1`. | `host.api_version` |
 | `sdk_revision` | `u32` / integer | Current discovery schema revision, `1`; not a release or protocol compatibility claim. | `host.sdk_revision` |
-| `capabilities` | `Vec<String>` / array of strings | Host-supported capability names (58 currently), not this plugin's granted capabilities. | `host.supports("rich_presence")` |
+| `capabilities` | `Vec<String>` / array of strings | Host-supported capability names (63 currently), not this plugin's granted capabilities. | `host.supports("rich_presence")` |
 | `app_events` | `Vec<String>` / array of strings | Host-supported app-event names (21 currently), not an event subscription or delivery guarantee. | `host.supports_event("typing")` |
 | `interface_tweaks` | `Vec<String>` / array of strings, empty on older hosts | Interface tweak names this host honors: `static_typing_indicator`, `plain_profiles`, `expanded_roles`, `hidden_request_counts`, `one_ping_per_direct_message`, `hidden_blocked_messages`, `hidden_profile_notes`, `large_stream_preview`, `double_click_reply_edit`. | `host.supports_tweak("expanded_roles")` |
+| `host_imports` | `Vec<String>` / array of strings, empty on older hosts | Preview. Functions importable from the `serein` Wasm module: `clock_now_ms`, `random_fill`, `db_execute`, `result_read`, `journal_read`, `https_request`. Each still needs its capability; see [host imports](extensions.md#host-imports-preview). | `host.supports_import("clock_now_ms")` |
 
 A supported capability still needs to be declared and explicitly granted. Older
 hosts reject unknown required manifest capabilities **before** a handler can run;
@@ -193,7 +204,22 @@ account snapshot or grant-dependent data:
       "context_menus",
       "interface_tweaks",
       "interface_ui",
-      "start_screen"
+      "start_screen",
+      "clock",
+      "random",
+      "database",
+      "message_journal",
+      "network",
+      "send_hook",
+      "message_annotations",
+      "notifications",
+      "pages",
+      "call_captions",
+      "files",
+      "media_worker",
+      "media_packets",
+      "media_audio",
+      "media_archive"
     ],
     "app_events": [
       "ready",
@@ -217,7 +243,8 @@ account snapshot or grant-dependent data:
       "pins",
       "typing",
       "polls"
-    ]
+    ],
+    "host_imports": ["clock_now_ms", "random_fill", "db_execute", "result_read", "journal_read", "https_request", "broadcast", "has_subscribers", "topic_read", "file_request", "file_write", "media_read", "attachment_fetch"]
   }
 }
 ```

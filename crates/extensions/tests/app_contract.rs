@@ -114,6 +114,10 @@ fn test_manifest(capabilities: Vec<Capability>) -> Manifest {
 		license: "MIT".into(),
 		source: "https://example.org/source".into(),
 		kind: ExtensionKind::Plugin,
+		network: Vec::new(),
+		secrets: Vec::new(),
+		broadcasts: Vec::new(),
+		subscribes: Vec::new(),
 		capabilities,
 		actions: vec![Action {
 			id: "run".into(),
@@ -560,6 +564,61 @@ fn local_effects_require_matching_grants_and_cannot_run_in_background() {
 }
 
 #[test]
+fn channel_hook_proposals_need_each_hook_they_switch() {
+	let hooks = |notes, send| HostEffect::SetChannelHooks {
+		channel_id: "20".into(),
+		notes,
+		send,
+	};
+	let mut manifest = test_manifest(vec![Capability::MessageAnnotations]);
+	manifest.actions.push(Action {
+		id: "notes".into(),
+		label: "Notes".into(),
+		surface: Surface::Annotate,
+	});
+	let both = hooks(true, Some(SendHookMode::Auto));
+	assert!(hooks(true, None).validate(&manifest).is_ok());
+	assert!(
+		hooks(false, None).validate(&manifest).is_ok(),
+		"switching off"
+	);
+	// A send hook needs its grant and a send action, not just notes.
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	manifest.capabilities.push(Capability::SendHook);
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	manifest.actions.push(Action {
+		id: "send".into(),
+		label: "Send".into(),
+		surface: Surface::Send,
+	});
+	assert!(both.validate(&manifest).is_ok());
+	// Notes need their action too, whatever the grants.
+	manifest
+		.actions
+		.retain(|action| action.surface != Surface::Annotate);
+	assert!(matches!(both.validate(&manifest), Err(Error::Capability)));
+	assert!(
+		hooks(false, Some(SendHookMode::Preview))
+			.validate(&manifest)
+			.is_ok()
+	);
+	let wire = serde_json::to_value(&both).unwrap();
+	assert_eq!(
+		wire,
+		serde_json::json!({"type": "set_channel_hooks", "channel_id": "20", "notes": true,
+			"send": "auto"})
+	);
+	let sdk: sdk::HostEffect = serde_json::from_value(wire).unwrap();
+	assert!(matches!(
+		sdk,
+		sdk::HostEffect::SetChannelHooks {
+			send: Some(sdk::SendHookMode::Auto),
+			..
+		}
+	));
+}
+
+#[test]
 fn app_events_are_unique_granted_and_have_no_direct_conversation_context() {
 	let mut manifest = test_manifest(vec![
 		Capability::AppEvents,
@@ -918,12 +977,34 @@ fn discovery_is_forward_tolerant_and_does_not_change_legacy_input() {
 		label: "Events".into(),
 		surface: Surface::AppEvent,
 	});
+	// `send_hook` is granted together with its `send` action.
+	supported.actions.push(Action {
+		id: "send".into(),
+		label: "Send".into(),
+		surface: Surface::Send,
+	});
+	supported.actions.push(Action {
+		id: "alert".into(),
+		label: "Alert".into(),
+		surface: Surface::Notification,
+	});
+	supported.actions.push(Action {
+		id: "media".into(),
+		label: "Media".into(),
+		surface: Surface::Media,
+	});
+	// The network capability is declared for specific origins.
+	supported.network = vec!["https://api.example.org".into()];
 	supported.validate().unwrap();
 	assert!(host.supports("rich_presence"));
 	assert!(host.supports("api_proxy"));
-	assert_eq!(caps.len(), 58);
+	assert!(host.supports_import("clock_now_ms") && host.supports_import("random_fill"));
+	assert!(host.supports_import("db_execute") && host.supports_import("result_read"));
+	assert!(host.supports_import("journal_read") && host.supports_import("https_request"));
+	assert!(host.supports_import("broadcast") && host.supports_import("topic_read"));
+	assert_eq!(caps.len(), 74);
 	assert_eq!(HostInfo::current().app_events.len(), 21);
-	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 58);
+	assert_eq!(std::collections::BTreeSet::from_iter(caps).len(), 74);
 }
 
 #[test]

@@ -7,8 +7,9 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 REPOSITORY = Path(__file__).resolve().parents[4]
-GITHUB = "https://github.com/ViceVerse-cz/Serein"
-WIKI_ORIGINS = {GITHUB + ".wiki.git", "git@github.com:ViceVerse-cz/Serein.wiki.git"}
+# The fork publishes its own wiki; never the upstream project's (see "Fork" in AGENTS.md).
+GITHUB = "https://github.com/BRUHItsABunny/Serein"
+WIKI_ORIGINS = {GITHUB + ".wiki.git", "git@github.com:BRUHItsABunny/Serein.wiki.git"}
 SOURCES = (
     "examples/extensions/README.md", "docs/extensions.md", "docs/theme-api.md",
     "docs/extension-sdk-reference.md", "docs/extension-sdk-actions.md",
@@ -299,7 +300,7 @@ def main():
         if Path(git(directory, "rev-parse", "--show-toplevel")).resolve() != directory:
             raise ValueError("--wiki-dir must name the wiki checkout root")
         if git(directory, "remote", "get-url", "origin") not in WIKI_ORIGINS:
-            raise ValueError("wiki origin must be the existing ViceVerse-cz/Serein.wiki.git remote")
+            raise ValueError("wiki origin must be the existing BRUHItsABunny/Serein.wiki.git remote")
         if not args.status.strip() or len(args.status) > 256 or any(ord(c) < 32 for c in args.status):
             raise ValueError("--status must be one nonempty line, at most 256 characters")
         generated = pages(revision, args.status)

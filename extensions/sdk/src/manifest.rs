@@ -17,6 +17,33 @@ pub struct Manifest {
 	pub capabilities: Vec<Capability>,
 	#[serde(default)]
 	pub actions: Vec<Action>,
+	/// HTTPS origins [`crate::host::https`] may reach, such as `https://api.example.org`;
+	/// requires the `network` capability.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub network: Vec<String>,
+	/// Values the user enters, such as API keys. Reference one as `{{secret.<id>}}` in a
+	/// [`crate::host::https`] request; the host fills it in for its origins only and the
+	/// plugin never reads it.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub secrets: Vec<SecretSpec>,
+	/// Topics [`crate::host::topics::broadcast`] may send, such as `serein.captions/1`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub broadcasts: Vec<String>,
+	/// Topics this plugin receives in its [`Surface::Topic`] action.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub subscribes: Vec<String>,
+}
+
+/// A secret the user enters for the plugin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+	/// Lowercase letters, digits and `_`, at most 32.
+	pub id: String,
+	/// Shown where the user enters the value.
+	pub label: String,
+	/// Origins from `network` that may receive it.
+	pub origins: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +116,44 @@ pub enum Capability {
 	InterfaceTweaks,
 	InterfaceUi,
 	StartScreen,
+	/// Import [`crate::host::now_ms`].
+	Clock,
+	/// Import [`crate::host::fill_random`].
+	Random,
+	/// Use [`crate::host::db`], a private SQLite database.
+	Database,
+	/// Use [`crate::host::journal`] in a [`Surface::Journal`] action.
+	MessageJournal,
+	/// Use [`crate::host::https`] for the manifest's `network` origins.
+	Network,
+	/// Rewrite drafts in a [`Surface::Send`] action; see [`crate::SendInvocation`].
+	SendHook,
+	/// Return [`crate::Annotation`]s from [`Surface::Annotate`] and [`Surface::Message`] actions.
+	MessageAnnotations,
+	/// Reword or hide desktop alerts in a [`Surface::Notification`] action; see
+	/// [`crate::NotificationInvocation`].
+	Notifications,
+	/// Show a [`crate::Page`] in the main area from activation and panel actions; see
+	/// [`crate::PageOutput`].
+	Pages,
+	/// Show caption lines above the call controls; see [`crate::CaptionOutput`].
+	CallCaptions,
+	/// Use [`crate::host::files`]: a private folder and folders or files the user picks.
+	Files,
+	/// Stay loaded during calls and receive [`crate::MediaBatch`]es in a
+	/// [`Surface::Media`] action.
+	MediaWorker,
+	/// Receive decrypted call packets in media batches and ask for keyframes. Requires
+	/// `media_worker`.
+	MediaPackets,
+	/// Receive 16 kHz mono samples per speaker in media batches. Requires `media_worker`.
+	MediaAudio,
+	/// Save original attachments into the private folder with [`crate::host::archive`].
+	/// Requires `files`.
+	MediaArchive,
+	/// Also receive the user's own microphone, camera and screen share, as sent, in media
+	/// batches. Requires `media_packets`.
+	MediaOwn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +170,25 @@ pub enum Surface {
 	Channel,
 	Server,
 	Role,
+	/// Host-scheduled message journal delivery; read entries with [`crate::host::journal::read`].
+	Journal,
+	/// Host-scheduled delivery of approved broadcasts; read them with [`crate::host::topics::read`].
+	Topic,
+	/// The user is sending a message in a channel where they switched this hook on; decode
+	/// [`crate::SendInvocation`] and return the rewritten draft in `replacement`.
+	Send,
+	/// Host-scheduled batches of messages to annotate; decode [`crate::AnnotateInvocation`]
+	/// and return [`crate::AnnotationOutput`].
+	Annotate,
+	/// Runs before each desktop alert; decode [`crate::NotificationInvocation`] and return
+	/// [`crate::NotificationOutput`].
+	Notification,
+	/// Runs once per batch in an instance kept loaded during a call; decode
+	/// [`crate::MediaInvocation`]. It may return only captions.
+	Media,
+	/// An entry in the call controls' More menu; decode [`crate::MenuInvocation`], whose
+	/// target is [`crate::MenuTarget::Call`]. Requires `context_menus`.
+	Call,
 }
 
 /// Declared entry point; its ID arrives in `Invocation::action`.
