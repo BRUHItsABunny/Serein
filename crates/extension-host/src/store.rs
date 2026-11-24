@@ -3020,8 +3020,12 @@ mod tests {
 		fn new() -> Self {
 			let mut nonce = [0; 16];
 			getrandom::fill(&mut nonce).unwrap();
-			let path =
-				std::env::temp_dir().join(format!("serein-extension-test-{}", digest(&nonce)));
+			// Plugin databases refuse paths through a symbolic link, and macOS's temporary
+			// directory is under one (/var -> /private/var).
+			let path = std::env::temp_dir()
+				.canonicalize()
+				.unwrap()
+				.join(format!("serein-extension-test-{}", digest(&nonce)));
 			fs::create_dir(&path).unwrap();
 			Self(path)
 		}
