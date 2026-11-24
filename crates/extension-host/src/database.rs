@@ -348,7 +348,9 @@ mod tests {
 		fn new() -> Self {
 			let mut bytes = [0; 8];
 			getrandom::fill(&mut bytes).unwrap();
-			let path = std::env::temp_dir().join(format!(
+			// Databases refuse paths through a symbolic link, and macOS's temporary
+			// directory is under one (/var -> /private/var).
+			let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
 				"serein-plugin-db-{}",
 				bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
 			));

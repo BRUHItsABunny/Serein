@@ -75,7 +75,7 @@ with tempfile.TemporaryDirectory() as directory:
         (fixture / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / path, fixture / path)
     os.chdir(fixture)
-    for version in ['1.2.3-nightly.20260913.9', '1.2.3']:
+    for version in ['1.2.3-nightly.20260913.9-fork.1', '1.2.3-nightly.20260913.9', '1.2.3']:
         subprocess.run([os.sys.executable, str(root / '.github/release/version.py'), version], check=True)
         assert tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'] == version
         for lock in ['Cargo.lock', 'fuzz/Cargo.lock']:
