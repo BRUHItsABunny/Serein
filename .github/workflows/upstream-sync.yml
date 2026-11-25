@@ -190,7 +190,9 @@ jobs:
             echo "::error::Conflict markers remain."
             ok=false
           fi
-          git add -A -- . ':!target'
+          # target/ is ignored, so a plain add leaves it out; naming it, even to exclude it,
+          # makes git add fail on an ignored path.
+          git add -A
           if [ -f .git/MERGE_HEAD ]; then
             git commit --no-edit -m "Merge upstream $UPSTREAM_TAG into the fork" \
               -m "Conflicts resolved by Claude in the Upstream sync workflow."
