@@ -145,7 +145,11 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: release-assets
-        run: sha256sum ./* > SHA256SUMS.txt
+        # The shared Linux workflow's flatpakref points at upstream's Flatpak repository,
+        # which the fork does not publish to; the .flatpak bundle installs on its own.
+        run: |
+          rm -f serein.flatpakref
+          sha256sum ./* > SHA256SUMS.txt
       - name: Publish the pre-release
         run: |
           set -eu
