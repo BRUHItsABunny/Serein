@@ -190,7 +190,9 @@ jobs:
             echo "::error::Conflict markers remain."
             ok=false
           fi
-          git add -A -- . ':!target'
+          # target/ is ignored, so a plain add leaves it out; naming it, even to exclude it,
+          # makes git add fail on an ignored path.
+          git add -A
           if [ -f .git/MERGE_HEAD ]; then
             git commit --no-edit -m "Merge upstream $UPSTREAM_TAG into the fork" \
               -m "Conflicts resolved by Claude in the Upstream sync workflow."
@@ -264,10 +266,37 @@ jobs:
             [ "$(gh pr view "$PR" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0 ] && break
             sleep 30
           done
-          if ! gh pr checks "$PR" --watch --interval 60; then
-            echo "::error::CI failed on PR #$PR; it is left open for a human."
-            exit 1
-          fi
+          # GitHub sometimes cancels a job for lack of runners. Jobs that were only cancelled
+          # get one re-run; a job that actually failed leaves the PR for a human.
+          retried=false
+          until gh pr checks "$PR" --watch --interval 60; do
+            if [ "$retried" = true ]; then
+              echo "::error::CI failed on PR #$PR after re-running cancelled jobs; it is left open for a human."
+              exit 1
+            fi
+            sha=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+            rerun=()
+            for run in $(gh run list --commit "$sha" --limit 50 --json databaseId --jq '.[].databaseId'); do
+              jobs=" $(gh run view "$run" --json jobs --jq '[.jobs[].conclusion] | join(" ")') "
+              case "$jobs" in
+                *" failure "* | *" timed_out "* | *" startup_failure "*)
+                  echo "::error::CI failed on PR #$PR (run $run); it is left open for a human."
+                  exit 1
+                  ;;
+                *" cancelled "*) rerun+=("$run") ;;
+              esac
+            done
+            if [ "${#rerun[@]}" -eq 0 ]; then
+              echo "::error::CI did not pass on PR #$PR; it is left open for a human."
+              exit 1
+            fi
+            for run in "${rerun[@]}"; do
+              echo "Re-running cancelled jobs of run $run."
+              gh run rerun "$run" --failed
+            done
+            retried=true
+            sleep 60
+          done
           gh pr merge "$PR" --merge
 
       - name: Publish the fork release
